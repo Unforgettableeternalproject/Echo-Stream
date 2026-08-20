@@ -21,26 +21,40 @@ $PidFile = Join-Path $env:TEMP "echo_stream_serve.pids"
 # 相容 bat shim 的「serve_web.bat stop」寫法
 if ($Rest -contains "stop") { $Stop = $true }
 
-if ($Stop) {
+# 停掉所有 Echo Stream 相關行程。
+# ⚠️ 不能只靠 PID 檔——手動起的 server（或別的工具起的）不在檔裡，
+# 而 Windows 允許兩個行程同時 bind 同一個 port，殘留的舊 server 會
+# 默默搶走流量（2026-08-21 踩過）。所以按 port 掃 + PID 檔雙管齊下。
+function Stop-EchoProcesses {
+    $killed = 0
+    # 1) 佔著 8770 的，只要命令列含 echo_stream 就收
+    Get-NetTCPConnection -LocalPort 8770 -State Listen -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object {
+            $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$_" -ErrorAction SilentlyContinue
+            if ($proc -and $proc.CommandLine -match "echo_stream") {
+                Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue
+                $killed++
+            }
+        }
+    # 2) PID 檔記錄的（tunnel 不在 8770 上，靠這裡收）
     if (Test-Path $PidFile) {
         Get-Content $PidFile | ForEach-Object {
             Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue
         }
         Remove-Item $PidFile -ErrorAction SilentlyContinue
-        Write-Host "已停止 server 與 tunnel。"
-    } else {
-        Write-Host "沒有記錄中的行程（PID 檔不存在）。"
     }
+    return $killed
+}
+
+if ($Stop) {
+    $n = Stop-EchoProcesses
+    Write-Host "已停止（port 掃到 $n 個 server + PID 檔記錄的行程）。"
     exit 0
 }
 
-# 舊行程還在就先收掉，避免 port 衝突
-if (Test-Path $PidFile) {
-    Get-Content $PidFile | ForEach-Object {
-        Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue
-    }
-    Remove-Item $PidFile -ErrorAction SilentlyContinue
-}
+# 啟動前先清場——殘留的舊 server 會讓新 server bind 失敗（刻意的，見 _StrictServer）
+Stop-EchoProcesses | Out-Null
+Start-Sleep -Seconds 1
 
 # Python：優先環境變數，否則猜同層的 U.E.P Core env（與 config.py 的同層猜測一致）
 $Py = $env:ECHO_STREAM_PYTHON

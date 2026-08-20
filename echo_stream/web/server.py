@@ -415,6 +415,11 @@ class StreamService:
                 # 傳真的 Utterance 而不是重建——ended_at 是真實的說完時刻，
                 # tracer 的 TTFA 才會把 STT 的耗時算進去
                 await self._run(utterance, emit)
+
+                # turn 結束補一個 padding frame：tunnel 代理（cloudflared）會
+                # 緩衝小尾巴，最後一段音訊可能卡在代理層直到下一輪資料把它
+                # 擠出去——「最後一段等下次輸入才播」就是這個。前端會忽略它。
+                emit(json_frame(FRAME_EVENT, {"event": "flush", "pad": "." * 16384}))
         except Exception as exc:  # noqa: BLE001
             emit(json_frame(FRAME_ERROR, {"error": f"{type(exc).__name__}: {exc}"}))
         finally:
@@ -708,6 +713,18 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+class _StrictServer(ThreadingHTTPServer):
+    """不設 SO_REUSEADDR 的 HTTP server。
+
+    Python 預設 ``allow_reuse_address=1``，在 Windows 上這代表**兩個行程
+    可以同時 bind 同一個 port**——舊 server 沒關乾淨時，新 server 啟動
+    「成功」但流量進舊行程，人設、程式碼更新全都看似失效
+    （2026-08-21 踩過，查了很久）。關掉它讓重複啟動直接炸 bind error。
+    """
+
+    allow_reuse_address = False
+
+
 def serve(
     host: str | None = None,
     port: int | None = None,
@@ -749,7 +766,13 @@ def serve(
         print(f"  ✓ 就緒（{service.load_seconds:.1f}s）")
 
     handler = type("Handler", (_Handler,), {"service": service})
-    httpd = ThreadingHTTPServer((host, port), handler)
+    try:
+        httpd = _StrictServer((host, port), handler)
+    except OSError:
+        print(f"\n  ✗ {host}:{port} 已被占用——有舊的 server 沒關乾淨。")
+        print("    執行 serve_web.bat stop（會按 port 掃，不管是誰起的）再重試。")
+        service.shutdown()
+        raise SystemExit(1)
     print(f"\n  → http://{host}:{port}\n")
     print("  Ctrl+C 結束")
     print("═" * 56)
