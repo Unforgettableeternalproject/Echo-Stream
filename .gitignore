@@ -10,6 +10,8 @@ venv/
 .venv/
 .env
 .env.*
+# 範本要進版控——不然新環境不知道有哪些設定要填
+!.env.example
 
 # 量測輸出
 traces/
