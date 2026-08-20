@@ -56,9 +56,20 @@ PYTHONIOENCODING=utf-8 "$PY" -m echo_stream demo --fake --barge-in 4.0
 # 檢查切分結果（調參用，不必跑整條管線）
 PYTHONIOENCODING=utf-8 "$PY" -m echo_stream split "你的文字。第二句在這裡。"
 
+# Web 前端（fake 管線，秒開）
+PYTHONIOENCODING=utf-8 "$PY" -m echo_stream serve
+# 接真模組：--real-tts（要 GPU）/ --real-llm（消耗 token）/ --real（兩者）
+
+# 各段獨立驗收
+PYTHONIOENCODING=utf-8 "$PY" -m echo_stream tts-check "要合成的文字。"   # Phase 1，要 GPU
+PYTHONIOENCODING=utf-8 "$PY" -m echo_stream llm-check "要問的問題。"     # Phase 2，消耗 token
+
 # 測試
 PYTHONIOENCODING=utf-8 "$PY" -m pytest tests/ -q
 ```
+
+真模組的設定放 `.env`（複製 `.env.example`）。⚠️ `ECHO_STREAM_LLM_TEMPERATURE`
+必須留空——gpt-5.6-luna 只接受預設值 1，傳自訂值會被 API 直接拒絕。
 
 輸出範例：
 
@@ -109,11 +120,37 @@ tests/
 | Phase | 內容 | 狀態 |
 |-------|------|------|
 | 0 | 骨架 + fake 三層、契約、背壓、取消、打點 | ✅ 完成 |
-| 1 | 接真 TTS（IndexTTS2，push→pull 橋接） | ⬜ |
-| 2 | 接真 LLM（GPT-5.6-luna）+ SentenceSplitter 調參 | ⬜ |
+| 1 | 接真 TTS（IndexTTS2，push→pull 橋接） | ✅ 完成 |
+| 2 | 接真 LLM（GPT-5.6-luna，經 SessionControl） | ✅ 完成 |
+| — | Web 前端 host 整條管線 | ✅ 完成 |
 | 3 | 接真 STT（MultiChannelSTTEngine）+ Smart Turn v3 | ⬜ |
 | 4 | Memory / Session 接入 | ⬜ |
 | 5 | Discord Frontend | ⬜ |
+
+### 實測延遲（2026-08-20，各段獨立量測）
+
+| 段 | 實測 | 預算 | 性質 |
+|----|------|------|------|
+| STT | ~700ms | 700ms | 本地（尚未接） |
+| LLM 首句 | ~2600ms | 800ms | 其中 **~800ms 是純網路往返** |
+| TTS 首段 | ~1800ms | 1800ms | 本地，**每次合成的固定開銷** |
+| **TTFA** | **≈5100ms** | 3500ms | |
+
+兩個大頭性質完全不同，優化方向也不同：
+
+* **TTS 1.8s** — 本地算力問題。首句就算只有一個字也要 1.8 秒，切短救不了。
+  解法是 TensorRT 加速（Faster IndexTTS-2 論文：端到端 3.46-3.60×）。
+* **LLM 2.6s** — 網路距離問題。實測純網路往返（`models.list`）就要
+  721/806/1215ms（min/med/max），程式碼優化不了。
+  且 **reasoning effort 對它沒有可辨識的影響**（none 2389 / low 2877 /
+  medium 2192 / high 2665 ms，全在雜訊範圍內）。
+
+拆解 LLM 段可以看得更清楚——瓶頸完全在首 token，不在切分：
+
+```
+首 token      2563ms   ← 全部在這裡
+累積成句       137ms   ← 切分閾值只影響這一段
+```
 
 ---
 
