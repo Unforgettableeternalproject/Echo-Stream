@@ -57,6 +57,26 @@ def _build_speak_stage(args: argparse.Namespace):
     return stage, stage.sample_rate
 
 
+def _run_serve(args: argparse.Namespace) -> int:
+    from .web.server import serve
+
+    serve(
+        host=args.host,
+        port=args.port,
+        real_tts=args.real_tts or args.real,
+        real_llm=args.real_llm or args.real,
+        split_policy=SplitPolicy(
+            first_min_weight=args.first_min,
+            first_max_weight=args.first_max,
+            min_weight=args.min_weight,
+            max_weight=args.max_weight,
+        ),
+        system_prompt=args.system or "",
+        trace_path=args.trace,
+    )
+    return 0
+
+
 async def _run_llm_check(args: argparse.Namespace) -> int:
     """Phase 2 驗收：只跑 ThinkStage，量首 token 與首句延遲。
 
@@ -429,6 +449,17 @@ def build_parser() -> argparse.ArgumentParser:
     demo.add_argument("--out", default=None, metavar="檔案", help="把音訊寫成 WAV")
     _add_split_args(demo)
     demo.set_defaults(func=lambda a: asyncio.run(_run_demo(a)))
+
+    web = sub.add_parser("serve", help="開 Web 前端 host 整條管線")
+    web.add_argument("--host", default=None)
+    web.add_argument("--port", type=int, default=None)
+    web.add_argument("--real-tts", action="store_true", help="用真 IndexTTS2（需要 GPU）")
+    web.add_argument("--real-llm", action="store_true", help="用真 OpenAI（會消耗 token）")
+    web.add_argument("--real", action="store_true", help="TTS 與 LLM 都用真的")
+    web.add_argument("--system", default=None, help="system prompt")
+    web.add_argument("--trace", default=None, help="打點輸出的 JSONL 路徑")
+    _add_split_args(web)
+    web.set_defaults(func=_run_serve)
 
     llm = sub.add_parser("llm-check", help="Phase 2 驗收：只跑真 LLM，量首句延遲")
     llm.add_argument("text", help="要送出的訊息")
