@@ -53,7 +53,11 @@
     background: transparent; color: var(--bad);
     border: 1px solid var(--bad);
   }
+  button.rec { background: var(--bad); color: #fff; }
   .hint { color: var(--dim); font-size: 12px; margin-top: 8px; }
+  .sent.user { border-left-color: var(--ok); }
+  #voice-state { font-size: 12px; color: var(--dim); }
+  #voice-state.speech { color: var(--ok); }
 
   .sentences { display: flex; flex-direction: column; gap: 6px; }
   .sent {
@@ -81,6 +85,7 @@
   <header>
     <h1>Echo Stream</h1>
     <span class="sub">串流語音管線</span>
+    <span class="badge" id="b-stt">STT</span>
     <span class="badge" id="b-tts">TTS</span>
     <span class="badge" id="b-llm">LLM</span>
     <span class="sub" id="status"></span>
@@ -91,10 +96,12 @@
       <textarea id="input" placeholder="輸入要說的話，Ctrl+Enter 送出">今天過得怎麼樣？</textarea>
       <div style="display:flex;flex-direction:column;gap:8px">
         <button id="send">送出</button>
+        <button id="mic">🎤 聆聽</button>
         <button id="stop" class="ghost" disabled>插話</button>
       </div>
     </div>
-    <div class="hint" id="hint">首次送出會啟用音訊播放（瀏覽器要求使用者互動）。</div>
+    <div class="hint" id="hint">首次送出會啟用音訊播放（瀏覽器要求使用者互動）。
+      <span id="voice-state"></span></div>
   </div>
 
   <div class="panel">
@@ -109,7 +116,7 @@
 </div>
 
 <script>
-const FRAME = { AUDIO: 1, META: 2, ERROR: 3, TEXT: 4 };
+const FRAME = { AUDIO: 1, META: 2, ERROR: 3, TEXT: 4, UTTER: 5, EVENT: 6 };
 const BUDGET = { stt: 700, memory: 300, llm_first_sentence: 800, tts_first_chunk: 1800, ttfa: 3500 };
 const LABEL = {
   stt: "STT 最終轉錄", memory: "Memory retrieve",
@@ -214,6 +221,43 @@ function renderReport(meta) {
     </p>`;
 }
 
+// ── Frame 處理（文字送出與語音模式共用）─────────────────────────────
+function handleFrame(kind, payload) {
+  const text = () => JSON.parse(new TextDecoder().decode(payload));
+  if (kind === FRAME.AUDIO) {
+    playChunk(payload);
+  } else if (kind === FRAME.TEXT) {
+    addSentence(text());
+  } else if (kind === FRAME.META) {
+    renderReport(text());
+    $("stop").disabled = true;
+  } else if (kind === FRAME.ERROR) {
+    $("report").innerHTML = `<p class="bad">${text().error}</p>`;
+  } else if (kind === FRAME.UTTER) {
+    // 使用者的語音被切成一個 turn：開新回合的 UI
+    const u = text();
+    stopAudio();
+    $("sentences").innerHTML = "";
+    const el = document.createElement("div");
+    el.className = "sent user";
+    el.innerHTML = `<span class="idx">🎤</span>
+                    <span class="ms">${u.stt_ms}ms</span>
+                    <span>${(u.text || "").replace(/</g, "&lt;")}</span>`;
+    $("sentences").appendChild(el);
+    $("report").innerHTML = '<div class="empty">量測中…</div>';
+    $("stop").disabled = false;
+  } else if (kind === FRAME.EVENT) {
+    const e = text();
+    if (e.event === "barge_in") {
+      stopAudio();  // 伺服器判定插話成立：立即停播
+    } else {
+      const vs = $("voice-state");
+      vs.textContent = e.event === "speech" ? "● 收到語音" : "○ 聆聽中";
+      vs.className = e.event === "speech" ? "speech" : "";
+    }
+  }
+}
+
 // ── 送出 ──────────────────────────────────────────────────────────
 async function send() {
   const text = $("input").value.trim();
@@ -230,18 +274,7 @@ async function send() {
   stopAudio();
   t0 = performance.now();
 
-  const parse = makeParser((kind, payload) => {
-    if (kind === FRAME.AUDIO) {
-      playChunk(payload);
-    } else if (kind === FRAME.TEXT) {
-      addSentence(JSON.parse(new TextDecoder().decode(payload)));
-    } else if (kind === FRAME.META) {
-      renderReport(JSON.parse(new TextDecoder().decode(payload)));
-    } else if (kind === FRAME.ERROR) {
-      const e = JSON.parse(new TextDecoder().decode(payload));
-      $("report").innerHTML = `<p class="bad">${e.error}</p>`;
-    }
-  });
+  const parse = makeParser(handleFrame);
 
   try {
     const res = await fetch("/api/say", {
@@ -269,8 +302,101 @@ async function interrupt() {
   await fetch("/api/interrupt", { method: "POST" });
 }
 
+// ── 語音模式 ──────────────────────────────────────────────────────
+// 瀏覽器擷取 → 降採樣成 16kHz int16 → 每 ~200ms 一個 POST 上傳。
+// 選連續小 POST 而不是 WebSocket：stdlib server 不用手刻握手，
+// keep-alive 下每個 chunk 的額外開銷是毫秒級，對測試工具足夠。
+let voice = null;
+
+async function startVoice() {
+  if (voice) return stopVoice();
+  if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+  if (ctx.state === "suspended") await ctx.resume();
+
+  const info = await (await fetch("/api/voice/start", { method: "POST" })).json();
+  if (info.error) { $("voice-state").textContent = "✗ " + info.error; return; }
+  const sid = info.sid, targetRate = info.sample_rate;
+
+  let media;
+  try {
+    media = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
+    });
+  } catch (e) {
+    // 常見原因：非 https / 非 localhost（瀏覽器要求 secure context）
+    $("voice-state").textContent = "✗ 無法取得麥克風：" + e.name;
+    await fetch(`/api/voice/stop?sid=${sid}`, { method: "POST" });
+    return;
+  }
+
+  // frame 回流（獨立長連線；音訊經另一條路 POST 上去）
+  const ac = new AbortController();
+  (async () => {
+    const parse = makeParser(handleFrame);
+    try {
+      const res = await fetch(`/api/voice/stream?sid=${sid}`, { signal: ac.signal });
+      const reader = res.body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        parse(value);
+      }
+    } catch (e) { /* abort 或斷線 */ }
+  })();
+
+  const micCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const src = micCtx.createMediaStreamSource(media);
+  const proc = micCtx.createScriptProcessor(4096, 1, 1);
+  const ratio = micCtx.sampleRate / targetRate;
+  let acc = [], accLen = 0;
+
+  proc.onaudioprocess = e => {
+    const input = e.inputBuffer.getChannelData(0);
+    const outLen = Math.floor(input.length / ratio);
+    const out = new Int16Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const pos = i * ratio, i0 = Math.floor(pos);
+      const i1 = Math.min(i0 + 1, input.length - 1);
+      const v = input[i0] + (input[i1] - input[i0]) * (pos - i0);
+      out[i] = Math.max(-1, Math.min(1, v)) * 32767;
+    }
+    acc.push(out); accLen += out.length;
+    if (accLen >= targetRate * 0.2) {
+      const merged = new Int16Array(accLen);
+      let o = 0;
+      acc.forEach(a => { merged.set(a, o); o += a.length; });
+      acc = []; accLen = 0;
+      fetch(`/api/voice/audio?sid=${sid}`, { method: "POST", body: merged.buffer })
+        .catch(() => {});
+    }
+  };
+  src.connect(proc);
+  proc.connect(micCtx.destination);
+
+  voice = { sid, ac, media, micCtx, proc };
+  $("mic").textContent = "■ 停止";
+  $("mic").classList.add("rec");
+  $("voice-state").textContent = "○ 聆聽中";
+}
+
+async function stopVoice() {
+  if (!voice) return;
+  const v = voice;
+  voice = null;
+  try { v.proc.disconnect(); } catch (e) {}
+  v.media.getTracks().forEach(t => t.stop());
+  try { await v.micCtx.close(); } catch (e) {}
+  await fetch(`/api/voice/stop?sid=${v.sid}`, { method: "POST" }).catch(() => {});
+  setTimeout(() => v.ac.abort(), 5000);  // 給殘餘 frame（flush 的 turn）一點時間
+  $("mic").textContent = "🎤 聆聽";
+  $("mic").classList.remove("rec");
+  $("voice-state").textContent = "";
+  $("voice-state").className = "";
+}
+
 $("send").onclick = send;
 $("stop").onclick = interrupt;
+$("mic").onclick = startVoice;
 $("input").addEventListener("keydown", e => {
   if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) send();
 });
@@ -280,6 +406,8 @@ fetch("/api/status").then(r => r.json()).then(s => {
   $("b-tts").textContent = s.real_tts ? "真 TTS" : "fake TTS";
   $("b-llm").className = "badge" + (s.real_llm ? " on" : "");
   $("b-llm").textContent = s.real_llm ? "真 LLM" : "fake LLM";
+  $("b-stt").className = "badge" + (s.real_stt ? " on" : "");
+  $("b-stt").textContent = s.real_stt ? "真 STT" : "fake STT";
   $("status").textContent = s.error ? "✗ " + s.error
     : s.ready ? `就緒 ${s.load_seconds ? "(" + s.load_seconds.toFixed(1) + "s)" : ""}`
     : "載入中…";

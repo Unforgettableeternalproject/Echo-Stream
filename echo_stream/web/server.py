@@ -33,11 +33,14 @@ HTTP server 是多執行緒的（``ThreadingHTTPServer``），管線是 asyncio 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import json
+import queue
 import struct
 import threading
 import time
+import uuid
 import wave
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -45,8 +48,8 @@ from pathlib import Path
 from typing import Any
 
 from .. import config
-from ..contracts.cancellation import CancelReason
-from ..contracts.types import AudioChunk, TurnPhase, Utterance
+from ..contracts.cancellation import CancellationToken, CancelReason
+from ..contracts.types import STT_SAMPLE_RATE, AudioChunk, TurnPhase, Utterance
 from ..core.pipeline import PipelineRunner
 from ..core.splitter import SplitPolicy
 from ..core.tracer import LatencyTracer
@@ -57,6 +60,12 @@ FRAME_ERROR = 0x03
 FRAME_TEXT = 0x04
 """句子文字。讓前端能顯示字幕與逐句延遲——沒有這個就只能聽，
 調參時看不出是哪一句慢。"""
+
+FRAME_UTTER = 0x05
+"""語音輸入的轉錄結果（使用者說了什麼 + STT 延遲）。"""
+
+FRAME_EVENT = 0x06
+"""狀態事件：VAD speech/silence、barge_in。前端據此顯示聆聽狀態、停播。"""
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -80,6 +89,76 @@ def json_frame(kind: int, obj: Any) -> bytes:
     return frame(kind, json.dumps(obj, ensure_ascii=False).encode("utf-8"))
 
 
+class _PushSource:
+    """由 HTTP 執行緒餵資料的 AudioSource。
+
+    瀏覽器的音訊 chunk 經 POST 進來（HTTP 執行緒），管線在 loop 執行緒
+    消費——跨執行緒一律走 ``call_soon_threadsafe``。滿了丟最舊：
+    對話場景裡遲到的音訊沒有價值，堵住上傳只會讓延遲雪球。
+    """
+
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        sample_rate: int,
+        max_chunks: int = 256,
+    ) -> None:
+        self._loop = loop
+        self._sample_rate = sample_rate
+        self._queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=max_chunks)
+
+    @property
+    def sample_rate(self) -> int:
+        return self._sample_rate
+
+    def push(self, pcm: bytes) -> None:
+        """從 HTTP 執行緒餵入一個 int16 PCM chunk。"""
+        self._loop.call_soon_threadsafe(self._enqueue, pcm)
+
+    def close(self) -> None:
+        """從 HTTP 執行緒宣告結束。stream 消化完殘餘後正常結束（會 flush）。"""
+        self._loop.call_soon_threadsafe(self._enqueue, None)
+
+    def _enqueue(self, item: bytes | None) -> None:
+        if self._queue.full():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self._queue.get_nowait()
+        self._queue.put_nowait(item)
+
+    async def stream(self, token):  # noqa: ANN001 - AudioSource 契約
+        while not token.is_cancelled:
+            get_task = asyncio.ensure_future(self._queue.get())
+            cancel_task = asyncio.ensure_future(token.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    {get_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED
+                )
+            finally:
+                for task in (get_task, cancel_task):
+                    if not task.done():
+                        task.cancel()
+            if get_task not in done:
+                return
+            item = get_task.result()
+            if item is None:
+                return
+            yield item
+
+
+class _FakeWebTranscriber:
+    """fake 模式的 transcriber——不辨識，只回報收到了多少語音。
+
+    存在的意義：讓「瀏覽器擷取 → 上傳 → VAD → turn 切分」這整條
+    串流接收路徑能在沒有 Whisper、沒有 GPU 的機器上驗證。
+    """
+
+    def transcribe(self, pcm: bytes, sample_rate: int):
+        from ..adapters.input_stt import TranscriptionResult
+
+        seconds = len(pcm) / 2 / sample_rate
+        return TranscriptionResult(text=f"（fake 轉錄：收到 {seconds:.1f}s 語音）")
+
+
 class StreamService:
     """持有管線與常駐 event loop。"""
 
@@ -88,12 +167,14 @@ class StreamService:
         *,
         use_real_tts: bool = False,
         use_real_llm: bool = False,
+        use_real_stt: bool = False,
         split_policy: SplitPolicy | None = None,
         system_prompt: str = "",
         trace_path: str | None = None,
     ) -> None:
         self.use_real_tts = use_real_tts
         self.use_real_llm = use_real_llm
+        self.use_real_stt = use_real_stt
         self.split_policy = split_policy or SplitPolicy()
         self.system_prompt = system_prompt
         self.tracer = LatencyTracer(output_path=trace_path)
@@ -107,8 +188,14 @@ class StreamService:
         self._runner: PipelineRunner | None = None
         self._think = None
         self._speak = None
+        self._stt = None
         self._lock = threading.Lock()
         """序列化 turn。GPU 推理本來就無法並行，排隊比搶資源好。"""
+
+        self._voice: dict[str, Any] | None = None
+        """當前的語音 session（單使用者，一次一個）。"""
+
+        self._voice_lock = threading.Lock()
 
         self.ready = False
         self.load_error: str | None = None
@@ -128,7 +215,17 @@ class StreamService:
             self.load_error = f"{type(exc).__name__}: {exc}"
 
     async def _build(self) -> None:
+        from ..adapters.input_stt import SttInputStage
         from ..fakes import FakeSpeakStage, FakeThinkStage
+
+        # STT stage 建一次、跨 voice session 重用——真 Whisper 載入要數十秒，
+        # 不能每次按下麥克風都重載。fake 模式注入假 transcriber，
+        # 讓「瀏覽器擷取 → 上傳 → VAD → turn 切分」在無 GPU 環境也能驗證。
+        if self.use_real_stt:
+            self._stt = SttInputStage()
+        else:
+            self._stt = SttInputStage(backend=_FakeWebTranscriber())
+        await self._stt.prepare()
 
         if self.use_real_tts:
             from ..adapters.speak_indextts import IndexTTS2SpeakStage
@@ -191,6 +288,128 @@ class StreamService:
         done.wait(timeout=2.0)
         return bool(result and result[0])
 
+    # --- 語音 session ---
+
+    def voice_start(self) -> dict[str, Any]:
+        """建立語音 session。一次一個——重複 start 會頂掉舊的。"""
+        if not self.ready:
+            return {"error": "管線尚未就緒"}
+        with self._voice_lock:
+            self._voice_close_locked()
+            sid = uuid.uuid4().hex[:12]
+            session: dict[str, Any] = {
+                "sid": sid,
+                "source": _PushSource(self._loop, STT_SAMPLE_RATE),
+                "out": queue.Queue(maxsize=256),
+                "token": CancellationToken(),
+            }
+            self._voice = session
+            asyncio.run_coroutine_threadsafe(self._voice_loop(session), self._loop)
+            return {"sid": sid, "sample_rate": STT_SAMPLE_RATE}
+
+    def voice_push(self, sid: str, pcm: bytes) -> bool:
+        session = self._voice
+        if session is None or session["sid"] != sid:
+            return False
+        session["source"].push(pcm)
+        return True
+
+    def voice_stop(self, sid: str) -> bool:
+        """結束擷取。source 收尾後 STT 會 flush 殘餘語音再結束。"""
+        session = self._voice
+        if session is None or session["sid"] != sid:
+            return False
+        session["source"].close()
+        return True
+
+    def _voice_close_locked(self) -> None:
+        session = self._voice
+        if session is None:
+            return
+        session["source"].close()
+        self._loop.call_soon_threadsafe(
+            session["token"].cancel, CancelReason.SUPERSEDED
+        )
+        self._voice = None
+
+    async def _voice_loop(self, session: dict[str, Any]) -> None:
+        """語音 session 的主迴圈：STT 切出 turn → 跑管線 → frame 推回瀏覽器。
+
+        整段跑在 loop 執行緒。turn 之間天然序列化（async for 一次一個），
+        所以**不拿** ``self._lock``——那是 threading.Lock，在 loop 執行緒上
+        等它會卡死整個 event loop。語音與文字輸入同時打的邊界情況
+        由 GPU 排隊自然處理，單人測試不構成問題。
+        """
+        from ..core.turn_detector import DurationInterruptionDetector
+
+        stage = self._stt
+        out: queue.Queue = session["out"]
+        token: CancellationToken = session["token"]
+
+        def emit(payload: bytes) -> None:
+            with contextlib.suppress(queue.Full):
+                out.put_nowait(payload)
+
+        # 自動 barge-in：機器人講話中偵測到持續語音 → 中止。
+        # 判定器與 turn 判定分離（§7.5），門檻在 TurnPolicy。
+        detector = DurationInterruptionDetector(
+            self._runner.policy if self._runner else None
+        )
+        last_state: list[str | None] = [None]
+
+        def on_event(event) -> None:  # noqa: ANN001 - VoiceEvent
+            state = event.state.value
+            if state != last_state[0]:
+                last_state[0] = state
+                emit(json_frame(FRAME_EVENT, {"event": state}))
+            runner = self._runner
+            if runner is not None and runner.is_speaking:
+                if detector.evaluate(event).should_interrupt:
+                    if runner.interrupt(CancelReason.BARGE_IN):
+                        emit(json_frame(FRAME_EVENT, {"event": "barge_in"}))
+
+        stage.on_voice_event = on_event
+        try:
+            async for utterance in stage.stream(session["source"], token):
+                stt_ms = (time.perf_counter() - utterance.ended_at) * 1000
+                emit(
+                    json_frame(
+                        FRAME_UTTER,
+                        {
+                            "text": utterance.text,
+                            "stt_ms": round(stt_ms),
+                            "confidence": round(utterance.confidence, 2),
+                            "language": utterance.language,
+                        },
+                    )
+                )
+                # 傳真的 Utterance 而不是重建——ended_at 是真實的說完時刻，
+                # tracer 的 TTFA 才會把 STT 的耗時算進去
+                await self._run(utterance, emit)
+        except Exception as exc:  # noqa: BLE001
+            emit(json_frame(FRAME_ERROR, {"error": f"{type(exc).__name__}: {exc}"}))
+        finally:
+            stage.on_voice_event = None
+            with contextlib.suppress(queue.Full):
+                out.put_nowait(None)
+            if self._voice is session:
+                self._voice = None
+
+    def voice_frames(self, sid: str):
+        """給 GET handler 迭代的 frame 流。在 HTTP 執行緒上跑。"""
+        session = self._voice
+        if session is None or session["sid"] != sid:
+            return
+        out: queue.Queue = session["out"]
+        while True:
+            try:
+                item = out.get(timeout=60.0)
+            except queue.Empty:
+                continue  # 沒動靜就繼續等——長靜音是正常狀態
+            if item is None:
+                return
+            yield item
+
     # --- 執行 ---
 
     def run_turn(self, text: str, emit: Callable[[bytes], None]) -> None:
@@ -203,14 +422,15 @@ class StreamService:
             return
 
         with self._lock:
-            fut = asyncio.run_coroutine_threadsafe(self._run(text, emit), self._loop)
+            fut = asyncio.run_coroutine_threadsafe(
+                self._run(Utterance(text=text), emit), self._loop
+            )
             fut.result()
 
-    async def _run(self, text: str, emit: Callable[[bytes], None]) -> None:
+    async def _run(self, utterance: Utterance, emit: Callable[[bytes], None]) -> None:
         runner = self._runner
         assert runner is not None
 
-        utterance = Utterance(text=text)
         turn_id = utterance.turn_id
         t0 = time.perf_counter()
 
@@ -348,14 +568,47 @@ class _Handler(BaseHTTPRequestHandler):
                     "load_seconds": self.service.load_seconds,
                     "real_tts": self.service.use_real_tts,
                     "real_llm": self.service.use_real_llm,
+                    "real_stt": self.service.use_real_stt,
                 },
             )
+        elif self.path.startswith("/api/voice/stream"):
+            sid = self._query_param("sid")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                for payload in self.service.voice_frames(sid):
+                    self.wfile.write(f"{len(payload):X}\r\n".encode())
+                    self.wfile.write(payload)
+                    self.wfile.write(b"\r\n")
+                    self.wfile.flush()
+            except Exception:  # noqa: BLE001 - 瀏覽器斷線是正常結束
+                return
+            with contextlib.suppress(Exception):
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
         else:
             self._json(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
         if self.path == "/api/interrupt":
             self._json(200, {"interrupted": self.service.interrupt()})
+            return
+        if self.path == "/api/voice/start":
+            self._json(200, self.service.voice_start())
+            return
+        if self.path.startswith("/api/voice/audio"):
+            sid = self._query_param("sid")
+            length = int(self.headers.get("Content-Length", "0"))
+            pcm = self.rfile.read(length) if length else b""
+            ok = bool(pcm) and self.service.voice_push(sid, pcm)
+            self._json(200 if ok else 404, {"ok": ok})
+            return
+        if self.path.startswith("/api/voice/stop"):
+            sid = self._query_param("sid")
+            self._json(200, {"ok": self.service.voice_stop(sid)})
             return
         if self.path != "/api/say":
             self._json(404, {"error": "not found"})
@@ -402,6 +655,12 @@ class _Handler(BaseHTTPRequestHandler):
 
     # --- 工具 ---
 
+    def _query_param(self, key: str) -> str:
+        from urllib.parse import parse_qs, urlparse
+
+        values = parse_qs(urlparse(self.path).query).get(key)
+        return values[0] if values else ""
+
     def _send_file(self, path: Path, content_type: str) -> None:
         if not path.exists():
             self._json(404, {"error": f"missing {path.name}"})
@@ -429,6 +688,7 @@ def serve(
     *,
     real_tts: bool = False,
     real_llm: bool = False,
+    real_stt: bool = False,
     split_policy: SplitPolicy | None = None,
     system_prompt: str = "",
     trace_path: str | None = None,
@@ -439,6 +699,7 @@ def serve(
     service = StreamService(
         use_real_tts=real_tts,
         use_real_llm=real_llm,
+        use_real_stt=real_stt,
         split_policy=split_policy,
         system_prompt=system_prompt,
         trace_path=trace_path,
@@ -449,6 +710,7 @@ def serve(
     print("═" * 56)
     print(f"  TTS: {'真 IndexTTS2' if real_tts else 'fake'}")
     print(f"  LLM: {'真 OpenAI' if real_llm else 'fake'}")
+    print(f"  STT: {'真 Whisper' if real_stt else 'fake（只驗串流接收）'}")
     print("\n  載入管線中…", flush=True)
 
     service.prepare()

@@ -211,3 +211,97 @@ def test_未知路徑回_404(server):
     with pytest.raises(urllib.error.HTTPError) as exc:
         urllib.request.urlopen(f"{base}/nope", timeout=10)
     assert exc.value.code == 404
+
+
+# --- 語音 session ---
+
+
+def _tone_pcm(seconds: float, amplitude: float = 0.3) -> bytes:
+    import math
+    import struct as _struct
+
+    n = int(16_000 * seconds)
+    return _struct.pack(
+        f"<{n}h",
+        *(
+            int(amplitude * 32767 * math.sin(2 * math.pi * 220.0 * i / 16_000))
+            for i in range(n)
+        ),
+    )
+
+
+def _post_raw(url: str, body: bytes) -> bytes:
+    req = urllib.request.Request(url, data=body, method="POST")
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read()
+
+
+def test_語音_session_端到端(server):
+    """瀏覽器擷取 → 上傳 → VAD 切 turn →（fake）轉錄 → 管線回應。
+
+    這條路徑驗的是串流音訊接收：chunk 經 POST 進來、跨執行緒餵給
+    asyncio 管線、turn 切出來後 frame 從長連線推回去。
+    """
+    base, _ = server
+
+    info = json.loads(post(f"{base}/api/voice/start", {}))
+    sid = info["sid"]
+    assert info["sample_rate"] == 16_000
+
+    # 收 frame 的長連線（在背景執行緒讀）
+    collected: dict = {"raw": b""}
+
+    def read_stream():
+        req = urllib.request.Request(f"{base}/api/voice/stream?sid={sid}")
+        with urllib.request.urlopen(req, timeout=60) as r:
+            collected["raw"] = r.read()
+
+    reader = threading.Thread(target=read_stream, daemon=True)
+    reader.start()
+
+    # 推 0.8s 語音 + 1.2s 靜音（切出一個 turn），再 stop（觸發收尾）
+    speech = _tone_pcm(0.8)
+    quiet = b"\x00\x00" * int(16_000 * 1.2)
+    step = int(16_000 * 0.2) * 2  # 200ms 一個 chunk，模擬前端上傳節奏
+    stream_bytes = speech + quiet
+    for i in range(0, len(stream_bytes), step):
+        _post_raw(f"{base}/api/voice/audio?sid={sid}", stream_bytes[i : i + step])
+
+    _post_raw(f"{base}/api/voice/stop?sid={sid}", b"x")
+    reader.join(timeout=60)
+
+    frames = parse_frames(collected["raw"])
+    kinds = [k for k, _ in frames]
+
+    from echo_stream.web.server import FRAME_EVENT, FRAME_UTTER
+
+    assert FRAME_EVENT in kinds, "要有 VAD 狀態事件（前端聆聽指示）"
+    assert FRAME_UTTER in kinds, "要有轉錄結果 frame"
+    assert FRAME_AUDIO in kinds, "turn 要走完管線並回音訊"
+    assert FRAME_META in kinds
+
+    utter = json.loads([p for k, p in frames if k == FRAME_UTTER][0])
+    assert "fake 轉錄" in utter["text"]
+    assert utter["stt_ms"] >= 0
+
+    meta = json.loads([p for k, p in frames if k == FRAME_META][-1])
+    assert meta["phase"] == "done"
+
+
+def test_語音_audio_無效_sid_回_404(server):
+    base, _ = server
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _post_raw(f"{base}/api/voice/audio?sid=nope", b"\x00\x00" * 100)
+    assert exc.value.code == 404
+
+
+def test_語音_start_會頂掉舊_session(server):
+    base, _ = server
+    first = json.loads(post(f"{base}/api/voice/start", {}))
+    second = json.loads(post(f"{base}/api/voice/start", {}))
+    assert first["sid"] != second["sid"]
+    # 舊 sid 已失效
+    with pytest.raises(urllib.error.HTTPError):
+        _post_raw(f"{base}/api/voice/audio?sid={first['sid']}", b"\x00\x00" * 100)
+    # 清掉
+    _post_raw(f"{base}/api/voice/stop?sid={second['sid']}", b"x")

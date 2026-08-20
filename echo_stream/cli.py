@@ -65,6 +65,7 @@ def _run_serve(args: argparse.Namespace) -> int:
         port=args.port,
         real_tts=args.real_tts or args.real,
         real_llm=args.real_llm or args.real,
+        real_stt=args.real_stt or args.real,
         split_policy=SplitPolicy(
             first_min_weight=args.first_min,
             first_max_weight=args.first_max,
@@ -537,7 +538,8 @@ def build_parser() -> argparse.ArgumentParser:
     web.add_argument("--port", type=int, default=None)
     web.add_argument("--real-tts", action="store_true", help="用真 IndexTTS2（需要 GPU）")
     web.add_argument("--real-llm", action="store_true", help="用真 OpenAI（會消耗 token）")
-    web.add_argument("--real", action="store_true", help="TTS 與 LLM 都用真的")
+    web.add_argument("--real-stt", action="store_true", help="用真 Whisper（載入需要時間）")
+    web.add_argument("--real", action="store_true", help="STT / LLM / TTS 全用真的")
     web.add_argument("--system", default=None, help="system prompt")
     web.add_argument("--trace", default=None, help="打點輸出的 JSONL 路徑")
     _add_split_args(web)
