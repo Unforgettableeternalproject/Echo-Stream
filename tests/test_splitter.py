@@ -74,8 +74,13 @@ async def test_結尾引號跟著句子走():
 
 
 async def test_小數點不切():
-    """3.14 的點不是句末——這是串流切分最典型的誤判。"""
-    result = await collect("圓周率大約是3.14這個數字很常用喔。")
+    """3.14 的點不是句末——這是串流切分最典型的誤判。
+
+    刻意放寬長度上限：這裡驗的是「標點判定」，不能讓長度強制切分
+    混進來當變因。
+    """
+    loose = SplitPolicy(first_max_weight=999.0, max_weight=999.0)
+    result = await collect("圓周率大約是3.14這個數字很常用喔。", loose)
     assert len(result) == 1
     assert "3.14" in result[0]
 

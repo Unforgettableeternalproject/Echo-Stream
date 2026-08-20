@@ -95,12 +95,47 @@ class StreamChannel(Generic[T]):
     # --- 寫入 ---
 
     async def put(self, item: T) -> None:
-        """寫入。通道滿時阻塞——這就是背壓。"""
+        """寫入。通道滿時阻塞——這就是背壓。
+
+        阻塞期間仍可被取消。這條路徑是 barge-in 能穿透到 GPU 推理的關鍵：
+        TTS 的同步 callback 透過 :meth:`put_threadsafe` 阻塞在這裡，
+        取消時它會拿到 :class:`CancelledError`，從 callback 拋出去，
+        中止正在跑的 ``generate()``。不能被取消的話，插話會卡死
+        ——沒有消費者了，卻還在等空位。
+        """
         if self._closed:
             raise ChannelClosed("通道已關閉")
-        if self._token is not None:
-            self._token.raise_if_cancelled()
-        await self._queue.put(item)
+
+        if self._token is None:
+            await self._queue.put(item)
+            self._item_event.set()
+            return
+
+        self._token.raise_if_cancelled()
+        if not self._queue.full():
+            self._queue.put_nowait(item)
+            self._item_event.set()
+            return
+
+        put_task = asyncio.ensure_future(self._queue.put(item))
+        cancel_task = asyncio.ensure_future(self._token.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {put_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+        except BaseException:
+            # 外部把整個 task 取消掉（例如 feeder 被中止）。兩個內部 task
+            # 都要清掉，否則會留下懸空的 Queue.put coroutine，
+            # 在 event loop 關閉後才爆出 "Event loop is closed"。
+            put_task.cancel()
+            cancel_task.cancel()
+            raise
+        finally:
+            if not cancel_task.done():
+                cancel_task.cancel()
+        if put_task not in done:
+            put_task.cancel()
+            raise CancelledError(self._token.reason or CancelReason.SHUTDOWN)
         self._item_event.set()
 
     def put_threadsafe(self, item: T, loop: asyncio.AbstractEventLoop) -> None:

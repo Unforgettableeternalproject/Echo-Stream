@@ -8,6 +8,8 @@ dist/
 env/
 venv/
 .venv/
+.env
+.env.*
 
 # 量測輸出
 traces/
