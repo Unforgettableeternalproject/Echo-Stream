@@ -256,3 +256,20 @@ class TestVoiceEventHook:
         )
         results = await collect(stage, source)
         assert len(results) == 2
+
+
+class TestConfidenceGate:
+    @pytest.mark.asyncio
+    async def test_低信心轉錄被擋下(self) -> None:
+        class NoisyBackend:
+            def transcribe(self, pcm: bytes, sample_rate: int):
+                return TranscriptionResult(text="Hello!", confidence=0.2)
+
+        stage = SttInputStage(
+            backend=NoisyBackend(),
+            policy=TurnPolicy(silence_threshold_s=0.7, min_utterance_s=0.3),
+            vad=EnergyVad(sample_rate=SR),
+            min_confidence=0.35,
+        )
+        results = await collect(stage, ScriptedSource(tone(0.8) + silence(1.0)))
+        assert results == []

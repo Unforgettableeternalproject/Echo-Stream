@@ -91,6 +91,18 @@ def speed_multiplier_to_offset(multiplier: float) -> float:
     return max(-1.0, min(1.0, offset))
 
 
+_TTS_STRIP_CHARS = "「」『』【】《》〈〉“”‘’\"'`*_#~<>|（）()［］[]"
+"""合成前剔除的符號。引號會被 IndexTTS 唸出怪聲（實測），
+括號、markdown 記號同理——它們是視覺標記，不是語音內容。
+逗號句號等韻律標點**保留**，那些影響停頓，是語音的一部分。"""
+
+
+def sanitize_for_tts(text: str) -> str:
+    """清掉不該被唸出來的符號，並收攏多餘空白。"""
+    cleaned = text.translate({ord(c): None for c in _TTS_STRIP_CHARS})
+    return " ".join(cleaned.split())
+
+
 def tensor_to_pcm16(tensor: Any) -> bytes:
     """把引擎吐出的音訊轉成 int16 little-endian PCM bytes。
 
@@ -334,6 +346,9 @@ class IndexTTS2SpeakStage:
         chunk_index = 0
         output_path = self._next_output_path(sentence)
         self._apply_style(sentence.style)
+        speak_text = sanitize_for_tts(sentence.text)
+        if not speak_text:
+            return  # 整句都是符號（例如純引號）——沒東西可唸
 
         def on_segment(tensor: Any, seg_idx: int, total: int) -> None:
             nonlocal chunk_index
@@ -354,7 +369,7 @@ class IndexTTS2SpeakStage:
 
         try:
             self._backend.generate(
-                sentence.text,
+                speak_text,
                 output_path,
                 on_segment_audio=on_segment,
                 language=self.language,
@@ -410,6 +425,7 @@ class IndexTTS2SpeakStage:
 
 __all__ = [
     "IndexTTS2SpeakStage",
+    "sanitize_for_tts",
     "tensor_to_pcm16",
     "speed_multiplier_to_offset",
     "DEFAULT_SAMPLE_RATE",

@@ -100,7 +100,8 @@
         <button id="stop" class="ghost" disabled>插話</button>
       </div>
     </div>
-    <div class="hint" id="hint">首次送出會啟用音訊播放（瀏覽器要求使用者互動）。
+    <div class="hint" id="hint">🎤 聆聽開啟時：講完停頓即送出，機器人講話時<b>直接開口就會打斷</b>（自動判定）。
+      「插話」鈕是文字模式（沒開麥克風）用的手動打斷。
       <span id="voice-state"></span></div>
   </div>
 
@@ -168,13 +169,19 @@ function makeParser(onFrame) {
 }
 
 // ── UI ────────────────────────────────────────────────────────────
+let lastSentMs = 0;
 function addSentence(s) {
   const box = $("sentences");
-  if (box.querySelector(".empty")) box.innerHTML = "";
+  if (box.querySelector(".empty")) { box.innerHTML = ""; lastSentMs = 0; }
+  // 首句顯示絕對時間（那是 TTFA 的成分），後續顯示「距上一句」的增量——
+  // 累計值到長回應後段會變成十幾萬 ms，沒有可讀性
+  const delta = s.is_first ? s.ms : s.ms - lastSentMs;
+  lastSentMs = s.ms;
+  const label = (s.is_first ? "" : "+") + Math.round(delta) + "ms";
   const el = document.createElement("div");
   el.className = "sent" + (s.is_first ? " first" : "");
   el.innerHTML = `<span class="idx">${s.index}</span>
-                  <span class="ms">${Math.round(s.ms)}ms</span>
+                  <span class="ms" title="累計 ${Math.round(s.ms)}ms">${label}</span>
                   <span>${s.text.replace(/</g, "&lt;")}</span>`;
   box.appendChild(el);
 }

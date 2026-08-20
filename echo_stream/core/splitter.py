@@ -206,12 +206,22 @@ class SentenceSplitter:
                         # 把結尾引號一起帶走
                         while cut < len(buffer) and buffer[cut] in CLOSING_PUNCT:
                             cut += 1
-                        head, buffer = buffer[:cut], buffer[cut:]
+                        head = buffer[:cut]
                         pending_ascii_at = -1
-                        if head.strip():
-                            yield self._make(head, turn_id, index, "terminal")
-                            index += 1
-                        continue
+                        # 句末標點也要達最短長度——"Of course!" 這種短句
+                        # 單獨合成會各吃一次 TTS 固定開銷，且語氣破碎。
+                        # 不夠長就不切，併入下一句一起講。
+                        floor = (
+                            self.policy.first_min_weight
+                            if index == 0
+                            else self.policy.min_weight
+                        )
+                        if text_weight(head) >= floor:
+                            buffer = buffer[cut:]
+                            if head.strip():
+                                yield self._make(head, turn_id, index, "terminal")
+                                index += 1
+                            continue
 
                 weight = text_weight(buffer)
                 is_first = index == 0
@@ -222,12 +232,14 @@ class SentenceSplitter:
                     self.policy.first_min_weight if is_first else self.policy.min_weight
                 )
 
-                # 2. 全形句末標點：可以立即切（不會有小數點歧義）
+                # 2. 全形句末標點：立即切（不會有小數點歧義），但同樣要達
+                #    最短長度——太短就繼續累積，併入下一句
                 if ch in TERMINAL_PUNCT_FULLWIDTH:
-                    head, buffer = buffer, ""
-                    if head.strip():
-                        yield self._make(head, turn_id, index, "terminal")
-                        index += 1
+                    if weight >= min_w:
+                        head, buffer = buffer, ""
+                        if head.strip():
+                            yield self._make(head, turn_id, index, "terminal")
+                            index += 1
                     continue
 
                 # 3. 半形句末標點：進入待決狀態，等下一個字元

@@ -56,17 +56,17 @@ def test_日文假名與中文同權重():
 
 
 async def test_全形句末標點立即切():
-    result = await collect("你好。今天天氣真好。")
+    result = await collect("你好。今天天氣真好。", SplitPolicy(first_min_weight=1.0, min_weight=1.0))
     assert result == ["你好。", "今天天氣真好。"]
 
 
 async def test_全形問號驚嘆號():
-    result = await collect("真的嗎？太好了！")
+    result = await collect("真的嗎？太好了！", SplitPolicy(first_min_weight=1.0, min_weight=1.0))
     assert result == ["真的嗎？", "太好了！"]
 
 
 async def test_結尾引號跟著句子走():
-    result = await collect('他說「好啊."後面繼續講一些別的內容。')
+    result = await collect('他說「好啊."後面繼續講一些別的內容。', SplitPolicy(first_min_weight=1.0, min_weight=1.0))
     assert result[0].endswith('"') or "」" in result[0] or result[0].endswith("好啊.")
 
 
@@ -86,13 +86,13 @@ async def test_小數點不切():
 
 
 async def test_省略號不切():
-    result = await collect("我想想...應該可以吧。")
+    result = await collect("我想想...應該可以吧。", SplitPolicy(first_min_weight=1.0, min_weight=1.0))
     assert all("." not in r or r.count(".") >= 2 for r in result[:1])
     assert len(result) <= 2
 
 
 async def test_半形句號在後面有字時才切():
-    result = await collect("Hello world. This is fine.")
+    result = await collect("Hello world. This is fine.", SplitPolicy(first_min_weight=1.0, min_weight=1.0))
     assert len(result) >= 1
     assert result[0].startswith("Hello")
 
@@ -199,7 +199,7 @@ async def test_取消時拋出():
 
 async def test_split_reason_可分類():
     """調參時要看這個分布：max_length 佔比過高代表閾值要調。"""
-    result = await collect_full("你好。這是一段比較長的句子，裡面有逗號分隔的內容。")
+    result = await collect_full("你好。這是一段比較長的句子，裡面有逗號分隔的內容。", SplitPolicy(first_min_weight=1.0, min_weight=1.0))
     reasons = {s.split_reason for s in result}
     assert "terminal" in reasons
 
@@ -207,3 +207,14 @@ async def test_split_reason_可分類():
 def test_text_weight_累加():
     assert text_weight("你好") == 2.0
     assert text_weight("，。") == 0.0
+
+
+async def test_過短的句末不切_併入下一句():
+    """"Of course!" 這種兩三字短句單獨合成會各吃一次 TTS 固定開銷，
+    且語氣破碎——句末標點也要達最短長度，不夠就併入下一句。"""
+    result = await collect(
+        "好。那我們就從這裡開始講起吧。",
+        SplitPolicy(first_min_weight=6.0, first_max_weight=999.0, min_weight=12.0),
+    )
+    assert len(result) == 1
+    assert result[0].startswith("好。")

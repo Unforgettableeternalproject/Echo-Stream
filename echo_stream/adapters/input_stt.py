@@ -104,6 +104,7 @@ class SttInputStage:
         policy: TurnPolicy | None = None,
         vad: EnergyVad | None = None,
         language: str | None = None,
+        min_confidence: float | None = None,
         preroll_s: float = 0.2,
         max_pending_segments: int = 4,
         queue_size: int = 2,
@@ -115,6 +116,14 @@ class SttInputStage:
         self.turn_detector = turn_detector or SilenceTurnDetector(self.policy)
         self.vad = vad or EnergyVad()
         self.language = language or config.get("ECHO_STREAM_STT_LANGUAGE")
+        self.min_confidence = (
+            min_confidence
+            if min_confidence is not None
+            else config.get_float("ECHO_STREAM_STT_MIN_CONFIDENCE", 0.35)
+        )
+        """低於此信心值的轉錄直接丟棄，不進 LLM。
+        雜訊誤轉錄（實測 "Hello!" conf=0.2 之類）會觸發一整輪
+        LLM + TTS，浪費之外還會污染對話歷史。實測正常語音 conf 0.6+。"""
         self.preroll_s = preroll_s
         """語音起點前保留的音訊量。VAD 判定總比實際起音晚一點，
         不補前導的話每句的第一個字會被削掉。"""
@@ -320,6 +329,8 @@ class SttInputStage:
                 )
                 if result is None or not result.text.strip():
                     continue
+                if result.confidence < self.min_confidence:
+                    continue  # 雜訊誤轉錄：擋在 LLM 之前（見 min_confidence）
                 await out.put(
                     Utterance(
                         text=result.text.strip(),
