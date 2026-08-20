@@ -1,0 +1,47 @@
+[project]
+name = "echo-stream"
+version = "0.1.0"
+description = "U.E.P 串流語音對話管線整合層——只做契約、串接、背壓、取消、量測"
+authors = [{ name = "U.E.P Team" }]
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+# Phase 0 骨架刻意保持零第三方依賴（純 asyncio + 標準庫），
+# 這樣不需要建環境就能秒級迭代。真模組的依賴放在 optional-dependencies，
+# 目前統一沿用 U.E.P Core 的 Python 環境，本專案不自建 env/。
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4.0", "pytest-asyncio>=0.23.0", "ruff>=0.1.9"]
+# Phase 1+ 接真模組時才需要，屆時由 U.E.P Core 環境提供
+real = [
+    "numpy>=1.24.0",
+    "soundfile>=0.12.1",
+]
+
+[project.scripts]
+echo-stream = "echo_stream.cli:main"
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["echo_stream*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-q"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+env/
+venv/
+.venv/
+
+# 量測輸出
+traces/
+outputs/
+*.jsonl
+
+# 編輯器
+.vscode/
+.idea/
+*.swp
+
+# 本機設定
+.claude/settings.local.json
