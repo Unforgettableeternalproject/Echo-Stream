@@ -10,9 +10,7 @@ Phase 1 的多數 bug 會出在 push→pull 橋接而不是模型，
 from __future__ import annotations
 
 import asyncio
-import math
 import threading
-import time
 from collections.abc import AsyncIterator
 
 import pytest
@@ -20,64 +18,9 @@ import pytest
 from echo_stream.adapters.speak_indextts import IndexTTS2SpeakStage, tensor_to_pcm16
 from echo_stream.contracts.cancellation import CancellationToken, CancelReason
 from echo_stream.contracts.types import Sentence
+from tests.conftest import FakeTTSBackend as FakeBackend, sentence_stream
 
 np = pytest.importorskip("numpy", reason="adapter 的音訊轉換需要 numpy")
-
-
-class FakeBackend:
-    """模擬 IndexTTS2Backend 的同步 push callback 行為。"""
-
-    def __init__(
-        self,
-        segments_per_sentence: int = 2,
-        segment_seconds: float = 0.5,
-        synth_delay_s: float = 0.0,
-        sample_rate: int = 22050,
-    ) -> None:
-        self.segments_per_sentence = segments_per_sentence
-        self.segment_seconds = segment_seconds
-        self.synth_delay_s = synth_delay_s
-        self.sample_rate = sample_rate
-        self.calls: list[str] = []
-        self.loaded = False
-        self.completed: list[str] = []
-        """完整跑完 generate 的句子。被取消時不會進來——用來驗證上游確實中止。"""
-
-    def load(self) -> None:
-        self.loaded = True
-
-    def generate(
-        self,
-        text,
-        output_path,
-        on_segment_audio=None,
-        language=None,
-        emotion_overrides=None,
-    ):
-        self.calls.append(text)
-        total = self.segments_per_sentence
-        samples = int(self.sample_rate * self.segment_seconds)
-        for idx in range(total):
-            if self.synth_delay_s:
-                time.sleep(self.synth_delay_s)
-            wave = np.sin(
-                2 * math.pi * 220.0 * np.arange(samples) / self.sample_rate
-            ).astype("float32") * 0.2
-            if on_segment_audio is not None:
-                on_segment_audio(wave, idx, total)
-        self.completed.append(text)
-        return output_path
-
-
-async def sentence_stream(texts: list[str], turn_id: str = "t1") -> AsyncIterator[Sentence]:
-    for i, text in enumerate(texts):
-        yield Sentence(
-            text=text,
-            turn_id=turn_id,
-            index=i,
-            is_first=i == 0,
-            is_last=i == len(texts) - 1,
-        )
 
 
 # --- 音訊轉換 ---

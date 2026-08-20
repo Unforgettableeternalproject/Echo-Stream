@@ -53,6 +53,7 @@ from typing import Any
 
 from .. import config
 from ..contracts.cancellation import CancellationToken, CancelledError, CancelReason
+from ..contracts.style import SpeechStyle
 from ..contracts.types import TTS_SAMPLE_RATE, AudioChunk, Sentence
 from ..core.channel import StreamChannel
 
@@ -62,6 +63,32 @@ DEFAULT_SAMPLE_RATE = TTS_SAMPLE_RATE
 
 class _Aborted(Exception):
     """內部訊號：從 callback 拋出以中止 ``generate()``。"""
+
+
+CONFIG_STRETCH_RATIO = 1.72
+"""引擎 config 的 ``s2mel_stretch_ratio`` 預設值。
+
+引擎裡的關係是 ``stretch_ratio = config_stretch_ratio - speed × 0.5``，
+stretch 越大唸得越慢。
+"""
+
+
+def speed_multiplier_to_offset(multiplier: float) -> float:
+    """把 :attr:`SpeechStyle.speed` 的**倍率**換成 IndexTTS 的 speed 偏移。
+
+    契約層用倍率（1.0 = 正常、1.1 = 快 10%），因為那是 backend 無關的說法；
+    IndexTTS 用 -1~1 的偏移。換算：
+
+        stretch = CONFIG / r        （要快 r 倍，就把拉伸縮小 r 倍）
+        offset  = (CONFIG - stretch) / 0.5 = 2 × CONFIG × (1 - 1/r)
+
+    夾在 [-1, 1]，超出範圍的倍率會被截斷而不是拋錯——
+    語速設過頭應該是「頂到底」，不該讓整個 turn 掛掉。
+    """
+    if multiplier <= 0:
+        return 0.0
+    offset = 2.0 * CONFIG_STRETCH_RATIO * (1.0 - 1.0 / multiplier)
+    return max(-1.0, min(1.0, offset))
 
 
 def tensor_to_pcm16(tensor: Any) -> bytes:
@@ -306,6 +333,7 @@ class IndexTTS2SpeakStage:
         """在 executor 執行緒裡跑同步推理。**這個函式不在 event loop 上。**"""
         chunk_index = 0
         output_path = self._next_output_path(sentence)
+        self._apply_style(sentence.style)
 
         def on_segment(tensor: Any, seg_idx: int, total: int) -> None:
             nonlocal chunk_index
@@ -339,6 +367,31 @@ class IndexTTS2SpeakStage:
                 with contextlib.suppress(OSError):
                     Path(output_path).unlink(missing_ok=True)
 
+    def _apply_style(self, style: SpeechStyle | None) -> None:
+        """把句子的 :class:`SpeechStyle` 翻譯成 IndexTTS 的原生控制。
+
+        在 executor 執行緒裡呼叫，且句子是**序列**合成的（一次一句），
+        所以直接改 backend 狀態是安全的——不會有兩句同時在改。
+
+        ``style`` 為 None 或中性時完全不動 backend：預設音色是既有資產，
+        adapter 不該無故覆寫它。
+
+        ``expressiveness`` 與 ``volume`` 目前沒有對應的 IndexTTS 參數，
+        會被忽略——這是刻意的，SpeechStyle 是**各後端取所需**的共同描述，
+        不是每個欄位都保證被實作。
+        """
+        if style is None:
+            return
+
+        backend = self._backend
+        if not style.is_neutral:
+            backend.emotion_vector = style.emotion_vector()
+
+        if style.speed != 1.0:
+            set_speed = getattr(backend, "set_speed", None)
+            if callable(set_speed):
+                set_speed(speed_multiplier_to_offset(style.speed))
+
     def _next_output_path(self, sentence: Sentence) -> Path:
         """`generate()` 一定要寫檔，即使我們只要 callback 的音訊。
 
@@ -355,4 +408,10 @@ class IndexTTS2SpeakStage:
         return base / f"{sentence.turn_id}_{sentence.index:03d}.wav"
 
 
-__all__ = ["IndexTTS2SpeakStage", "tensor_to_pcm16", "DEFAULT_SAMPLE_RATE"]
+__all__ = [
+    "IndexTTS2SpeakStage",
+    "tensor_to_pcm16",
+    "speed_multiplier_to_offset",
+    "DEFAULT_SAMPLE_RATE",
+    "CONFIG_STRETCH_RATIO",
+]
