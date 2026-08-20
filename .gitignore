@@ -24,4 +24,4 @@ outputs/
 *.swp
 
 # 本機設定
-.claude/settings.local.json
+.claude/

@@ -38,6 +38,7 @@ import io
 import json
 import queue
 import struct
+import sys
 import threading
 import time
 import uuid
@@ -714,7 +715,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 class _StrictServer(ThreadingHTTPServer):
-    """不設 SO_REUSEADDR 的 HTTP server。
+    """不設 SO_REUSEADDR、且不把客戶端斷線當錯誤的 HTTP server。
 
     Python 預設 ``allow_reuse_address=1``，在 Windows 上這代表**兩個行程
     可以同時 bind 同一個 port**——舊 server 沒關乾淨時，新 server 啟動
@@ -723,6 +724,21 @@ class _StrictServer(ThreadingHTTPServer):
     """
 
     allow_reuse_address = False
+
+    def handle_error(self, request, client_address) -> None:  # noqa: ANN001
+        """客戶端斷線（WinError 10054 等）不印 traceback。
+
+        語音串流的長連線被前端 ``abort()``、使用者關頁面、tunnel 探測——
+        這些都以「強制關閉連線」收場，是串流服務的日常而非錯誤。
+        預設實作會把完整 traceback 刷到主控台，嚇人且淹掉真正的錯誤。
+        其他例外照常報。
+        """
+        exc = sys.exc_info()[1]
+        if isinstance(
+            exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)
+        ):
+            return
+        super().handle_error(request, client_address)
 
 
 def serve(
