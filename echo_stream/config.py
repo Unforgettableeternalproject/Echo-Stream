@@ -41,15 +41,20 @@ def _dotenv_values() -> dict[str, str]:
     """讀取專案根目錄的 `.env`。
 
     格式是最樸素的 ``KEY=VALUE``，支援 ``#`` 註解與前後引號。
-    不支援變數展開、多行值——需要那些就該用真的設定系統了。
+    引號包起來的值可以跨多行（``SYSTEM_PROMPT`` 這類人設會用到）——
+    開引號後一路收集到出現閉引號的那一行為止，換行保留。
+    不支援變數展開——需要那個就該用真的設定系統了。
     """
     path = _project_root() / ENV_FILENAME
     if not path.exists():
         return {}
 
     values: dict[str, str] = {}
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
+    lines = path.read_text(encoding="utf-8").splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        i += 1
         if not line or line.startswith("#"):
             continue
         if line.startswith("export "):
@@ -59,8 +64,22 @@ def _dotenv_values() -> dict[str, str]:
             continue
         key = key.strip()
         value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
+        if value and value[0] in "\"'":
+            quote = value[0]
+            if len(value) >= 2 and value.endswith(quote):
+                value = value[1:-1]
+            else:
+                # 多行值：逐行收集到閉引號。後續行**不** strip——
+                # 縮排可能是人設內容的一部分
+                parts = [value[1:]]
+                while i < len(lines):
+                    raw = lines[i]
+                    i += 1
+                    if raw.rstrip().endswith(quote):
+                        parts.append(raw.rstrip()[:-1])
+                        break
+                    parts.append(raw)
+                value = "\n".join(parts)
         if key:
             values[key] = value
     return values

@@ -177,7 +177,17 @@ class StreamService:
         self.use_real_stt = use_real_stt
         self.split_policy = split_policy or SplitPolicy()
         self.system_prompt = system_prompt
+
+        # 每次啟動自動開一個 session log（JSONL，逐 turn 一筆）——
+        # 測試結果要能事後分析，不能只活在瀏覽器畫面上。
+        session_tag = time.strftime("%Y%m%d_%H%M%S")
+        log_dir = Path(__file__).parents[2] / "outputs" / "web_logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        self.log_path: Path = log_dir / f"session_{session_tag}.jsonl"
+        if trace_path is None:
+            trace_path = str(log_dir / f"session_{session_tag}_trace.jsonl")
         self.tracer = LatencyTracer(output_path=trace_path)
+        self.trace_path = trace_path
 
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
@@ -288,6 +298,17 @@ class StreamService:
         done.wait(timeout=2.0)
         return bool(result and result[0])
 
+    # --- 記錄 ---
+
+    def _log(self, record: dict[str, Any]) -> None:
+        """寫一筆 JSONL。失敗不擋主流程——log 是旁路。"""
+        record["at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        try:
+            with self.log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+
     # --- 語音 session ---
 
     def voice_start(self) -> dict[str, Any]:
@@ -367,22 +388,20 @@ class StreamService:
                 if detector.evaluate(event).should_interrupt:
                     if runner.interrupt(CancelReason.BARGE_IN):
                         emit(json_frame(FRAME_EVENT, {"event": "barge_in"}))
+                        self._log({"type": "barge_in"})
 
         stage.on_voice_event = on_event
         try:
             async for utterance in stage.stream(session["source"], token):
                 stt_ms = (time.perf_counter() - utterance.ended_at) * 1000
-                emit(
-                    json_frame(
-                        FRAME_UTTER,
-                        {
-                            "text": utterance.text,
-                            "stt_ms": round(stt_ms),
-                            "confidence": round(utterance.confidence, 2),
-                            "language": utterance.language,
-                        },
-                    )
-                )
+                utter_info = {
+                    "text": utterance.text,
+                    "stt_ms": round(stt_ms),
+                    "confidence": round(utterance.confidence, 2),
+                    "language": utterance.language,
+                }
+                emit(json_frame(FRAME_UTTER, utter_info))
+                self._log({"type": "utterance", **utter_info})
                 # 傳真的 Utterance 而不是重建——ended_at 是真實的說完時刻，
                 # tracer 的 TTFA 才會把 STT 的耗時算進去
                 await self._run(utterance, emit)
@@ -445,28 +464,25 @@ class StreamService:
 
         trace = self.tracer.get(turn_id)
         segments = trace.segments_ms() if trace else {}
-        emit(
-            json_frame(
-                FRAME_META,
-                {
-                    "turn_id": turn_id,
-                    "phase": result.phase.value,
-                    "cancel_reason": result.cancel_reason,
-                    "error": result.error,
-                    "generated": result.generated_text,
-                    "spoken": result.spoken_text,
-                    "segments_ms": {
-                        k: (round(v, 1) if v is not None else None)
-                        for k, v in segments.items()
-                    },
-                    "sentences": trace.sentence_count if trace else 0,
-                    "chunks": trace.chunk_count if trace else 0,
-                    "split_reasons": dict(trace.split_reasons) if trace else {},
-                    "audio_seconds": round(sink.written_duration_s, 2),
-                    "report": self.tracer.report(turn_id),
-                },
-            )
-        )
+        meta = {
+            "turn_id": turn_id,
+            "phase": result.phase.value,
+            "cancel_reason": result.cancel_reason,
+            "error": result.error,
+            "generated": result.generated_text,
+            "spoken": result.spoken_text,
+            "segments_ms": {
+                k: (round(v, 1) if v is not None else None)
+                for k, v in segments.items()
+            },
+            "sentences": trace.sentence_count if trace else 0,
+            "chunks": trace.chunk_count if trace else 0,
+            "split_reasons": dict(trace.split_reasons) if trace else {},
+            "audio_seconds": round(sink.written_duration_s, 2),
+            "report": self.tracer.report(turn_id),
+        }
+        emit(json_frame(FRAME_META, meta))
+        self._log({"type": "turn", "input": utterance.text, **meta})
 
 
 class _EmitThink:
@@ -711,6 +727,9 @@ def serve(
     print(f"  TTS: {'真 IndexTTS2' if real_tts else 'fake'}")
     print(f"  LLM: {'真 OpenAI' if real_llm else 'fake'}")
     print(f"  STT: {'真 Whisper' if real_stt else 'fake（只驗串流接收）'}")
+    print(f"  Log: {service.log_path}")
+    if system_prompt:
+        print(f"  System prompt: {len(system_prompt)} 字")
     print("\n  載入管線中…", flush=True)
 
     service.prepare()

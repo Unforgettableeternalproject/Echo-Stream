@@ -57,6 +57,18 @@ def _build_speak_stage(args: argparse.Namespace):
     return stage, stage.sample_rate
 
 
+def _combined_system_prompt(explicit: str | None) -> str:
+    """把 .env 的 ``SYSTEM_PROMPT``（U.E.P 人設）接在最前面。
+
+    順序是刻意的：人設是基底，`--system` 是這次測試的補充指示，
+    後者不該蓋掉前者。
+    """
+    from . import config
+
+    parts = [config.get("SYSTEM_PROMPT") or "", explicit or ""]
+    return "\n\n".join(p for p in parts if p)
+
+
 def _run_serve(args: argparse.Namespace) -> int:
     from .web.server import serve
 
@@ -72,7 +84,7 @@ def _run_serve(args: argparse.Namespace) -> int:
             min_weight=args.min_weight,
             max_weight=args.max_weight,
         ),
-        system_prompt=args.system or "",
+        system_prompt=_combined_system_prompt(args.system),
         trace_path=args.trace,
     )
     return 0
