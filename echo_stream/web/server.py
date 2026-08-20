@@ -221,6 +221,16 @@ class StreamService:
             fut.result()
             self.ready = True
             self.load_seconds = time.perf_counter() - t0
+            self._log(
+                {
+                    "type": "session_start",
+                    "real_stt": self.use_real_stt,
+                    "real_llm": self.use_real_llm,
+                    "real_tts": self.use_real_tts,
+                    "system_prompt_chars": len(self.system_prompt),
+                    "load_seconds": round(self.load_seconds, 1),
+                }
+            )
         except Exception as exc:  # noqa: BLE001
             self.load_error = f"{type(exc).__name__}: {exc}"
 

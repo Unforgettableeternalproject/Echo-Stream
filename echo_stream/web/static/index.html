@@ -221,18 +221,44 @@ function renderReport(meta) {
     </p>`;
 }
 
+// ── 管線狀態指示 ──────────────────────────────────────────────────
+// 每一段延遲都有對應的階段，讓使用者知道現在卡在哪，而不是乾等。
+let phase = "idle";       // idle → hear → transcribe → think → synth → play
+let heardSpeech = false;  // 這一輪有沒有收過語音（分辨「斷句中」與「純靜音」）
+
+function setPhase(p) {
+  phase = p;
+  const vs = $("voice-state");
+  const TEXTS = {
+    idle:       ["○ 聆聽中", ""],
+    hear:       ["● 收到語音", "speech"],
+    transcribe: ["⋯ 斷句／轉錄中", "speech"],
+    think:      ["🧠 思考中（等 LLM 首句）", "speech"],
+    synth:      ["🔊 合成語音中", "speech"],
+    play:       ["▶ 播放中（可直接開口插話）", "speech"],
+  };
+  const [t, cls] = TEXTS[p] || TEXTS.idle;
+  vs.textContent = t;
+  vs.className = cls;
+}
+
 // ── Frame 處理（文字送出與語音模式共用）─────────────────────────────
 function handleFrame(kind, payload) {
   const text = () => JSON.parse(new TextDecoder().decode(payload));
   if (kind === FRAME.AUDIO) {
     playChunk(payload);
+    if (phase === "think" || phase === "synth") setPhase("play");
   } else if (kind === FRAME.TEXT) {
     addSentence(text());
+    if (phase === "think") setPhase("synth");
   } else if (kind === FRAME.META) {
     renderReport(text());
     $("stop").disabled = true;
+    heardSpeech = false;
+    setPhase("idle");
   } else if (kind === FRAME.ERROR) {
     $("report").innerHTML = `<p class="bad">${text().error}</p>`;
+    setPhase("idle");
   } else if (kind === FRAME.UTTER) {
     // 使用者的語音被切成一個 turn：開新回合的 UI
     const u = text();
@@ -246,14 +272,19 @@ function handleFrame(kind, payload) {
     $("sentences").appendChild(el);
     $("report").innerHTML = '<div class="empty">量測中…</div>';
     $("stop").disabled = false;
+    setPhase("think");
   } else if (kind === FRAME.EVENT) {
     const e = text();
     if (e.event === "barge_in") {
       stopAudio();  // 伺服器判定插話成立：立即停播
-    } else {
-      const vs = $("voice-state");
-      vs.textContent = e.event === "speech" ? "● 收到語音" : "○ 聆聽中";
-      vs.className = e.event === "speech" ? "speech" : "";
+      setPhase("hear");
+    } else if (e.event === "speech") {
+      heardSpeech = true;
+      // 機器人回應期間收到語音不覆蓋階段顯示（那是插話判定中）
+      if (phase === "idle" || phase === "transcribe") setPhase("hear");
+    } else if (e.event === "silence") {
+      // 講完進入靜音：靜音滿門檻就切 turn 送轉錄，這段顯示「斷句中」
+      if (phase === "hear" && heardSpeech) setPhase("transcribe");
     }
   }
 }
@@ -272,6 +303,7 @@ async function send() {
   $("sentences").innerHTML = '<div class="empty">生成中…</div>';
   $("report").innerHTML = '<div class="empty">量測中…</div>';
   stopAudio();
+  setPhase("think");
   t0 = performance.now();
 
   const parse = makeParser(handleFrame);
@@ -376,7 +408,8 @@ async function startVoice() {
   voice = { sid, ac, media, micCtx, proc };
   $("mic").textContent = "■ 停止";
   $("mic").classList.add("rec");
-  $("voice-state").textContent = "○ 聆聽中";
+  heardSpeech = false;
+  setPhase("idle");
 }
 
 async function stopVoice() {
