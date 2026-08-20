@@ -298,6 +298,88 @@ async def _run_tts_check(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _run_stt_check(args: argparse.Namespace) -> int:
+    """Phase 3 驗收：只跑 SttInputStage，量 turn 切分與轉錄延遲。
+
+    不經過 PipelineRunner——這裡要驗的是 VAD、turn 判定、轉錄的接線。
+    「使用者說完 → 拿到 Utterance」這段就是 TTFA 裡 STT 要吃掉的預算。
+    """
+    import time
+
+    from .adapters.input_stt import SttInputStage
+    from .contracts.cancellation import CancellationToken
+
+    print("═" * 56)
+    print("  Echo Stream — Phase 3 STT 驗收（真 Whisper，載入需要時間）")
+    print("═" * 56)
+
+    if args.wav:
+        from .sources import WavFileSource
+
+        source = WavFileSource(args.wav, realtime=True)
+        print(f"\n▸ 來源：{args.wav}（realtime 播放）")
+    else:
+        from .sources import MicrophoneSource
+
+        source = MicrophoneSource(device=args.device_index)
+        print("\n▸ 來源：麥克風（Ctrl+C 結束）")
+
+    policy = TurnPolicy(
+        silence_threshold_s=args.silence,
+        min_utterance_s=args.min_utterance,
+    )
+    stage = SttInputStage(language=args.language, policy=policy)
+
+    print("▸ 載入模型…")
+    load_t0 = time.perf_counter()
+    try:
+        await stage.prepare()
+    except Exception as exc:  # noqa: BLE001
+        print(f"\n✗ 模型載入失敗：{type(exc).__name__}: {exc}")
+        print("\n  檢查項：")
+        print("  - ECHO_STREAM_STT_REPO 是否指向 TestSeparateSTTSystem")
+        print("  - 該 repo 的模型與設定是否可用（faster-whisper checkpoint）")
+        return 1
+    print(f"  載入完成 {(time.perf_counter() - load_t0) * 1000:.0f}ms")
+    print(f"  靜音門檻 {policy.silence_threshold_s * 1000:.0f}ms"
+          f" · 最短語音 {policy.min_utterance_s * 1000:.0f}ms\n")
+
+    token = CancellationToken()
+    count = 0
+    latencies: list[float] = []
+    try:
+        async for utterance in stage.stream(source, token):
+            now = time.perf_counter()
+            stt_ms = (now - utterance.ended_at) * 1000
+            speech_s = max(0.0, utterance.ended_at - utterance.started_at)
+            latencies.append(stt_ms)
+            count += 1
+            print(f"  [{count:>2}] 語音 {speech_s:>4.1f}s → 轉錄 {stt_ms:>6.0f}ms"
+                  f"  ({utterance.language or '?'}, conf={utterance.confidence:.2f})")
+            print(f"       {utterance.text}")
+            if args.turns and count >= args.turns:
+                token.cancel(CancelReason.SHUTDOWN)
+                break
+    except KeyboardInterrupt:
+        token.cancel(CancelReason.SHUTDOWN)
+    finally:
+        await stage.aclose()
+
+    if latencies:
+        print()
+        print("─" * 56)
+        budget = BUDGET_MS.get("stt", 700.0)
+        median = sorted(latencies)[len(latencies) // 2]
+        verdict = "✓" if median <= budget else "✗"
+        print(f"  轉錄延遲 med  {median:>8.0f}ms   預算 {budget:.0f}ms   {verdict}")
+        print(f"  轉錄延遲 max  {max(latencies):>8.0f}ms")
+        print(f"  turn 數       {count}")
+        print("─" * 56)
+    else:
+        print("\n  （沒有切出任何 turn——檢查麥克風音量或 VAD 閾值）")
+    return 0
+
+
 async def _run_demo(args: argparse.Namespace) -> int:
     tracer = LatencyTracer(output_path=args.trace)
     split_policy = SplitPolicy(
@@ -482,6 +564,18 @@ def build_parser() -> argparse.ArgumentParser:
                      help="載入後先跑一次丟棄的合成（實測無效益，預設關閉）")
     _add_split_args(tts)
     tts.set_defaults(func=lambda a: asyncio.run(_run_tts_check(a)))
+
+    stt = sub.add_parser("stt-check", help="Phase 3 驗收：只跑真 STT，量 turn 切分與轉錄延遲")
+    stt.add_argument("--wav", default=None, metavar="檔案",
+                     help="用 WAV 檔當來源（16kHz mono；不給就用麥克風）")
+    stt.add_argument("--device-index", type=int, default=None, help="麥克風裝置索引")
+    stt.add_argument("--language", default=None, help="轉錄語言（留空自動偵測）")
+    stt.add_argument("--turns", type=int, default=None, help="收滿 N 個 turn 後結束")
+    stt.add_argument("--silence", type=float, default=0.7,
+                     help="turn 結束的靜音門檻（秒）")
+    stt.add_argument("--min-utterance", type=float, default=0.3,
+                     help="短於此的語音不成 turn（秒）")
+    stt.set_defaults(func=lambda a: asyncio.run(_run_stt_check(a)))
 
     split = sub.add_parser("split", help="檢查切分結果（調參用）")
     split.add_argument("text", help="要切分的文字")
