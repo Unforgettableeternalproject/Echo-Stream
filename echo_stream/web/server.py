@@ -184,6 +184,9 @@ class StreamService:
 
         self._memory = None
         """EchoMemoryAdapter。旁路——建不起來只停用記憶，不擋管線。"""
+        self._memory_enabled = True
+        """面板開關。關掉 = 不 retrieve、不注入、不 store；
+        adapter 與 engine 留著（重載要數十秒），開回來立即生效。"""
         self.memory_error: str | None = None
         self.memory_warm_seconds: float | None = None
         self.split_policy = split_policy or SplitPolicy()
@@ -404,6 +407,13 @@ class StreamService:
                 "reasoning_effort": getattr(backend, "reasoning_effort", None),
                 "emotion_markers": getattr(self._think, "emotion_markers", False),
             },
+            "memory": {
+                "available": self._memory is not None,
+                "enabled": self._memory is not None and self._memory_enabled,
+                "error": self.memory_error,
+                "top_k": getattr(self._memory, "top_k", None),
+                "max_chars": getattr(self._memory, "max_chars", None),
+            },
         }
 
     def apply_config(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -487,6 +497,26 @@ class StreamService:
                 changed["min_confidence"] = float(turn["min_confidence"])
             if changed:
                 applied["turn"] = changed
+
+        memory = body.get("memory")
+        if isinstance(memory, dict) and self._memory is not None:
+            changed = {}
+            if "enabled" in memory:
+                # 掛/卸 think stage 的引用（擋 retrieve/注入）+ service 旗標
+                # （擋 store）。adapter 與 engine 留著，開回來立即生效。
+                enabled = bool(memory["enabled"])
+                self._memory_enabled = enabled
+                if hasattr(self._think, "memory"):
+                    self._think.memory = self._memory if enabled else None
+                changed["enabled"] = enabled
+            if "top_k" in memory:
+                self._memory.top_k = max(1, int(memory["top_k"]))
+                changed["top_k"] = self._memory.top_k
+            if "max_chars" in memory:
+                self._memory.max_chars = max(50, int(memory["max_chars"]))
+                changed["max_chars"] = self._memory.max_chars
+            if changed:
+                applied["memory"] = changed
 
         llm = body.get("llm")
         if isinstance(llm, dict):
@@ -918,6 +948,7 @@ class StreamService:
             "chunks": trace.chunk_count if trace else 0,
             "split_reasons": dict(trace.split_reasons) if trace else {},
             "audio_seconds": round(sink.written_duration_s, 2),
+            "memory_injected": getattr(self._think, "last_injected_memory", None),
             "report": self.tracer.report(turn_id),
         }
         emit(json_frame(FRAME_META, meta))
@@ -932,6 +963,7 @@ class StreamService:
         # **寫 spoken 不寫 generated**——與歷史同一條語意。
         if (
             self._memory is not None
+            and self._memory_enabled
             and not self._discard_turn
             and result.spoken_text
         ):

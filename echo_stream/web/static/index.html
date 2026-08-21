@@ -278,6 +278,25 @@
         <label for="cfg-markers">逐句情緒標記（[開心] 等）</label>
       </div>
 
+      <h3>記憶（Echo Memory）</h3>
+      <div id="cfg-mem-section">
+        <div class="check">
+          <input type="checkbox" id="cfg-mem-enabled">
+          <label for="cfg-mem-enabled">啟用檢索與寫入</label>
+        </div>
+        <div class="field">
+          <label for="cfg-mem-topk">檢索筆數</label>
+          <input type="number" id="cfg-mem-topk" min="1" max="10" step="1">
+          <span class="val"></span>
+        </div>
+        <div class="field">
+          <label for="cfg-mem-chars">注入上限字</label>
+          <input type="number" id="cfg-mem-chars" min="50" max="2000" step="50">
+          <span class="val"></span>
+        </div>
+      </div>
+      <div class="hint" id="cfg-mem-hint" style="display:none"></div>
+
       <div class="apply-row">
         <button id="cfg-apply">套用</button>
         <span id="cfg-msg"></span>
@@ -410,7 +429,18 @@ function renderReport(meta) {
     <p class="muted" style="font-size:12px;margin:10px 0 0">
       句數 ${meta.sentences}　音訊段 ${meta.chunks}　時長 ${meta.audio_seconds}s
       ${reasons ? "　切點：" + reasons : ""}
-    </p>`;
+    </p>
+    ${meta.memory_injected ? `
+    <details style="margin-top:8px">
+      <summary class="muted" style="font-size:12px;cursor:pointer">🧠 本輪注入的記憶</summary>
+      <pre style="font-size:11px;white-space:pre-wrap;margin:6px 0 0">${
+        escapeHtml(meta.memory_injected)}</pre>
+    </details>` : ""}`;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g,
+    c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
 // ── 管線狀態指示 ──────────────────────────────────────────────────
@@ -782,6 +812,7 @@ const EMO_DIMS = [
   ["disgusted", "厭惡"], ["melancholic", "憂鬱"], ["surprised", "驚訝"], ["calm", "平靜"],
 ];
 let cfgPresets = {};
+let cfgMemoryAvailable = false;
 
 function emoSliders() {
   return EMO_DIMS.map(([dim]) => $("cfg-emo-" + dim));
@@ -834,6 +865,19 @@ async function loadConfig() {
     if (c.turn.min_confidence != null) $("cfg-conf").value = c.turn.min_confidence;
     if (c.llm.reasoning_effort) $("cfg-effort").value = c.llm.reasoning_effort;
     $("cfg-markers").checked = !!c.llm.emotion_markers;
+    cfgMemoryAvailable = !!(c.memory && c.memory.available);
+    if (cfgMemoryAvailable) {
+      $("cfg-mem-enabled").checked = !!c.memory.enabled;
+      if (c.memory.top_k != null) $("cfg-mem-topk").value = c.memory.top_k;
+      if (c.memory.max_chars != null) $("cfg-mem-chars").value = c.memory.max_chars;
+    } else {
+      $("cfg-mem-section").style.display = "none";
+      const hint = $("cfg-mem-hint");
+      hint.style.display = "";
+      hint.textContent = (c.memory && c.memory.error)
+        ? "記憶未啟用：" + c.memory.error
+        : "記憶未啟用（serve 加 --real-memory）";
+    }
   } catch (e) {
     $("cfg-msg").textContent = "✗ 讀取設定失敗";
     $("cfg-msg").className = "bad";
@@ -868,6 +912,13 @@ async function applyConfig() {
       emotion_markers: $("cfg-markers").checked,
     },
   };
+  if (cfgMemoryAvailable) {
+    body.memory = {
+      enabled: $("cfg-mem-enabled").checked,
+      top_k: +$("cfg-mem-topk").value,
+      max_chars: +$("cfg-mem-chars").value,
+    };
+  }
   const msg = $("cfg-msg");
   msg.textContent = "套用中…"; msg.className = "";
   try {

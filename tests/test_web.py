@@ -525,6 +525,8 @@ class StubMemory:
     def __init__(self):
         self.stored: list[dict] = []
         self.sessions: list[str] = []
+        self.top_k = 3
+        self.max_chars = 500
 
     def set_session(self, session_id):
         self.sessions.append(session_id)
@@ -593,3 +595,32 @@ def test_會話切換同步給記憶層(session_server):
     post(f"{base}/api/sessions/new", {})
     assert memory.sessions, "session new 沒有同步給記憶層"
     assert memory.sessions[-1] == service._session_id
+
+
+def test_config_回報記憶不可用(server):
+    base, _ = server
+    c = _get_json(f"{base}/api/config")
+    assert c["memory"]["available"] is False
+    assert c["memory"]["enabled"] is False
+
+
+def test_config_記憶開關與參數(server):
+    base, service = server
+    service._memory = StubMemory()
+
+    c = _get_json(f"{base}/api/config")
+    assert c["memory"]["available"] is True
+    assert c["memory"]["enabled"] is True
+
+    res = json.loads(post(f"{base}/api/config", {
+        "memory": {"enabled": False, "top_k": 5, "max_chars": 800},
+    }))
+    assert res["applied"]["memory"] == {
+        "enabled": False, "top_k": 5, "max_chars": 800,
+    }
+    assert service._memory_enabled is False
+    assert service._memory.top_k == 5
+
+    # 關閉後跑一輪，不該寫入
+    post(f"{base}/api/say", {"text": "關掉之後說的話"})
+    assert not _wait_for(lambda: service._memory.stored, timeout=1.0)
