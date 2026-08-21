@@ -1,0 +1,914 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Echo Stream</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #161b22;
+    --line: #262d38;
+    --fg: #e6edf3;
+    --dim: #8b949e;
+    --accent: #d5b618;
+    --ok: #3fb950;
+    --bad: #f85149;
+    --warn: #d29922;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px;
+    background: var(--bg); color: var(--fg);
+    font: 14px/1.6 "Segoe UI", "Noto Sans TC", system-ui, sans-serif;
+  }
+  .wrap {
+    max-width: 1480px; margin: 0 auto;
+    display: grid; grid-template-columns: 232px minmax(0, 1fr) 320px;
+    gap: 0 16px; align-items: start;
+  }
+  header { grid-column: 1 / -1; }
+  .main { min-width: 0; }
+  @media (max-width: 1180px) { .wrap { grid-template-columns: 232px minmax(0, 1fr); }
+    aside.right { grid-column: 1 / -1; } }
+  @media (max-width: 820px) { .wrap { grid-template-columns: 1fr; } }
+
+  /* ── 會話列表 ── */
+  .sess-new {
+    width: 100%; margin-bottom: 10px; padding: 7px 0; min-width: 0;
+    background: transparent; color: var(--accent);
+    border: 1px dashed var(--accent); border-radius: 6px;
+  }
+  .sess-item {
+    display: flex; align-items: center; gap: 6px;
+    padding: 7px 8px; margin: 3px 0; border-radius: 5px;
+    background: #0d1117; border-left: 2px solid var(--line);
+    cursor: pointer; font-size: 12px;
+  }
+  .sess-item:hover { border-left-color: var(--dim); }
+  .sess-item.active { border-left-color: var(--accent); }
+  .sess-item .t {
+    flex: 1; min-width: 0; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+  }
+  .sess-item.active .t { color: var(--accent); }
+  .sess-item .n { color: var(--dim); font-size: 11px; white-space: nowrap; }
+  .sess-item .del {
+    background: transparent; border: 0; color: var(--dim);
+    padding: 0 2px; min-width: 0; font-size: 12px; cursor: pointer;
+  }
+  .sess-item .del:hover { color: var(--bad); }
+  .sess-item .del.confirm { color: var(--bad); font-weight: 700; }
+  #sess-msg { font-size: 11px; color: var(--bad); margin-top: 6px; }
+  .sent.hist { opacity: .75; }
+  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 4px; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: .5px; }
+  .sub { color: var(--dim); font-size: 12px; }
+  .badge {
+    font-size: 11px; padding: 2px 8px; border-radius: 10px;
+    border: 1px solid var(--line); color: var(--dim);
+  }
+  .badge.on { color: var(--accent); border-color: var(--accent); }
+
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 16px; margin-top: 16px;
+  }
+  .row { display: flex; gap: 8px; }
+  textarea {
+    flex: 1; background: #0d1117; color: var(--fg);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 10px; font: inherit; resize: vertical; min-height: 62px;
+  }
+  textarea:focus { outline: none; border-color: var(--accent); }
+  button {
+    background: var(--accent); color: #1a1a1a; border: 0;
+    border-radius: 6px; padding: 0 18px; font: 600 14px/1 inherit;
+    cursor: pointer; min-width: 96px;
+  }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.ghost {
+    background: transparent; color: var(--bad);
+    border: 1px solid var(--bad);
+  }
+  button.rec { background: var(--bad); color: #fff; }
+  .hint { color: var(--dim); font-size: 12px; margin-top: 8px; }
+  .sent.user { border-left-color: var(--ok); }
+  #voice-state { font-size: 12px; color: var(--dim); }
+  #voice-state.speech { color: var(--ok); }
+
+  .sentences { display: flex; flex-direction: column; gap: 6px; }
+  .sent {
+    display: grid; grid-template-columns: 34px 78px 1fr; gap: 10px;
+    align-items: baseline; padding: 6px 8px; border-radius: 5px;
+    background: #0d1117; border-left: 2px solid var(--line);
+  }
+  .sent.first { border-left-color: var(--accent); }
+  .sent .idx { color: var(--dim); font-size: 12px; }
+  .sent .ms { color: var(--accent); font-variant-numeric: tabular-nums; font-size: 12px; }
+
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--dim); font-weight: 500; font-size: 12px; }
+  td.num { text-align: right; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); }
+  .muted { color: var(--dim); }
+  h2 { font-size: 13px; color: var(--dim); margin: 0 0 10px; font-weight: 500;
+       text-transform: uppercase; letter-spacing: .8px; }
+  .empty { color: var(--dim); font-size: 13px; }
+
+  /* ── 設定面板 ── */
+  .cfg h3 {
+    font-size: 12px; color: var(--dim); font-weight: 600;
+    margin: 14px 0 6px; letter-spacing: .5px;
+  }
+  .cfg h3:first-of-type { margin-top: 0; }
+  .cfg .field {
+    display: grid; grid-template-columns: 86px 1fr 42px;
+    gap: 8px; align-items: center; margin: 4px 0; font-size: 12px;
+  }
+  .cfg .field label { color: var(--dim); white-space: nowrap; }
+  .cfg .field .val {
+    color: var(--accent); font-variant-numeric: tabular-nums;
+    font-size: 11px; text-align: right;
+  }
+  .cfg input[type=range] { width: 100%; accent-color: var(--accent); height: 18px; }
+  .cfg input[type=number], .cfg select {
+    background: #0d1117; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 4px; padding: 3px 6px; font: 12px inherit; width: 100%;
+  }
+  .cfg .check { display: flex; gap: 6px; align-items: center;
+                font-size: 12px; color: var(--dim); margin: 6px 0; }
+  .cfg .check input { accent-color: var(--accent); }
+  .cfg .apply-row { display: flex; gap: 8px; align-items: center; margin-top: 14px; }
+  .cfg .apply-row button { padding: 6px 18px; min-width: 0; }
+  #cfg-msg { font-size: 11px; color: var(--dim); }
+  #cfg-msg.ok { color: var(--ok); }
+  #cfg-msg.bad { color: var(--bad); }
+  details.emo > summary {
+    cursor: pointer; font-size: 12px; color: var(--dim);
+    margin: 6px 0 4px; user-select: none;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Echo Stream</h1>
+    <span class="sub">串流語音管線</span>
+    <span class="badge" id="b-stt">STT</span>
+    <span class="badge" id="b-tts">TTS</span>
+    <span class="badge" id="b-llm">LLM</span>
+    <span class="sub" id="status"></span>
+  </header>
+
+  <aside class="left">
+    <div class="panel">
+      <h2>會話</h2>
+      <button class="sess-new" id="sess-new">＋ 新對話</button>
+      <div id="sessions-list"><div class="empty">載入中…</div></div>
+      <div id="sess-msg"></div>
+    </div>
+  </aside>
+
+  <div class="main">
+  <div class="panel">
+    <div class="row">
+      <textarea id="input" placeholder="輸入要說的話，Ctrl+Enter 送出">今天過得怎麼樣？</textarea>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <button id="send">送出</button>
+        <button id="mic">🎤 聆聽</button>
+        <button id="stop" class="ghost" disabled>插話</button>
+        <button id="discard" class="ghost" disabled>🗑 捨棄</button>
+      </div>
+    </div>
+    <div class="hint" id="hint">🎤 聆聽開啟時：講完停頓即送出，機器人講話時<b>直接開口就會打斷</b>（自動判定）；
+      「捨棄」把當前輸入整個作廢（旁邊有人講話、誤觸發——這輪不算）。
+      「■ 停止」會直接中斷所有進行中的流程。「插話」鈕是文字模式用的手動打斷。
+      <span id="voice-state"></span></div>
+  </div>
+
+  <div class="panel">
+    <h2>逐句輸出</h2>
+    <div class="sentences" id="sentences"><div class="empty">尚未開始</div></div>
+  </div>
+
+  <div class="panel">
+    <h2>延遲報告</h2>
+    <div id="report"><div class="empty">尚未開始</div></div>
+  </div>
+  </div><!-- /.main -->
+
+  <aside class="right">
+    <div class="panel cfg">
+      <h2>設定（執行中即時調整）</h2>
+
+      <h3>TTS 語音</h3>
+      <div class="field">
+        <label for="cfg-speed">語速</label>
+        <input type="range" id="cfg-speed" min="0.6" max="1.6" step="0.05" value="1.0">
+        <span class="val" id="cfg-speed-val">1.00×</span>
+      </div>
+      <div class="field">
+        <label for="cfg-intensity">情緒強度</label>
+        <input type="range" id="cfg-intensity" min="0" max="1" step="0.05" value="0.6">
+        <span class="val" id="cfg-intensity-val">0.60</span>
+      </div>
+      <div class="field">
+        <label for="cfg-preset">情緒 preset</label>
+        <select id="cfg-preset"><option value="">（角色檔預設）</option></select>
+        <span class="val"></span>
+      </div>
+      <details class="emo" id="cfg-emo-details">
+        <summary>八維情緒向量</summary>
+        <div id="cfg-emotions"></div>
+      </details>
+
+      <h3>切分（SplitPolicy）</h3>
+      <div class="field">
+        <label for="cfg-first-min">首句下限</label>
+        <input type="number" id="cfg-first-min" min="1" max="40" step="1">
+        <span class="val"></span>
+      </div>
+      <div class="field">
+        <label for="cfg-first-max">首句上限</label>
+        <input type="number" id="cfg-first-max" min="2" max="60" step="1">
+        <span class="val"></span>
+      </div>
+      <div class="field">
+        <label for="cfg-min">後續下限</label>
+        <input type="number" id="cfg-min" min="4" max="80" step="1">
+        <span class="val"></span>
+      </div>
+      <div class="field">
+        <label for="cfg-max">後續上限</label>
+        <input type="number" id="cfg-max" min="8" max="120" step="1">
+        <span class="val"></span>
+      </div>
+
+      <h3>Turn 判定</h3>
+      <div class="field">
+        <label for="cfg-silence">靜音門檻 s</label>
+        <input type="number" id="cfg-silence" min="0.2" max="3" step="0.1">
+        <span class="val"></span>
+      </div>
+      <div class="field">
+        <label for="cfg-barge">插話門檻 s</label>
+        <input type="number" id="cfg-barge" min="0.1" max="2" step="0.1">
+        <span class="val"></span>
+      </div>
+      <div class="field">
+        <label for="cfg-conf">信心下限</label>
+        <input type="number" id="cfg-conf" min="0" max="1" step="0.05">
+        <span class="val"></span>
+      </div>
+
+      <h3>LLM</h3>
+      <div class="field">
+        <label for="cfg-effort">推理強度</label>
+        <select id="cfg-effort">
+          <option value="none">none</option><option value="low">low</option>
+          <option value="medium">medium</option><option value="high">high</option>
+          <option value="xhigh">xhigh</option><option value="max">max</option>
+        </select>
+        <span class="val"></span>
+      </div>
+      <div class="check">
+        <input type="checkbox" id="cfg-markers">
+        <label for="cfg-markers">逐句情緒標記（[開心] 等）</label>
+      </div>
+
+      <div class="apply-row">
+        <button id="cfg-apply">套用</button>
+        <span id="cfg-msg"></span>
+      </div>
+    </div>
+  </aside>
+</div>
+
+<script>
+const FRAME = { AUDIO: 1, META: 2, ERROR: 3, TEXT: 4, UTTER: 5, EVENT: 6 };
+const BUDGET = { stt: 700, memory: 300, llm_first_sentence: 800, tts_first_chunk: 1800, ttfa: 3500 };
+const LABEL = {
+  stt: "STT 最終轉錄", memory: "Memory retrieve",
+  llm_first_token: "LLM 首 token", llm_first_sentence: "LLM 首句",
+  tts_first_chunk: "TTS 首段", ttfa: "TTFA", total: "總時長",
+};
+
+const $ = id => document.getElementById(id);
+let ctx = null, nextAt = 0, sources = [], busy = false, t0 = 0;
+
+// ── 音訊：用 AudioContext 排程，讓各段無縫接續 ──────────────────────
+// 等前一段 onended 才播下一段會有間隙，聽起來一頓一頓的。
+//
+// ⚠️ 解碼必須**依到達順序序列化**。decodeAudioData 是非同步的，
+// 並行解碼時短段先解完就先搶到排程位，實際聽感是「跳過中間一句、
+// 之後才補回來」——舊 TTS webapp 踩過同一個坑，修法就是逐段 await
+// （tts.html 的 drain 迴圈），這裡用 promise chain 達到同樣效果。
+// playGen 是世代守衛：插話/停止後，還在解碼路上的舊段不得再排程。
+let playChain = Promise.resolve();
+let playGen = 0;
+
+function playChunk(bytes) {
+  if (!ctx) return;
+  const gen = playGen;
+  playChain = playChain.then(async () => {
+    if (gen !== playGen) return;  // 這段所屬的回合已被停掉
+    const buf = await ctx.decodeAudioData(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+    if (gen !== playGen) return;  // 解碼期間被停掉
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
+    const at = Math.max(ctx.currentTime + 0.02, nextAt);
+    src.start(at);
+    nextAt = at + buf.duration;
+    sources.push(src);
+    src.onended = () => { sources = sources.filter(s => s !== src); };
+  }).catch(() => {});
+}
+
+function stopAudio() {
+  playGen++;  // 作廢還在解碼路上的段
+  sources.forEach(s => { try { s.stop(); } catch (e) {} });
+  sources = [];
+  nextAt = ctx ? ctx.currentTime : 0;
+}
+
+// ── Frame 解析 ────────────────────────────────────────────────────
+// 1 byte type + 4 byte big-endian length + payload
+function makeParser(onFrame) {
+  let buf = new Uint8Array(0);
+  return chunk => {
+    const merged = new Uint8Array(buf.length + chunk.length);
+    merged.set(buf); merged.set(chunk, buf.length);
+    buf = merged;
+    for (;;) {
+      if (buf.length < 5) return;
+      const kind = buf[0];
+      const len = new DataView(buf.buffer, buf.byteOffset + 1, 4).getUint32(0);
+      if (buf.length < 5 + len) return;
+      onFrame(kind, buf.slice(5, 5 + len));
+      buf = buf.slice(5 + len);
+    }
+  };
+}
+
+// ── UI ────────────────────────────────────────────────────────────
+let lastSentMs = 0;
+function addSentence(s) {
+  const box = $("sentences");
+  if (box.querySelector(".empty")) { box.innerHTML = ""; lastSentMs = 0; }
+  // 首句顯示絕對時間（那是 TTFA 的成分），後續顯示「距上一句」的增量——
+  // 累計值到長回應後段會變成十幾萬 ms，沒有可讀性
+  const delta = s.is_first ? s.ms : s.ms - lastSentMs;
+  lastSentMs = s.ms;
+  const label = (s.is_first ? "" : "+") + Math.round(delta) + "ms";
+  const el = document.createElement("div");
+  el.className = "sent" + (s.is_first ? " first" : "");
+  el.innerHTML = `<span class="idx">${s.index}</span>
+                  <span class="ms" title="累計 ${Math.round(s.ms)}ms">${label}</span>
+                  <span>${s.text.replace(/</g, "&lt;")}</span>`;
+  box.appendChild(el);
+}
+
+function verdict(key, value) {
+  const b = BUDGET[key];
+  if (value == null || b == null) return "";
+  if (value <= b) return '<span class="ok">✓</span>';
+  return `<span class="bad">✗ ${(value / b).toFixed(1)}×</span>`;
+}
+
+function renderReport(meta) {
+  const seg = meta.segments_ms || {};
+  const rows = ["stt", "memory", "llm_first_token", "llm_first_sentence", "tts_first_chunk"]
+    .filter(k => seg[k] != null)
+    .map(k => `<tr><td>${LABEL[k]}</td>
+                   <td class="num">${Math.round(seg[k])}ms</td>
+                   <td class="num muted">${BUDGET[k] ? BUDGET[k] + "ms" : "—"}</td>
+                   <td>${verdict(k, seg[k])}</td></tr>`).join("");
+
+  const ttfa = seg.ttfa;
+  const cancelled = meta.cancel_reason
+    ? `<p class="warn">被 ${meta.cancel_reason} 中止 — 寫回對話歷史的是實際播出的部分</p>` : "";
+  const err = meta.error ? `<p class="bad">${meta.error}</p>` : "";
+  const reasons = Object.entries(meta.split_reasons || {})
+    .map(([k, v]) => `${k}=${v}`).join("　");
+
+  $("report").innerHTML = `
+    ${err}${cancelled}
+    <table>
+      <tr><th>階段</th><th class="num">實測</th><th class="num">預算</th><th></th></tr>
+      ${rows}
+      <tr><td><b>${LABEL.ttfa}</b></td>
+          <td class="num"><b>${ttfa != null ? Math.round(ttfa) + "ms" : "—"}</b></td>
+          <td class="num muted">${BUDGET.ttfa}ms</td>
+          <td>${verdict("ttfa", ttfa)}</td></tr>
+      <tr><td class="muted">${LABEL.total}</td>
+          <td class="num muted">${seg.total != null ? Math.round(seg.total) + "ms" : "—"}</td>
+          <td colspan="2"></td></tr>
+    </table>
+    <p class="muted" style="font-size:12px;margin:10px 0 0">
+      句數 ${meta.sentences}　音訊段 ${meta.chunks}　時長 ${meta.audio_seconds}s
+      ${reasons ? "　切點：" + reasons : ""}
+    </p>`;
+}
+
+// ── 管線狀態指示 ──────────────────────────────────────────────────
+// 每一段延遲都有對應的階段，讓使用者知道現在卡在哪，而不是乾等。
+let phase = "idle";       // idle → hear → transcribe → think → synth → play
+let heardSpeech = false;  // 這一輪有沒有收過語音（分辨「斷句中」與「純靜音」）
+let partialCount = 0;     // 這一輪已顯示的增量轉錄段數
+
+function setPhase(p) {
+  phase = p;
+  const vs = $("voice-state");
+  const TEXTS = {
+    idle:       ["○ 聆聽中", ""],
+    hear:       ["● 收到語音", "speech"],
+    transcribe: ["⋯ 斷句／轉錄中", "speech"],
+    think:      ["🧠 思考中（等 LLM 首句）", "speech"],
+    synth:      ["🔊 合成語音中", "speech"],
+    play:       ["▶ 播放中（可直接開口插話）", "speech"],
+  };
+  const [t, cls] = TEXTS[p] || TEXTS.idle;
+  vs.textContent = t;
+  vs.className = cls;
+}
+
+// ── Frame 處理（文字送出與語音模式共用）─────────────────────────────
+function handleFrame(kind, payload) {
+  const text = () => JSON.parse(new TextDecoder().decode(payload));
+  if (kind === FRAME.AUDIO) {
+    playChunk(payload);
+    if (phase === "think" || phase === "synth") setPhase("play");
+  } else if (kind === FRAME.TEXT) {
+    addSentence(text());
+    if (phase === "think") setPhase("synth");
+  } else if (kind === FRAME.META) {
+    renderReport(text());
+    $("stop").disabled = true;
+    heardSpeech = false;
+    setPhase("idle");
+    loadSessions();  // 每輪落地後更新左欄的則數與標題
+  } else if (kind === FRAME.ERROR) {
+    $("report").innerHTML = `<p class="bad">${text().error}</p>`;
+    setPhase("idle");
+  } else if (kind === FRAME.UTTER) {
+    const u = text();
+    if (u.partial) {
+      // 增量轉錄：講話停頓處逐段到位，不等整個 turn。
+      // 第一段先清場（上一輪的輸出讓位給新回合）。
+      const box = $("sentences");
+      if (partialCount === 0) box.innerHTML = "";
+      partialCount++;
+      const el = document.createElement("div");
+      el.className = "sent user";
+      el.innerHTML = `<span class="idx">🎤</span><span class="ms">⋯</span>
+                      <span>${(u.text || "").replace(/</g, "&lt;")}</span>`;
+      box.appendChild(el);
+      return;
+    }
+    // turn 定案：用完整的 parts 重排（增量段 + 殘餘段），最後一列標 STT 延遲
+    stopAudio();
+    partialCount = 0;
+    const box = $("sentences");
+    box.innerHTML = "";
+    const parts = (u.parts && u.parts.length ? u.parts : [u.text || ""]);
+    parts.forEach((t, i) => {
+      const el = document.createElement("div");
+      el.className = "sent user";
+      el.innerHTML = `<span class="idx">🎤</span>
+                      <span class="ms">${i === parts.length - 1 ? u.stt_ms + "ms" : ""}</span>
+                      <span>${(t || "").replace(/</g, "&lt;")}</span>`;
+      box.appendChild(el);
+    });
+    $("report").innerHTML = '<div class="empty">量測中…</div>';
+    $("stop").disabled = false;
+    setPhase("think");
+  } else if (kind === FRAME.EVENT) {
+    const e = text();
+    if (e.event === "barge_in") {
+      stopAudio();  // 伺服器判定插話成立：立即停播
+      setPhase("hear");
+    } else if (e.event === "input_discarded") {
+      // 這次輸入作廢：停播、清掉半途的轉錄顯示，回到聆聽狀態
+      stopAudio();
+      partialCount = 0;
+      heardSpeech = false;
+      $("sentences").innerHTML = '<div class="empty">已捨棄這次輸入</div>';
+      setPhase("idle");
+    } else if (e.event === "speech") {
+      heardSpeech = true;
+      // 機器人回應期間收到語音不覆蓋階段顯示（那是插話判定中）
+      if (phase === "idle" || phase === "transcribe") setPhase("hear");
+    } else if (e.event === "silence") {
+      // 講完進入靜音：靜音滿門檻就切 turn 送轉錄，這段顯示「斷句中」
+      if (phase === "hear" && heardSpeech) setPhase("transcribe");
+    }
+  }
+}
+
+// ── 送出 ──────────────────────────────────────────────────────────
+async function send() {
+  const text = $("input").value.trim();
+  if (!text || busy) return;
+
+  if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+  if (ctx.state === "suspended") await ctx.resume();
+
+  busy = true;
+  $("send").disabled = true;
+  $("stop").disabled = false;
+  $("sentences").innerHTML = '<div class="empty">生成中…</div>';
+  $("report").innerHTML = '<div class="empty">量測中…</div>';
+  stopAudio();
+  setPhase("think");
+  t0 = performance.now();
+
+  const parse = makeParser(handleFrame);
+
+  try {
+    const res = await fetch("/api/say", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    const reader = res.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      parse(value);
+    }
+  } catch (e) {
+    $("report").innerHTML = `<p class="bad">${e}</p>`;
+  } finally {
+    busy = false;
+    $("send").disabled = false;
+    $("stop").disabled = true;
+  }
+}
+
+async function interrupt() {
+  stopAudio();
+  await fetch("/api/interrupt", { method: "POST" });
+}
+
+// ── 語音模式 ──────────────────────────────────────────────────────
+// 瀏覽器擷取 → 降採樣成 16kHz int16 → 每 ~200ms 一個 POST 上傳。
+// 選連續小 POST 而不是 WebSocket：stdlib server 不用手刻握手，
+// keep-alive 下每個 chunk 的額外開銷是毫秒級，對測試工具足夠。
+let voice = null;
+
+async function startVoice() {
+  if (voice) return stopVoice();
+  if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+  if (ctx.state === "suspended") await ctx.resume();
+
+  const info = await (await fetch("/api/voice/start", { method: "POST" })).json();
+  if (info.error) { $("voice-state").textContent = "✗ " + info.error; return; }
+  const sid = info.sid, targetRate = info.sample_rate;
+
+  let media;
+  try {
+    media = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
+    });
+  } catch (e) {
+    // 常見原因：非 https / 非 localhost（瀏覽器要求 secure context）
+    $("voice-state").textContent = "✗ 無法取得麥克風：" + e.name;
+    await fetch(`/api/voice/stop?sid=${sid}`, { method: "POST" });
+    return;
+  }
+
+  // frame 回流（獨立長連線；音訊經另一條路 POST 上去）
+  const ac = new AbortController();
+  (async () => {
+    const parse = makeParser(handleFrame);
+    try {
+      const res = await fetch(`/api/voice/stream?sid=${sid}`, { signal: ac.signal });
+      const reader = res.body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        parse(value);
+      }
+    } catch (e) { /* abort 或斷線 */ }
+  })();
+
+  const micCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const src = micCtx.createMediaStreamSource(media);
+  const proc = micCtx.createScriptProcessor(4096, 1, 1);
+  const ratio = micCtx.sampleRate / targetRate;
+  let acc = [], accLen = 0;
+
+  proc.onaudioprocess = e => {
+    const input = e.inputBuffer.getChannelData(0);
+    const outLen = Math.floor(input.length / ratio);
+    const out = new Int16Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const pos = i * ratio, i0 = Math.floor(pos);
+      const i1 = Math.min(i0 + 1, input.length - 1);
+      const v = input[i0] + (input[i1] - input[i0]) * (pos - i0);
+      out[i] = Math.max(-1, Math.min(1, v)) * 32767;
+    }
+    acc.push(out); accLen += out.length;
+    if (accLen >= targetRate * 0.2) {
+      const merged = new Int16Array(accLen);
+      let o = 0;
+      acc.forEach(a => { merged.set(a, o); o += a.length; });
+      acc = []; accLen = 0;
+      fetch(`/api/voice/audio?sid=${sid}`, { method: "POST", body: merged.buffer })
+        .catch(() => {});
+    }
+  };
+  src.connect(proc);
+  proc.connect(micCtx.destination);
+
+  voice = { sid, ac, media, micCtx, proc };
+  $("mic").textContent = "■ 停止";
+  $("mic").classList.add("rec");
+  $("discard").disabled = false;
+  heardSpeech = false;
+  setPhase("idle");
+}
+
+async function discardInput() {
+  if (!voice) return;
+  await fetch(`/api/voice/discard?sid=${voice.sid}`, { method: "POST" }).catch(() => {});
+}
+
+async function stopVoice() {
+  if (!voice) return;
+  const v = voice;
+  voice = null;
+  try { v.proc.disconnect(); } catch (e) {}
+  v.media.getTracks().forEach(t => t.stop());
+  try { await v.micCtx.close(); } catch (e) {}
+  await fetch(`/api/voice/stop?sid=${v.sid}`, { method: "POST" }).catch(() => {});
+  stopAudio();  // 停止 = 乾淨收場：server 端會中斷流程，這裡同步停播
+  setTimeout(() => v.ac.abort(), 1000);
+  $("mic").textContent = "🎤 聆聽";
+  $("mic").classList.remove("rec");
+  $("discard").disabled = true;
+  partialCount = 0;
+  $("voice-state").textContent = "";
+  $("voice-state").className = "";
+}
+
+$("send").onclick = send;
+$("stop").onclick = interrupt;
+$("mic").onclick = startVoice;
+$("discard").onclick = discardInput;
+$("input").addEventListener("keydown", e => {
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) send();
+});
+
+// ── 會話列表 ──────────────────────────────────────────────────────
+// 歷史活在 server 端（think stage 的 history），這裡只是遙控器：
+// 切換時 server 回傳完整歷史，渲染到主區讓人確認接回了哪一段。
+const esc = s => (s || "").replace(/</g, "&lt;");
+let deleteArmId = null;
+
+function fmtTime(epoch) {
+  if (!epoch) return "";
+  const d = new Date(epoch * 1000);
+  const today = new Date();
+  const sameDay = d.toDateString() === today.toDateString();
+  return sameDay
+    ? d.toTimeString().slice(0, 5)
+    : `${d.getMonth() + 1}/${d.getDate()}`;
+}
+
+function renderSessions(data) {
+  const box = $("sessions-list");
+  const items = [];
+  if (!data.sessions.some(s => s.id === data.active)) {
+    // 還沒講過話的新會話不在 store 裡，補一列讓「現在在哪」永遠看得到
+    items.push({ id: data.active, title: "（新對話）",
+                 message_count: data.active_message_count || 0, unsaved: true });
+  }
+  items.push(...data.sessions);
+  box.innerHTML = items.map(s => `
+    <div class="sess-item${s.id === data.active ? " active" : ""}" data-id="${s.id}">
+      <span class="t" title="${esc(s.title)}">${esc(s.title)}</span>
+      <span class="n">${s.message_count}則${s.saved_at ? "·" + fmtTime(s.saved_at) : ""}</span>
+      ${s.unsaved ? "" : `<button class="del" data-del="${s.id}" title="刪除">×</button>`}
+    </div>`).join("") || '<div class="empty">尚無會話</div>';
+  $("sess-msg").textContent = data.error ? "✗ " + data.error : "";
+}
+
+async function loadSessions() {
+  try {
+    renderSessions(await (await fetch("/api/sessions")).json());
+  } catch (e) { /* server 未就緒時安靜跳過，META 後會再刷 */ }
+}
+
+function renderHistory(history) {
+  const box = $("sentences");
+  if (!history.length) {
+    box.innerHTML = '<div class="empty">（空會話）尚未開始</div>';
+    return;
+  }
+  box.innerHTML = history.map(m => `
+    <div class="sent hist${m.role === "user" ? " user" : ""}">
+      <span class="idx">${m.role === "user" ? "🗣" : "🤖"}</span>
+      <span class="ms"></span>
+      <span>${esc(m.content)}</span>
+    </div>`).join("");
+  box.lastElementChild.scrollIntoView({ block: "nearest" });
+}
+
+async function sessionAction(action, id) {
+  try {
+    const r = await fetch(`/api/sessions/${action}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(id ? { id } : {}),
+    });
+    const res = await r.json();
+    if (res.error) { $("sess-msg").textContent = "✗ " + res.error; return null; }
+    $("sess-msg").textContent = "";
+    return res;
+  } catch (e) {
+    $("sess-msg").textContent = "✗ " + e;
+    return null;
+  }
+}
+
+$("sess-new").onclick = async () => {
+  const res = await sessionAction("new");
+  if (!res) return;
+  stopAudio();
+  renderHistory([]);
+  $("report").innerHTML = '<div class="empty">尚未開始</div>';
+  loadSessions();
+};
+
+$("sessions-list").onclick = async e => {
+  const del = e.target.closest(".del");
+  if (del) {
+    e.stopPropagation();
+    const id = del.dataset.del;
+    if (deleteArmId !== id) {
+      // 兩段式刪除，避免瀏覽器 confirm 這種阻塞式對話框
+      deleteArmId = id;
+      del.textContent = "確定?";
+      del.classList.add("confirm");
+      setTimeout(() => { deleteArmId = null; loadSessions(); }, 3000);
+      return;
+    }
+    deleteArmId = null;
+    const res = await sessionAction("delete", id);
+    if (res && res.active) { renderHistory([]); }
+    loadSessions();
+    return;
+  }
+  const item = e.target.closest(".sess-item");
+  if (!item || item.classList.contains("active")) return;
+  const res = await sessionAction("switch", item.dataset.id);
+  if (!res) return;
+  stopAudio();
+  renderHistory(res.history || []);
+  $("report").innerHTML = '<div class="empty">尚未開始</div>';
+  loadSessions();
+};
+
+loadSessions();
+
+// ── 設定面板 ──────────────────────────────────────────────────────
+// 「套用」才 POST——逐滑桿即時送出會把 session log 灌爆，也難以事後對照。
+const EMO_DIMS = [
+  ["happy", "開心"], ["angry", "生氣"], ["sad", "難過"], ["afraid", "害怕"],
+  ["disgusted", "厭惡"], ["melancholic", "憂鬱"], ["surprised", "驚訝"], ["calm", "平靜"],
+];
+let cfgPresets = {};
+
+function emoSliders() {
+  return EMO_DIMS.map(([dim]) => $("cfg-emo-" + dim));
+}
+
+function buildEmotionSliders() {
+  $("cfg-emotions").innerHTML = EMO_DIMS.map(([dim, zh]) => `
+    <div class="field">
+      <label for="cfg-emo-${dim}">${zh}</label>
+      <input type="range" id="cfg-emo-${dim}" data-dim="${dim}"
+             min="0" max="1" step="0.05" value="0">
+      <span class="val" id="cfg-emo-${dim}-val">0</span>
+    </div>`).join("");
+  EMO_DIMS.forEach(([dim]) => {
+    const el = $("cfg-emo-" + dim);
+    el.oninput = () => {
+      $("cfg-emo-" + dim + "-val").textContent = (+el.value).toFixed(2);
+      $("cfg-preset").value = "";  // 手動動了向量就不再是 preset
+    };
+  });
+}
+
+function setEmotion(vec) {
+  EMO_DIMS.forEach(([dim]) => {
+    const v = (vec && vec[dim]) || 0;
+    $("cfg-emo-" + dim).value = v;
+    $("cfg-emo-" + dim + "-val").textContent = (+v).toFixed(2);
+  });
+}
+
+async function loadConfig() {
+  try {
+    const c = await (await fetch("/api/config")).json();
+    cfgPresets = c.presets || {};
+    const sel = $("cfg-preset");
+    sel.innerHTML = '<option value="">（角色檔預設）</option>' +
+      Object.keys(cfgPresets).map(n => `<option value="${n}">${n}</option>`).join("");
+    $("cfg-speed").value = c.tts.speed;
+    $("cfg-speed-val").textContent = (+c.tts.speed).toFixed(2) + "×";
+    $("cfg-intensity").value = c.tts.intensity;
+    $("cfg-intensity-val").textContent = (+c.tts.intensity).toFixed(2);
+    setEmotion(c.tts.emotion);
+    if (c.tts.override) $("cfg-emo-details").open = true;
+    $("cfg-first-min").value = c.split.first_min;
+    $("cfg-first-max").value = c.split.first_max;
+    $("cfg-min").value = c.split.min;
+    $("cfg-max").value = c.split.max;
+    if (c.turn.silence_threshold_s != null) $("cfg-silence").value = c.turn.silence_threshold_s;
+    if (c.turn.interruption_min_speech_s != null) $("cfg-barge").value = c.turn.interruption_min_speech_s;
+    if (c.turn.min_confidence != null) $("cfg-conf").value = c.turn.min_confidence;
+    if (c.llm.reasoning_effort) $("cfg-effort").value = c.llm.reasoning_effort;
+    $("cfg-markers").checked = !!c.llm.emotion_markers;
+  } catch (e) {
+    $("cfg-msg").textContent = "✗ 讀取設定失敗";
+    $("cfg-msg").className = "bad";
+  }
+}
+
+async function applyConfig() {
+  const emotion = {};
+  EMO_DIMS.forEach(([dim]) => {
+    const v = +$("cfg-emo-" + dim).value;
+    if (v > 0) emotion[dim] = v;
+  });
+  const body = {
+    tts: {
+      speed: +$("cfg-speed").value,
+      intensity: +$("cfg-intensity").value,
+      emotion,
+    },
+    split: {
+      first_min: +$("cfg-first-min").value,
+      first_max: +$("cfg-first-max").value,
+      min: +$("cfg-min").value,
+      max: +$("cfg-max").value,
+    },
+    turn: {
+      silence_threshold_s: +$("cfg-silence").value,
+      interruption_min_speech_s: +$("cfg-barge").value,
+      min_confidence: +$("cfg-conf").value,
+    },
+    llm: {
+      reasoning_effort: $("cfg-effort").value,
+      emotion_markers: $("cfg-markers").checked,
+    },
+  };
+  const msg = $("cfg-msg");
+  msg.textContent = "套用中…"; msg.className = "";
+  try {
+    const res = await (await fetch("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    })).json();
+    if (res.error) { msg.textContent = "✗ " + res.error; msg.className = "bad"; return; }
+    msg.textContent = "✓ 已套用（下一句生效）"; msg.className = "ok";
+    setTimeout(() => { if (msg.className === "ok") msg.textContent = ""; }, 4000);
+  } catch (e) {
+    msg.textContent = "✗ " + e; msg.className = "bad";
+  }
+}
+
+buildEmotionSliders();
+$("cfg-speed").oninput = () =>
+  $("cfg-speed-val").textContent = (+$("cfg-speed").value).toFixed(2) + "×";
+$("cfg-intensity").oninput = () =>
+  $("cfg-intensity-val").textContent = (+$("cfg-intensity").value).toFixed(2);
+$("cfg-preset").onchange = () => {
+  const name = $("cfg-preset").value;
+  setEmotion(name ? cfgPresets[name] : null);
+  if (name) $("cfg-emo-details").open = true;
+};
+$("cfg-apply").onclick = applyConfig;
+loadConfig();
+
+fetch("/api/status").then(r => r.json()).then(s => {
+  $("b-tts").className = "badge" + (s.real_tts ? " on" : "");
+  $("b-tts").textContent = s.real_tts ? "真 TTS" : "fake TTS";
+  $("b-llm").className = "badge" + (s.real_llm ? " on" : "");
+  $("b-llm").textContent = s.real_llm ? "真 LLM" : "fake LLM";
+  $("b-stt").className = "badge" + (s.real_stt ? " on" : "");
+  $("b-stt").textContent = s.real_stt ? "真 STT" : "fake STT";
+  $("status").textContent = s.error ? "✗ " + s.error
+    : s.ready ? `就緒 ${s.load_seconds ? "(" + s.load_seconds.toFixed(1) + "s)" : ""}`
+    : "載入中…";
+  if (s.error) $("status").className = "sub bad";
+});
+</script>
+</body>
+</html>

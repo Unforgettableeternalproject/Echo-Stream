@@ -56,17 +56,21 @@ def test_日文假名與中文同權重():
 
 
 async def test_全形句末標點立即切():
-    result = await collect("你好。今天天氣真好。")
+    result = await collect(
+        "你好。今天天氣真好。", SplitPolicy(first_min_weight=1.0, min_weight=1.0)
+    )
     assert result == ["你好。", "今天天氣真好。"]
 
 
 async def test_全形問號驚嘆號():
-    result = await collect("真的嗎？太好了！")
+    result = await collect("真的嗎？太好了！", SplitPolicy(first_min_weight=1.0, min_weight=1.0))
     assert result == ["真的嗎？", "太好了！"]
 
 
 async def test_結尾引號跟著句子走():
-    result = await collect('他說「好啊."後面繼續講一些別的內容。')
+    result = await collect(
+        '他說「好啊."後面繼續講一些別的內容。', SplitPolicy(first_min_weight=1.0, min_weight=1.0)
+    )
     assert result[0].endswith('"') or "」" in result[0] or result[0].endswith("好啊.")
 
 
@@ -86,13 +90,17 @@ async def test_小數點不切():
 
 
 async def test_省略號不切():
-    result = await collect("我想想...應該可以吧。")
+    result = await collect(
+        "我想想...應該可以吧。", SplitPolicy(first_min_weight=1.0, min_weight=1.0)
+    )
     assert all("." not in r or r.count(".") >= 2 for r in result[:1])
     assert len(result) <= 2
 
 
 async def test_半形句號在後面有字時才切():
-    result = await collect("Hello world. This is fine.")
+    result = await collect(
+        "Hello world. This is fine.", SplitPolicy(first_min_weight=1.0, min_weight=1.0)
+    )
     assert len(result) >= 1
     assert result[0].startswith("Hello")
 
@@ -102,7 +110,9 @@ async def test_半形句號在後面有字時才切():
 
 async def test_首句用較低閾值_較早切出():
     policy = SplitPolicy(first_min_weight=6.0, min_weight=20.0)
-    result = await collect_full("我覺得這個想法不錯，可以再多想一下細節，然後我們就開始做。", policy)
+    result = await collect_full(
+        "我覺得這個想法不錯，可以再多想一下細節，然後我們就開始做。", policy
+    )
     texts = [s.text for s in result if s.text]
     assert texts[0] == "我覺得這個想法不錯，"
     assert result[0].is_first
@@ -121,7 +131,11 @@ async def test_首句標記只有第一句有():
 
 async def test_超長句被強制切開():
     """一個 80 字的長句在 RTF 0.3 下要合成 6 秒，後面全部延遲。"""
-    policy = SplitPolicy(first_max_weight=10.0, max_weight=15.0, allow_secondary_split=False)
+    # 寬限設 0——這裡驗的是「上限必定切開」，寬限行為另有專屬測試
+    policy = SplitPolicy(
+        first_max_weight=10.0, max_weight=15.0,
+        allow_secondary_split=False, hard_cut_grace=0.0,
+    )
     long_text = "這" * 60 + "。"
     result = await collect_full(long_text, policy)
     assert len(result) > 3
@@ -199,7 +213,10 @@ async def test_取消時拋出():
 
 async def test_split_reason_可分類():
     """調參時要看這個分布：max_length 佔比過高代表閾值要調。"""
-    result = await collect_full("你好。這是一段比較長的句子，裡面有逗號分隔的內容。")
+    result = await collect_full(
+        "你好。這是一段比較長的句子，裡面有逗號分隔的內容。",
+        SplitPolicy(first_min_weight=1.0, min_weight=1.0),
+    )
     reasons = {s.split_reason for s in result}
     assert "terminal" in reasons
 
@@ -207,3 +224,69 @@ async def test_split_reason_可分類():
 def test_text_weight_累加():
     assert text_weight("你好") == 2.0
     assert text_weight("，。") == 0.0
+
+
+async def test_過短的句末不切_併入下一句():
+    """"Of course!" 這種兩三字短句單獨合成會各吃一次 TTS 固定開銷，
+    且語氣破碎——句末標點也要達最短長度，不夠就併入下一句。"""
+    result = await collect(
+        "好。那我們就從這裡開始講起吧。",
+        SplitPolicy(first_min_weight=6.0, first_max_weight=999.0, min_weight=12.0),
+    )
+    assert len(result) == 1
+    assert result[0].startswith("好。")
+
+
+# --- 硬切寬限（2026-08-21 實測回饋） ---
+
+
+async def test_超過上限先等標點再切_不切在詞中間():
+    """「…遊戲吸/引，…」這種詞中硬切比句子長幾個字難聽得多。"""
+    policy = SplitPolicy(
+        first_min_weight=4.0, first_max_weight=10.0, hard_cut_grace=6.0
+    )
+    # 權重 10 時沒有標點，「，」在權重 14 處——寬限內，應該等到標點
+    text = "一二三四五六七八九十十一十二，後面的內容。"
+    result = await collect_full(text, policy)
+    assert result[0].text.endswith("，")
+    assert result[0].split_reason == "secondary"
+
+
+async def test_寬限用完仍會硬切():
+    policy = SplitPolicy(
+        first_min_weight=4.0, first_max_weight=10.0, hard_cut_grace=4.0
+    )
+    text = "這" * 30 + "。"
+    result = await collect_full(text, policy)
+    assert result[0].split_reason == "max_length"
+    assert text_weight(result[0].text) <= 14.0 + 1
+
+
+# --- 括號內不切（2026-08-21 實測回饋） ---
+
+
+async def test_書名號內的冒號不當切點():
+    """《光與影：33號遠征隊》被切成「《光與影：」是實測看到的殘句。"""
+    policy = SplitPolicy(
+        first_min_weight=2.0, first_max_weight=99.0, min_weight=2.0, max_weight=99.0
+    )
+    text = "我想試試《光與影：33號遠征隊》這款，然後繼續講別的。"
+    result = await collect(text, policy)
+    assert result[0] == "我想試試《光與影：33號遠征隊》這款，"
+
+
+async def test_括號外的次級標點照常切():
+    policy = SplitPolicy(
+        first_min_weight=2.0, first_max_weight=99.0, min_weight=2.0, max_weight=99.0
+    )
+    result = await collect("第一段夠長了，第二段也夠長，", policy)
+    assert result == ["第一段夠長了，", "第二段也夠長，"]
+
+
+async def test_未閉合括號不會永久卡死切分():
+    """LLM 忘記閉合《 時，句末標點與硬切仍要能收尾。"""
+    policy = SplitPolicy(
+        first_min_weight=2.0, first_max_weight=99.0, min_weight=2.0, max_weight=99.0
+    )
+    result = await collect("他提到《某本書，內容還不錯。之後再說。", policy)
+    assert len(result) == 2  # 兩個句號各切一次，沒有被括號深度擋住

@@ -18,23 +18,30 @@ TTFA（Time To First Audio）= 使用者**說完話**到**聽見第一個字**�
 所以 t0 取 :attr:`Utterance.ended_at`（使用者說完的時刻），不是系統收到
 轉錄的時刻——**STT 的轉錄耗時是使用者的等待，必須算進去**。
 
-## 延遲預算（設計文件 §5，2026-08-20 修訂）
+## 延遲預算（設計文件 §5，2026-08-20 二次修訂）
 
-| 階段 | 預算 | 2026-06-22 現況 |
+| 階段 | 預算 | 依據 |
 |------|------|------|
-| STT 最終轉錄 | 700ms | 1-2s |
-| Memory retrieve | 300ms | 1-3s（§7.4 定案改平行，**不計入 TTFA**）|
-| LLM 首句 | 800ms | 20-30s（整段生成）|
-| TTS 首段 | 1000ms | 4-5s（整段）；已實測段級串流首段 4.0s |
-| **TTFA 合計** | **2500ms** | **~30s** |
+| STT 最終轉錄 | 700ms | 增量串流 + LocalAgreement 的實際量級 |
+| Memory retrieve | 300ms | 與 LLM prefill 平行，**不計入 TTFA** |
+| LLM 首句 | 800ms | 串流後首 token ~200-400ms |
+| TTS 首段 | 1800ms | **實測**：固定開銷約 1.8s，切短首句也跨不過 |
+| **TTFA 合計** | **3500ms** | 暫訂值 |
 
-STT 從原訂 400ms 上修為 700ms：400ms 是雲端專用串流 ASR
-（AssemblyAI P50 ~150ms、Deepgram Flux <300ms）的量級，Whisper 系是
-encoder-decoder attention 架構，即使 turbo + int8 也先天不利於那個量級。
-改造成增量串流 + LocalAgreement 後，社群實測落在 500-800ms，
-700ms 是這個架構下較實際的目標。硬追 400ms 要接受 partial 被推翻的風險。
+兩次上修都是**被實測打臉**的結果，記在這裡免得日後又拿舊數字當目標：
 
-Memory 不計入 TTFA 總和——它與 LLM prefill 平行跑（§7.4），
+* **STT 400ms → 700ms**：400ms 是雲端專用串流 ASR（AssemblyAI P50
+  ~150ms、Deepgram Flux <300ms）的量級。Whisper 是 encoder-decoder
+  attention 架構，即使 turbo + int8 也先天不利。
+* **TTS 1000ms → 1800ms**：實測首句 16 字 / 9 字 / 1 字分別是
+  3411 / 2845 / 1788ms，解出「每次合成約 1.8 秒固定開銷 + 每字 80ms」。
+  **首句就算只有一個字也要 1.8 秒**，這是當前 IndexTTS2 實作的硬牆。
+
+預算是**暫訂**的：導入 TensorRT 加速（Faster IndexTTS-2 論文的端到端
+3.46-3.60×）後 TTS 段可望回到 ~500ms，屆時 TTFA 目標可以拉回 2.5s 以下。
+在那之前拿 2.5s 當目標只會讓每份報告都顯示紅字，預算就失去意義了。
+
+Memory 不計入總和——它與 LLM prefill 平行跑（§7.4），
 列在表中只是為了看它有沒有慢到連第二句都趕不上。
 """
 
@@ -82,8 +89,8 @@ BUDGET_MS: dict[str, float] = {
     "stt": 700.0,
     "memory": 300.0,
     "llm_first_sentence": 800.0,
-    "tts_first_chunk": 1000.0,
-    "ttfa": 2500.0,
+    "tts_first_chunk": 1800.0,
+    "ttfa": 3500.0,
 }
 
 
@@ -280,7 +287,10 @@ class LatencyTracer:
         for label, key, budget_key in rows:
             value = segs.get(key)
             budget = BUDGET_MS.get(budget_key) if budget_key else None
-            lines.append(f"  {label:<18}{_fmt_ms(value):>10}{_fmt_ms(budget):>10}   {_verdict(value, budget)}")
+            lines.append(
+                f"  {label:<18}{_fmt_ms(value):>10}{_fmt_ms(budget):>10}"
+                f"   {_verdict(value, budget)}"
+            )
 
         lines.append("  " + "─" * 46)
         lines.append(

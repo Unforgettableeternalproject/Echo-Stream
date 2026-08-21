@@ -11,6 +11,9 @@ echo_stt / echo_tts / echo_memory / session control，那條線一旦破了，
   ``on_segment_audio(tensor, idx, total)``，契約是 async pull，
   用 :class:`~echo_stream.core.channel.StreamChannel` 轉接
 * ``think_llm.py``（Phase 2）— LLM 串流 + SentenceSplitter
-* ``input_stt.py``（Phase 3）— 包 ``MultiChannelSTTEngine``
+* ``input_stt.py``（Phase 3）— VAD + turn 判定 + 轉錄的 InputStage。
+  transcriber 邊界是 provider 無關的 ``TranscriberBackend``
+  （bytes 進、result 出），預設 backend 走 echo_stt 的
+  ``MultiChannelSTTEngine.transcribe_segment``
 * ``think_memory.py``（Phase 4）— EchoMemory + SessionControl
 """

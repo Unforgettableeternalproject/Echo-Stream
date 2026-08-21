@@ -18,7 +18,7 @@ from .contracts.cancellation import CancelReason
 from .contracts.turn import TurnPolicy
 from .core.pipeline import PipelineRunner
 from .core.splitter import SentenceSplitter, SplitPolicy
-from .core.tracer import LatencyTracer
+from .core.tracer import BUDGET_MS, MARK_THINK_FIRST_TOKEN, LatencyTracer
 from .fakes import (
     FakeAudioSink,
     FakeAudioSource,
@@ -55,6 +55,152 @@ def _build_speak_stage(args: argparse.Namespace):
         keep_wav=False,
     )
     return stage, stage.sample_rate
+
+
+def _combined_system_prompt(explicit: str | None) -> str:
+    """把 .env 的 ``SYSTEM_PROMPT``（U.E.P 人設）接在最前面。
+
+    順序是刻意的：人設是基底，`--system` 是這次測試的補充指示，
+    後者不該蓋掉前者。
+    """
+    from . import config
+
+    parts = [config.get("SYSTEM_PROMPT") or "", explicit or ""]
+    return "\n\n".join(p for p in parts if p)
+
+
+def _run_serve(args: argparse.Namespace) -> int:
+    from .web.server import serve
+
+    serve(
+        host=args.host,
+        port=args.port,
+        real_tts=args.real_tts or args.real,
+        real_llm=args.real_llm or args.real,
+        real_stt=args.real_stt or args.real,
+        split_policy=SplitPolicy(
+            first_min_weight=args.first_min,
+            first_max_weight=args.first_max,
+            min_weight=args.min_weight,
+            max_weight=args.max_weight,
+        ),
+        system_prompt=_combined_system_prompt(args.system),
+        trace_path=args.trace,
+    )
+    return 0
+
+
+async def _run_llm_check(args: argparse.Namespace) -> int:
+    """Phase 2 驗收：只跑 ThinkStage，量首 token 與首句延遲。
+
+    不經過 PipelineRunner，也不接 TTS——這裡要看的是 LLM 段本身。
+    特別是 reasoning effort 對首字延遲的影響：強度越高，吐出第一個 token
+    前思考得越久，那段時間全部計入 TTFA。
+    """
+    import time
+
+    from .adapters.think_llm import LLMThinkStage, build_backend
+    from .contracts.cancellation import CancellationToken
+    from .contracts.types import Utterance
+
+    print("═" * 56)
+    print("  Echo Stream — Phase 2 LLM 驗收（真 API，會消耗 token）")
+    print("═" * 56)
+
+    overrides = {}
+    if args.effort:
+        overrides["reasoning_effort"] = args.effort
+    if args.model:
+        overrides["model"] = args.model
+
+    try:
+        backend = build_backend(**overrides)
+    except Exception as exc:  # noqa: BLE001
+        print(f"\n✗ 無法建立 backend：{type(exc).__name__}: {exc}")
+        print("\n  檢查項：")
+        print("  - .env 的 OPENAI_API_KEY 是否已填")
+        print("  - ECHO_STREAM_SESSION_REPO 是否指向 TestSeparateSessionControl")
+        return 1
+
+    effort = getattr(backend, "reasoning_effort", "?")
+    model = getattr(backend, "model_name", "?")
+    print(f"\n▸ model={model}  effort={effort}  api={getattr(backend, 'api', '?')}")
+    if hasattr(backend, "get_context_window_size"):
+        window = backend.get_context_window_size()
+        print(f"  有效 context window：{window:,}")
+
+    split_policy = SplitPolicy(
+        first_min_weight=args.first_min,
+        first_max_weight=args.first_max,
+        min_weight=args.min_weight,
+        max_weight=args.max_weight,
+    )
+    # 用 tracer 取得「首 token」的打點——它與「首句」是兩件事：
+    # 首 token 反映 API 往返 + prefill + 推理，首句還要加上累積到切點的時間。
+    # 分不開就不知道該優化哪一邊。
+    tracer = LatencyTracer()
+    stage = LLMThinkStage(
+        backend,
+        system_prompt=args.system or "",
+        split_policy=split_policy,
+        tracer=tracer,
+    )
+
+    print(f"\n▸ 送出：{args.text}\n")
+    token = CancellationToken()
+    utterance = Utterance(text=args.text)
+    tracer.start(utterance.turn_id)
+    t0 = time.perf_counter()
+    first_sentence_ms: float | None = None
+    sentences = []
+
+    try:
+        async for sentence in stage.stream(utterance, token):
+            now = (time.perf_counter() - t0) * 1000
+            if first_sentence_ms is None:
+                first_sentence_ms = now
+            if sentence.text:
+                sentences.append((sentence, now))
+                flag = "首句" if sentence.is_first else "　　"
+                print(f"  [{sentence.index:>2}] {flag} {now:>7.0f}ms  {sentence.text}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"\n✗ 串流失敗：{type(exc).__name__}: {exc}")
+        return 1
+    finally:
+        await stage.aclose()
+
+    elapsed = (time.perf_counter() - t0) * 1000
+    trace = tracer.get(utterance.turn_id)
+    mark = trace.marks.get(MARK_THINK_FIRST_TOKEN) if trace else None
+    start = trace.marks.get("turn_start") if trace else None
+    first_token_ms = (mark - start) * 1000 if (mark and start) else None
+
+    print()
+    print("─" * 56)
+    budget = BUDGET_MS["llm_first_sentence"]
+    verdict = "✓" if first_sentence_ms and first_sentence_ms <= budget else "✗"
+    if first_token_ms is not None:
+        print(f"  首 token      {first_token_ms:>8.0f}ms   （API 往返 + prefill + 推理）")
+    print(f"  LLM 首句      {first_sentence_ms:>8.0f}ms   預算 {budget:.0f}ms   {verdict}")
+    if first_token_ms is not None and first_sentence_ms is not None:
+        accumulate = first_sentence_ms - first_token_ms
+        print(f"    └ 累積成句  {accumulate:>8.0f}ms   （切分閾值決定，可調）")
+    print(f"  全部生成完    {elapsed:>8.0f}ms")
+    print(f"  句數          {len(sentences)}")
+
+    if first_sentence_ms and first_sentence_ms > budget:
+        print()
+        if first_token_ms is not None and first_token_ms > budget * 0.7:
+            print("  ⚠ 瓶頸在**首 token**，不是切分。")
+            print("    切短首句救不了——那只影響上面的「累積成句」那一段。")
+            print(f"    目前 effort={effort}；若調整 effort 沒有明顯差異，")
+            print("    代表延遲來自 API 往返而非推理，要往 prompt caching /")
+            print("    網路路徑 / 換更小模型的方向查。")
+        else:
+            print("  ⚠ 瓶頸在**累積成句**——首句切短就能改善。")
+            print("    試試 --first-min 4 --first-max 10。")
+    print("─" * 56)
+    return 0
 
 
 async def _run_tts_check(args: argparse.Namespace) -> int:
@@ -162,6 +308,88 @@ async def _run_tts_check(args: argparse.Namespace) -> int:
     if path:
         print(f"\n  音訊已寫入 {path}")
     print("─" * 56)
+    return 0
+
+
+async def _run_stt_check(args: argparse.Namespace) -> int:
+    """Phase 3 驗收：只跑 SttInputStage，量 turn 切分與轉錄延遲。
+
+    不經過 PipelineRunner——這裡要驗的是 VAD、turn 判定、轉錄的接線。
+    「使用者說完 → 拿到 Utterance」這段就是 TTFA 裡 STT 要吃掉的預算。
+    """
+    import time
+
+    from .adapters.input_stt import SttInputStage
+    from .contracts.cancellation import CancellationToken
+
+    print("═" * 56)
+    print("  Echo Stream — Phase 3 STT 驗收（真 Whisper，載入需要時間）")
+    print("═" * 56)
+
+    if args.wav:
+        from .sources import WavFileSource
+
+        source = WavFileSource(args.wav, realtime=True)
+        print(f"\n▸ 來源：{args.wav}（realtime 播放）")
+    else:
+        from .sources import MicrophoneSource
+
+        source = MicrophoneSource(device=args.device_index)
+        print("\n▸ 來源：麥克風（Ctrl+C 結束）")
+
+    policy = TurnPolicy(
+        silence_threshold_s=args.silence,
+        min_utterance_s=args.min_utterance,
+    )
+    stage = SttInputStage(language=args.language, policy=policy)
+
+    print("▸ 載入模型…")
+    load_t0 = time.perf_counter()
+    try:
+        await stage.prepare()
+    except Exception as exc:  # noqa: BLE001
+        print(f"\n✗ 模型載入失敗：{type(exc).__name__}: {exc}")
+        print("\n  檢查項：")
+        print("  - ECHO_STREAM_STT_REPO 是否指向 TestSeparateSTTSystem")
+        print("  - 該 repo 的模型與設定是否可用（faster-whisper checkpoint）")
+        return 1
+    print(f"  載入完成 {(time.perf_counter() - load_t0) * 1000:.0f}ms")
+    print(f"  靜音門檻 {policy.silence_threshold_s * 1000:.0f}ms"
+          f" · 最短語音 {policy.min_utterance_s * 1000:.0f}ms\n")
+
+    token = CancellationToken()
+    count = 0
+    latencies: list[float] = []
+    try:
+        async for utterance in stage.stream(source, token):
+            now = time.perf_counter()
+            stt_ms = (now - utterance.ended_at) * 1000
+            speech_s = max(0.0, utterance.ended_at - utterance.started_at)
+            latencies.append(stt_ms)
+            count += 1
+            print(f"  [{count:>2}] 語音 {speech_s:>4.1f}s → 轉錄 {stt_ms:>6.0f}ms"
+                  f"  ({utterance.language or '?'}, conf={utterance.confidence:.2f})")
+            print(f"       {utterance.text}")
+            if args.turns and count >= args.turns:
+                token.cancel(CancelReason.SHUTDOWN)
+                break
+    except KeyboardInterrupt:
+        token.cancel(CancelReason.SHUTDOWN)
+    finally:
+        await stage.aclose()
+
+    if latencies:
+        print()
+        print("─" * 56)
+        budget = BUDGET_MS.get("stt", 700.0)
+        median = sorted(latencies)[len(latencies) // 2]
+        verdict = "✓" if median <= budget else "✗"
+        print(f"  轉錄延遲 med  {median:>8.0f}ms   預算 {budget:.0f}ms   {verdict}")
+        print(f"  轉錄延遲 max  {max(latencies):>8.0f}ms")
+        print(f"  turn 數       {count}")
+        print("─" * 56)
+    else:
+        print("\n  （沒有切出任何 turn——檢查麥克風音量或 VAD 閾值）")
     return 0
 
 
@@ -317,6 +545,28 @@ def build_parser() -> argparse.ArgumentParser:
     _add_split_args(demo)
     demo.set_defaults(func=lambda a: asyncio.run(_run_demo(a)))
 
+    web = sub.add_parser("serve", help="開 Web 前端 host 整條管線")
+    web.add_argument("--host", default=None)
+    web.add_argument("--port", type=int, default=None)
+    web.add_argument("--real-tts", action="store_true", help="用真 IndexTTS2（需要 GPU）")
+    web.add_argument("--real-llm", action="store_true", help="用真 OpenAI（會消耗 token）")
+    web.add_argument("--real-stt", action="store_true", help="用真 Whisper（載入需要時間）")
+    web.add_argument("--real", action="store_true", help="STT / LLM / TTS 全用真的")
+    web.add_argument("--system", default=None, help="system prompt")
+    web.add_argument("--trace", default=None, help="打點輸出的 JSONL 路徑")
+    _add_split_args(web)
+    web.set_defaults(func=_run_serve)
+
+    llm = sub.add_parser("llm-check", help="Phase 2 驗收：只跑真 LLM，量首句延遲")
+    llm.add_argument("text", help="要送出的訊息")
+    llm.add_argument("--effort", default=None,
+                     metavar="none|low|medium|high|xhigh|max",
+                     help="推理強度（覆寫 .env）。直接影響首字延遲")
+    llm.add_argument("--model", default=None, help="模型（覆寫 .env）")
+    llm.add_argument("--system", default=None, help="system prompt")
+    _add_split_args(llm)
+    llm.set_defaults(func=lambda a: asyncio.run(_run_llm_check(a)))
+
     tts = sub.add_parser("tts-check", help="Phase 1 驗收：只跑真 TTS，量首段延遲")
     tts.add_argument("text", help="要合成的文字")
     tts.add_argument("--out", default="outputs/tts_check.wav", help="音訊輸出路徑")
@@ -328,6 +578,18 @@ def build_parser() -> argparse.ArgumentParser:
                      help="載入後先跑一次丟棄的合成（實測無效益，預設關閉）")
     _add_split_args(tts)
     tts.set_defaults(func=lambda a: asyncio.run(_run_tts_check(a)))
+
+    stt = sub.add_parser("stt-check", help="Phase 3 驗收：只跑真 STT，量 turn 切分與轉錄延遲")
+    stt.add_argument("--wav", default=None, metavar="檔案",
+                     help="用 WAV 檔當來源（16kHz mono；不給就用麥克風）")
+    stt.add_argument("--device-index", type=int, default=None, help="麥克風裝置索引")
+    stt.add_argument("--language", default=None, help="轉錄語言（留空自動偵測）")
+    stt.add_argument("--turns", type=int, default=None, help="收滿 N 個 turn 後結束")
+    stt.add_argument("--silence", type=float, default=0.7,
+                     help="turn 結束的靜音門檻（秒）")
+    stt.add_argument("--min-utterance", type=float, default=0.3,
+                     help="短於此的語音不成 turn（秒）")
+    stt.set_defaults(func=lambda a: asyncio.run(_run_stt_check(a)))
 
     split = sub.add_parser("split", help="檢查切分結果（調參用）")
     split.add_argument("text", help="要切分的文字")

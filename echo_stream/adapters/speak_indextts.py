@@ -52,7 +52,8 @@ from pathlib import Path
 from typing import Any
 
 from .. import config
-from ..contracts.cancellation import CancellationToken, CancelledError, CancelReason
+from ..contracts.cancellation import CancellationToken, CancelledError
+from ..contracts.style import SpeechStyle
 from ..contracts.types import TTS_SAMPLE_RATE, AudioChunk, Sentence
 from ..core.channel import StreamChannel
 
@@ -62,6 +63,80 @@ DEFAULT_SAMPLE_RATE = TTS_SAMPLE_RATE
 
 class _Aborted(Exception):
     """內部訊號：從 callback 拋出以中止 ``generate()``。"""
+
+
+CONFIG_STRETCH_RATIO = 1.72
+"""引擎 config 的 ``s2mel_stretch_ratio`` 預設值。
+
+引擎裡的關係是 ``stretch_ratio = config_stretch_ratio - speed × 0.5``，
+stretch 越大唸得越慢。
+"""
+
+
+def speed_multiplier_to_offset(multiplier: float) -> float:
+    """把 :attr:`SpeechStyle.speed` 的**倍率**換成 IndexTTS 的 speed 偏移。
+
+    契約層用倍率（1.0 = 正常、1.1 = 快 10%），因為那是 backend 無關的說法；
+    IndexTTS 用 -1~1 的偏移。換算：
+
+        stretch = CONFIG / r        （要快 r 倍，就把拉伸縮小 r 倍）
+        offset  = (CONFIG - stretch) / 0.5 = 2 × CONFIG × (1 - 1/r)
+
+    夾在 [-1, 1]，超出範圍的倍率會被截斷而不是拋錯——
+    語速設過頭應該是「頂到底」，不該讓整個 turn 掛掉。
+    """
+    if multiplier <= 0:
+        return 0.0
+    offset = 2.0 * CONFIG_STRETCH_RATIO * (1.0 - 1.0 / multiplier)
+    return max(-1.0, min(1.0, offset))
+
+
+_TTS_STRIP_CHARS = "「」『』【】《》〈〉“”‘’\"'`*_#~<>|（）()［］[]"
+"""合成前剔除的符號。引號會被 IndexTTS 唸出怪聲（實測），
+括號、markdown 記號同理——它們是視覺標記，不是語音內容。
+逗號句號等韻律標點**保留**，那些影響停頓，是語音的一部分。"""
+
+
+def sanitize_for_tts(text: str) -> str:
+    """清掉不該被唸出來的符號，並收攏多餘空白。"""
+    import re
+
+    # 句中的列表破折號（「小說。 - 《死亡擱淺》」）換成頓點——那是列舉的
+    # 停頓，不是連字號。兩側都有空白才算，"well-known" 這種不受影響。
+    cleaned = re.sub(r"\s+[-–—•·・]+\s+", "，", text)
+    cleaned = cleaned.translate({ord(c): None for c in _TTS_STRIP_CHARS})
+    return " ".join(cleaned.split())
+
+
+def smooth_segment_edges(
+    pcm: bytes,
+    sample_rate: int,
+    fade_ms: float = 4.0,
+    tail_silence_ms: float = 15.0,
+) -> bytes:
+    """段緣平滑：半 Hann 淡入淡出 + 段尾短靜音墊。
+
+    段與段是獨立合成的，邊界樣本值不連續，接起來就是爆音（click）。
+    調查結論（docs/design/tts-improvement-reference.md）：Hann window
+    淡化 + 段間短靜音是純訊號處理的消爆音手段，UTMOS 損失僅 -0.08~-0.13。
+
+    淡化只動段緣幾毫秒（預設 4ms ≈ 88 樣本 @22050Hz），聽不出音量變化；
+    靜音墊直接附在段尾，前端排程不需要知道這件事。
+    """
+    import numpy as np
+
+    arr = np.frombuffer(pcm, dtype="<i2").astype("float32")
+    n_fade = min(int(sample_rate * fade_ms / 1000), len(arr) // 2)
+    if n_fade > 0:
+        # 半 Hann：0→1 的升沿。比線性淡化少一點高頻假影。
+        ramp = 0.5 * (1.0 - np.cos(np.pi * np.arange(n_fade) / n_fade))
+        arr[:n_fade] *= ramp
+        arr[-n_fade:] *= ramp[::-1]
+    out = arr.astype("<i2").tobytes()
+    n_pad = int(sample_rate * tail_silence_ms / 1000)
+    if n_pad > 0:
+        out += b"\x00\x00" * n_pad
+    return out
 
 
 def tensor_to_pcm16(tensor: Any) -> bytes:
@@ -113,6 +188,8 @@ class IndexTTS2SpeakStage:
         keep_wav: bool = False,
         warmup: bool = False,
         warmup_text: str = "嗯。",
+        edge_fade_ms: float = 4.0,
+        segment_silence_ms: float = 15.0,
     ) -> None:
         self._backend = backend
         self._tts_repo = Path(tts_repo) if tts_repo else None
@@ -137,6 +214,18 @@ class IndexTTS2SpeakStage:
         self.keep_wav = keep_wav
         self.warmup = warmup
         self.warmup_text = warmup_text
+        self.edge_fade_ms = edge_fade_ms
+        """段緣淡入淡出的長度（毫秒）。0 = 停用，消段間爆音用。"""
+
+        self.segment_silence_ms = segment_silence_ms
+        """段尾靜音墊（毫秒）。0 = 停用。與淡化搭配消爆音，見
+        :func:`smooth_segment_edges`。"""
+
+        self._default_emotion: list[float] | None = None
+        """backend 開機時的情緒向量（角色檔預設）。style 退場時要**還原**——
+        不還原的話，一句帶情緒的話會讓之後所有中性句都殘留那個情緒。"""
+
+        self._current_speed_offset: float = 0.0
         self._output_dir = Path(output_dir) if output_dir else None
         self._tempdir: tempfile.TemporaryDirectory | None = None
         self._prepared = False
@@ -159,6 +248,11 @@ class IndexTTS2SpeakStage:
             set_speed = getattr(self._backend, "set_speed", None)
             if callable(set_speed):
                 await loop.run_in_executor(None, set_speed, self.speed)
+        self._current_speed_offset = self.speed or 0.0
+
+        # 記住角色檔的預設情緒——per-sentence style 退場時要還原到這裡
+        default_emotion = getattr(self._backend, "emotion_vector", None)
+        self._default_emotion = list(default_emotion) if default_emotion else None
 
         if self.warmup:
             await loop.run_in_executor(None, self._run_warmup)
@@ -306,13 +400,25 @@ class IndexTTS2SpeakStage:
         """在 executor 執行緒裡跑同步推理。**這個函式不在 event loop 上。**"""
         chunk_index = 0
         output_path = self._next_output_path(sentence)
+        self._apply_style(sentence.style)
+        speak_text = sanitize_for_tts(sentence.text)
+        if not speak_text:
+            return  # 整句都是符號（例如純引號）——沒東西可唸
 
         def on_segment(tensor: Any, seg_idx: int, total: int) -> None:
             nonlocal chunk_index
             if token.is_cancelled:
                 raise _Aborted
+            pcm = tensor_to_pcm16(tensor)
+            if self.edge_fade_ms > 0 or self.segment_silence_ms > 0:
+                pcm = smooth_segment_edges(
+                    pcm,
+                    self.sample_rate,
+                    fade_ms=self.edge_fade_ms,
+                    tail_silence_ms=self.segment_silence_ms,
+                )
             chunk = AudioChunk(
-                pcm=tensor_to_pcm16(tensor),
+                pcm=pcm,
                 sample_rate=self.sample_rate,
                 turn_id=sentence.turn_id,
                 sentence_index=sentence.index,
@@ -326,7 +432,7 @@ class IndexTTS2SpeakStage:
 
         try:
             self._backend.generate(
-                sentence.text,
+                speak_text,
                 output_path,
                 on_segment_audio=on_segment,
                 language=self.language,
@@ -338,6 +444,51 @@ class IndexTTS2SpeakStage:
             if not self.keep_wav:
                 with contextlib.suppress(OSError):
                     Path(output_path).unlink(missing_ok=True)
+
+    def _apply_style(self, style: SpeechStyle | None) -> None:
+        """把句子的 :class:`SpeechStyle` 翻譯成 IndexTTS 的原生控制。
+
+        在 executor 執行緒裡呼叫，且句子是**序列**合成的（一次一句），
+        所以直接改 backend 狀態是安全的——不會有兩句同時在改。
+
+        ``style`` 為 None 或中性時完全不動 backend：預設音色是既有資產，
+        adapter 不該無故覆寫它。
+
+        ``expressiveness`` 與 ``volume`` 目前沒有對應的 IndexTTS 參數，
+        會被忽略——這是刻意的，SpeechStyle 是**各後端取所需**的共同描述，
+        不是每個欄位都保證被實作。
+
+        ``intensity``（emo_alpha）的翻譯是**向量 × 強度**：引擎的
+        ``normalize_emotion_vector`` 只在總和超過上限時壓縮，所以縮放
+        向量本身就等於調整情緒的整體強度。
+
+        style 為 None 或中性時**還原**角色檔預設，而不是不動——
+        上一句的情緒殘留在 backend 狀態裡，是「一句開心之後全部都開心」
+        這種 bug 的來源。
+        """
+        backend = self._backend
+
+        # 情緒向量：有 style 就換算，沒有就還原預設
+        if style is not None and not style.is_neutral:
+            alpha = max(0.0, min(1.0, style.intensity))
+            backend.emotion_vector = [v * alpha for v in style.emotion_vector()]
+        else:
+            backend.emotion_vector = (
+                list(self._default_emotion) if self._default_emotion else None
+            )
+
+        # 語速：style 指定倍率就換算成偏移，否則回到啟動時的基準值。
+        # 只在值真的變了才呼叫 set_speed——不必每句都戳引擎。
+        target = (
+            speed_multiplier_to_offset(style.speed)
+            if style is not None and style.speed != 1.0
+            else (self.speed or 0.0)
+        )
+        if target != self._current_speed_offset:
+            set_speed = getattr(backend, "set_speed", None)
+            if callable(set_speed):
+                set_speed(target)
+                self._current_speed_offset = target
 
     def _next_output_path(self, sentence: Sentence) -> Path:
         """`generate()` 一定要寫檔，即使我們只要 callback 的音訊。
@@ -355,4 +506,12 @@ class IndexTTS2SpeakStage:
         return base / f"{sentence.turn_id}_{sentence.index:03d}.wav"
 
 
-__all__ = ["IndexTTS2SpeakStage", "tensor_to_pcm16", "DEFAULT_SAMPLE_RATE"]
+__all__ = [
+    "IndexTTS2SpeakStage",
+    "sanitize_for_tts",
+    "smooth_segment_edges",
+    "tensor_to_pcm16",
+    "speed_multiplier_to_offset",
+    "DEFAULT_SAMPLE_RATE",
+    "CONFIG_STRETCH_RATIO",
+]

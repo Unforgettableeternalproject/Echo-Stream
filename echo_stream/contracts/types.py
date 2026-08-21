@@ -18,6 +18,8 @@ import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 
+from .style import SpeechStyle
+
 # --- 取樣率常數（§7.6：Pipeline 內部用各模組原生取樣率，重採樣放 Frontend Adapter）---
 
 STT_SAMPLE_RATE = 16_000
@@ -88,6 +90,14 @@ class Sentence:
     """切點成因：``terminal`` / ``secondary`` / ``max_length`` / ``flush``。
     調參時要看這個分布——``max_length`` 佔比過高代表 LLM 在生成長句，
     首句閾值需要調整。"""
+
+    style: SpeechStyle | None = None
+    """這一句的語音風格。``None`` 表示沿用 SpeakStage 的預設。
+
+    掛在句子上而不是整個 turn 上，是為了支援 phrase-level 的情緒切換
+    （「我本來以為沒問題，**[遲疑]** 但好像有哪裡怪怪的…」）——
+    切更細的句子 + 各自的 style 就能表達，不需要額外的 markup 結構。
+    """
 
     created_at: float = field(default_factory=time.perf_counter)
     metadata: dict = field(default_factory=dict)
