@@ -393,6 +393,86 @@ async def _run_stt_check(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _run_memory_check(args: argparse.Namespace) -> int:
+    """Phase 4a 驗收：只跑記憶層，量冷/熱檢索與寫入延遲。
+
+    「retrieve 1-3s」是現象不是診斷——bge-small-zh 的 embedding 推論
+    本身只要幾 ms。這裡把冷啟（模型載入）與熱路徑分開量，
+    有數據才決定 top_k / min_similarity 起始值與要不要 speculative retrieval。
+    """
+    import time
+
+    from .adapters.memory_echo import EchoMemoryAdapter
+
+    print("═" * 56)
+    print("  Echo Stream — Phase 4a Memory 驗收（本地 CPU，不燒 token）")
+    print("═" * 56)
+
+    adapter = EchoMemoryAdapter()
+
+    print("\n▸ 載入 engine…")
+    t0 = time.perf_counter()
+    try:
+        await adapter.prepare()
+    except Exception as exc:  # noqa: BLE001
+        print(f"\n✗ engine 建立失敗：{type(exc).__name__}: {exc}")
+        print("\n  檢查項：")
+        print("  - ECHO_STREAM_MEMORY_REPO 是否指向 TestSeperateMemorySystem")
+        print("  - 該 repo 是否在 feature/agent-memory-spike 分支")
+        return 1
+    engine_ms = (time.perf_counter() - t0) * 1000
+    print(f"  engine 建立 {engine_ms:.0f}ms（不含 embedding 模型，那個在首次檢索）")
+
+    if args.seed:
+        print("\n▸ 寫入種子 episodes…")
+        seeds = [
+            ("我最喜歡的顏色是深藍色", "記住了，深藍色。", ),
+            ("我養了一隻叫毛球的貓", "毛球聽起來很可愛。"),
+            ("我週末通常去河濱騎腳踏車", "河濱騎車很舒服呢。"),
+        ]
+        for user, agent in seeds:
+            t = time.perf_counter()
+            await adapter.store(user, agent, session_id="memory-check-seed")
+            print(f"    store {((time.perf_counter() - t) * 1000):>7.0f}ms  {user}")
+
+    query = args.query
+    print(f"\n▸ 檢索：{query}")
+
+    t = time.perf_counter()
+    cold = await adapter.retrieve(query)
+    cold_ms = (time.perf_counter() - t) * 1000
+    print(f"  冷檢索（含 embedding 模型首載） {cold_ms:>8.0f}ms")
+
+    warm: list[float] = []
+    for _ in range(args.repeat):
+        t = time.perf_counter()
+        await adapter.retrieve(query)
+        warm.append((time.perf_counter() - t) * 1000)
+
+    print()
+    print("─" * 56)
+    budget = BUDGET_MS.get("memory", 300.0)
+    if warm:
+        median = sorted(warm)[len(warm) // 2]
+        verdict = "✓" if median <= budget else "✗"
+        print(f"  熱檢索 med    {median:>8.0f}ms   預算 {budget:.0f}ms   {verdict}")
+        print(f"  熱檢索 max    {max(warm):>8.0f}ms")
+    first_load = cold_ms - (median if warm else 0)
+    print(f"  冷熱差        {first_load:>8.0f}ms   （= 首載成本，server 暖機吸收）")
+    if cold is not None:
+        print(f"\n  檢索結果（截斷至 {adapter.max_chars} 字）：")
+        for line in cold.splitlines()[:12]:
+            print(f"    {line}")
+    else:
+        print("\n  （沒有撈到任何記憶——資料目錄是空的？用 --seed 寫幾筆再試）")
+    print("─" * 56)
+    if warm and median > budget:
+        print("  ⚠ 熱檢索超出預算。retrieve 與 LLM 平行、不擋首句，")
+        print("    但下一輪注入會遲到。分解瓶頸要看 echo_memory 的 log")
+        print("    （embedding / 向量搜尋 / 圖擴散哪段肥）。")
+    return 0
+
+
 async def _run_demo(args: argparse.Namespace) -> int:
     tracer = LatencyTracer(output_path=args.trace)
     split_policy = SplitPolicy(
@@ -590,6 +670,12 @@ def build_parser() -> argparse.ArgumentParser:
     stt.add_argument("--min-utterance", type=float, default=0.3,
                      help="短於此的語音不成 turn（秒）")
     stt.set_defaults(func=lambda a: asyncio.run(_run_stt_check(a)))
+
+    mem = sub.add_parser("memory-check", help="Phase 4a 驗收：只跑記憶層，量冷/熱檢索延遲")
+    mem.add_argument("--query", default="我養的貓叫什麼名字？", help="檢索用的問句")
+    mem.add_argument("--seed", action="store_true", help="先寫入三筆種子 episodes（首次跑要開）")
+    mem.add_argument("--repeat", type=int, default=5, help="熱檢索次數")
+    mem.set_defaults(func=lambda a: asyncio.run(_run_memory_check(a)))
 
     split = sub.add_parser("split", help="檢查切分結果（調參用）")
     split.add_argument("text", help="要切分的文字")

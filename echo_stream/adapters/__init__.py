@@ -15,5 +15,6 @@ echo_stt / echo_tts / echo_memory / session control，那條線一旦破了，
   transcriber 邊界是 provider 無關的 ``TranscriberBackend``
   （bytes 進、result 出），預設 backend 走 echo_stt 的
   ``MultiChannelSTTEngine.transcribe_segment``
-* ``think_memory.py``（Phase 4）— EchoMemory + SessionControl
+* ``memory_echo.py``（Phase 4a）— 包 ``MemoryEngine``（EcphoryRAG）。
+  同步引擎丟 executor；retrieve/store 都是旁路，失敗不炸管線
 """
