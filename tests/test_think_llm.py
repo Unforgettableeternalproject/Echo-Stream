@@ -271,3 +271,52 @@ async def test_接進_PipelineRunner():
     assert result.phase is TurnPhase.DONE
     assert result.spoken_text == result.generated_text
     assert len(stage.history) == 2
+
+
+# --- 逐句情緒標記 ---
+
+
+async def test_情緒標記轉成_style_並從文字剔除():
+    backend = FakeBackend(response="[開心]太好了，這下成功了！接下來繼續處理剩的。")
+    stage = LLMThinkStage(backend, emotion_markers=True)
+    sentences = await collect(stage)
+    assert all("[" not in s.text for s in sentences)
+    assert sentences[0].style is not None
+    assert sentences[0].style.emotion.get("happy", 0) > 0
+
+
+async def test_標記開啟時_system_prompt_接上指示():
+    from echo_stream.core.emotion import MARKER_PROMPT
+
+    backend = FakeBackend()
+    stage = LLMThinkStage(backend, system_prompt="人設在前", emotion_markers=True)
+    await collect(stage)
+    assert backend.last_system.startswith("人設在前")
+    assert MARKER_PROMPT in backend.last_system
+
+
+async def test_標記關閉時不動_prompt_也不解析():
+    backend = FakeBackend(response="[開心]照舊輸出，不要動我的方括號內容。")
+    stage = LLMThinkStage(backend, system_prompt="人設", emotion_markers=False)
+    sentences = await collect(stage)
+    assert backend.last_system == "人設"
+    assert any("[開心]" in s.text for s in sentences)
+
+
+async def test_無標記的句子退回_default_style():
+    default = SpeechStyle(emotion={"calm": 0.5}, speed=1.1)
+    backend = FakeBackend(response="[開心]第一句有標記喔！後面這句就沒有標記了。")
+    stage = LLMThinkStage(backend, emotion_markers=True, default_style=default)
+    sentences = await collect(stage)
+    assert sentences[0].style.emotion.get("happy", 0) > 0
+    assert sentences[0].style.speed == 1.1  # base 的語速被保留
+    assert sentences[-1].style is default
+
+
+async def test_列表符號從句首剝除():
+    backend = FakeBackend(
+        response="我推薦幾款遊戲喔，你聽聽看。- 《文明七》：每次都想著只玩一回合就好。"
+    )
+    stage = LLMThinkStage(backend)
+    sentences = await collect(stage)
+    assert all(not s.text.lstrip().startswith("-") for s in sentences)

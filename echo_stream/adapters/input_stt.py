@@ -75,14 +75,31 @@ class TranscriberBackend(Protocol):
 
 
 class _Segment:
-    """一段待轉錄的 turn 音訊與它的時間標記。"""
+    """一段待轉錄的音訊與它的時間標記。
 
-    __slots__ = ("pcm", "started_at", "ended_at")
+    ``final=False`` 是 turn 進行中在停頓處切出的**增量段**——轉錄結果
+    先經 ``on_partial`` 推給前端顯示，turn 結束時與殘餘段拼成完整轉錄。
+    ``final=True`` 標記 turn 結束，``pcm`` 只含最後一段增量之後的殘餘
+    （可能為空），時間標記代表**整個 turn** 的起訖。
+    """
 
-    def __init__(self, pcm: bytes, started_at: float, ended_at: float) -> None:
+    __slots__ = ("pcm", "started_at", "ended_at", "final", "gen")
+
+    def __init__(
+        self,
+        pcm: bytes,
+        started_at: float,
+        ended_at: float,
+        final: bool = True,
+        gen: int = 0,
+    ) -> None:
         self.pcm = pcm
         self.started_at = started_at
         self.ended_at = ended_at
+        self.final = final
+        self.gen = gen
+        """切出這段時的世代號。``discard_current`` 會把世代往前推，
+        舊世代的段（包含已經在轉錄中的）一律作廢。"""
 
 
 class SttInputStage:
@@ -109,6 +126,9 @@ class SttInputStage:
         max_pending_segments: int = 4,
         queue_size: int = 2,
         on_voice_event: Callable[[VoiceEvent], None] | None = None,
+        on_partial: Callable[[str, int], None] | None = None,
+        partial_silence_s: float = 0.35,
+        partial_min_speech_s: float = 2.0,
     ) -> None:
         self._backend = backend
         self._stt_repo = stt_repo
@@ -135,7 +155,47 @@ class SttInputStage:
         （機器人講話中偵測插話 → ``runner.interrupt()``）。
         必須快——它在音訊路徑上。"""
 
+        self.on_partial = on_partial
+        """增量轉錄的 callback ``(text, index)``。turn 進行中每轉出一段就
+        呼叫一次——前端據此逐句條列使用者的話，不必等整個 turn 講完。
+        在 event loop 上呼叫，必須快。``None`` 表示不啟用增量切分。"""
+
+        self.partial_silence_s = partial_silence_s
+        """觸發增量切分的停頓長度。要**小於** turn 的 silence_threshold
+        （否則 turn 先結束了），又不能太小——太小會在氣口處切出破碎段，
+        Whisper 對半句話的辨識品質明顯較差。"""
+
+        self.partial_min_speech_s = partial_min_speech_s
+        """距上次切分至少累積這麼多語音才再切。短句一次轉完就好，
+        增量切分是給長獨白用的——順便把長 turn 的最終轉錄成本攤平
+        （殘餘段很短，turn 結束後的 STT 延遲不再隨講話長度線性成長）。"""
+
         self._prepared = False
+        self._generation = 0
+        self._segments_ref: asyncio.Queue[_Segment | None] | None = None
+
+    def discard_current(self) -> None:
+        """丟棄進行中的輸入：累積中的音訊、排隊與轉錄中的段全部作廢。
+
+        用途：旁邊有別人講話、誤觸發——這次輸入**不算在對話裡**。
+        **必須在 event loop 執行緒呼叫**（web server 走 call_soon_threadsafe）。
+
+        機制是世代號：discard 把世代 +1，讀取迴圈在下一個 chunk 察覺後
+        清空本地狀態；已排隊的段直接抽掉；正在 executor 轉錄的段無法中斷，
+        但結果回來時世代對不上就丟棄。
+        """
+        self._generation += 1
+        queue_ref = self._segments_ref
+        if queue_ref is not None:
+            while True:
+                try:
+                    item = queue_ref.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if item is None:  # 結束哨兵不能吞——放回去
+                    with contextlib.suppress(asyncio.QueueFull):
+                        queue_ref.put_nowait(None)
+                    break
 
     # --- 生命週期 ---
 
@@ -185,6 +245,7 @@ class SttInputStage:
         )
         out: StreamChannel[Utterance] = StreamChannel(maxsize=self.queue_size, token=token)
 
+        self._segments_ref = segments
         reader = asyncio.ensure_future(self._read(source, token, segments))
         worker = asyncio.ensure_future(self._transcribe_worker(segments, out, loop, token))
 
@@ -196,6 +257,7 @@ class SttInputStage:
             # 善後由 finally 做。取消不是 InputStage 的錯誤。
             return
         finally:
+            self._segments_ref = None
             for task in (reader, worker):
                 if not task.done():
                     task.cancel()
@@ -218,12 +280,15 @@ class SttInputStage:
         preroll: deque[bytes] = deque()
         preroll_len_s = 0.0
         buffer = bytearray()
+        partial_mark = 0
+        """buffer 中已切出去做增量轉錄的位元組數。turn 結束時只送殘餘。"""
         speech_start_clock: float | None = None
         """語音起點的**音訊時鐘**。時間標記一律用音訊時鐘回推、共用同一個
         牆鐘錨點——混用兩種時鐘在比即時快的來源（測試、檔案）下會讓
         started_at / ended_at 順序反轉。"""
         speech_in_turn_s = 0.0
         last_speech_clock: float | None = None
+        gen_seen = self._generation
 
         try:
             async for chunk in source.stream(token):
@@ -231,6 +296,18 @@ class SttInputStage:
                     return
                 if not chunk:
                     continue
+
+                # discard_current 把世代推前了：手上的累積全是被丟棄的輸入
+                if self._generation != gen_seen:
+                    gen_seen = self._generation
+                    buffer.clear()
+                    partial_mark = 0
+                    preroll.clear()
+                    preroll_len_s = 0.0
+                    speech_start_clock = None
+                    speech_in_turn_s = 0.0
+                    last_speech_clock = None
+                    self.turn_detector.reset()
 
                 event = self.vad.process(chunk)
                 if self.on_voice_event is not None:
@@ -258,6 +335,28 @@ class SttInputStage:
                         dropped = preroll.popleft()
                         preroll_len_s -= (len(dropped) // 2) / self.vad.sample_rate
 
+                    # 增量切分：講話中的自然停頓就先切一段去轉錄，
+                    # 不等整個 turn。條件是「停頓夠久 + 未轉錄的語音夠多」——
+                    # 同一次停頓切完 partial_mark 追上 buffer，不會重複觸發。
+                    pending_s = (len(buffer) - partial_mark) / 2 / self.vad.sample_rate
+                    if (
+                        self.on_partial is not None
+                        and buffer
+                        and event.duration_s >= self.partial_silence_s
+                        and pending_s >= self.partial_min_speech_s
+                    ):
+                        anchor = time.perf_counter()
+                        clock = self.vad.clock_s
+                        end_clock = (
+                            last_speech_clock if last_speech_clock is not None else clock
+                        )
+                        stamp = anchor - max(0.0, clock - end_clock)
+                        piece = bytes(buffer[partial_mark:])
+                        partial_mark = len(buffer)
+                        await segments.put(
+                            _Segment(piece, stamp, stamp, final=False, gen=gen_seen)
+                        )
+
                 decision = self.turn_detector.evaluate(event)
                 if decision.is_end_of_turn and buffer:
                     # 兩個標記共用同一個牆鐘錨點，再各自用音訊時鐘回推。
@@ -267,12 +366,17 @@ class SttInputStage:
                     clock = self.vad.clock_s
                     end_clock = last_speech_clock if last_speech_clock is not None else clock
                     start_clock = speech_start_clock if speech_start_clock is not None else end_clock
+                    # 增量切過的部分不重轉——final 段只帶殘餘，
+                    # 時間標記仍代表整個 turn
                     segment = _Segment(
-                        pcm=bytes(buffer),
+                        pcm=bytes(buffer[partial_mark:]),
                         started_at=anchor - max(0.0, clock - start_clock),
                         ended_at=anchor - max(0.0, clock - end_clock),
+                        final=True,
+                        gen=gen_seen,
                     )
                     buffer.clear()
+                    partial_mark = 0
                     speech_start_clock = None
                     speech_in_turn_s = 0.0
                     last_speech_clock = None
@@ -287,21 +391,29 @@ class SttInputStage:
                     # 太短不成 turn（咳嗽、關門聲）且靜音已足：丟掉。
                     # 不丟的話這段噪音會黏在下一個 turn 的開頭一起送去轉錄。
                     buffer.clear()
+                    partial_mark = 0
                     speech_start_clock = None
                     speech_in_turn_s = 0.0
                     last_speech_clock = None
 
-            # source 正常結束（檔案播完 / 麥克風關閉）：flush 殘餘
-            if buffer and speech_in_turn_s >= self.policy.min_utterance_s:
+            # source 正常結束（檔案播完 / 麥克風關閉）：flush 殘餘。
+            # 世代對不上代表殘餘是被丟棄的輸入——停止前按了捨棄，不該補送
+            if (
+                buffer
+                and self._generation == gen_seen
+                and speech_in_turn_s >= self.policy.min_utterance_s
+            ):
                 anchor = time.perf_counter()
                 clock = self.vad.clock_s
                 end_clock = last_speech_clock if last_speech_clock is not None else clock
                 start_clock = speech_start_clock if speech_start_clock is not None else end_clock
                 await segments.put(
                     _Segment(
-                        bytes(buffer),
+                        bytes(buffer[partial_mark:]),
                         anchor - max(0.0, clock - start_clock),
                         anchor - max(0.0, clock - end_clock),
+                        final=True,
+                        gen=gen_seen,
                     )
                 )
         except CancelledError:
@@ -317,27 +429,72 @@ class SttInputStage:
         loop: asyncio.AbstractEventLoop,
         token: CancellationToken,
     ) -> None:
-        """依序轉錄。單一 worker——turn 的順序不能亂。"""
+        """依序轉錄。單一 worker——段的順序不能亂，GPU 也不能並行。
+
+        增量段（``final=False``）的結果先推 ``on_partial``；turn 的
+        final 段到達時把累積的增量結果與殘餘段拼成完整 Utterance。
+        每段各自過信心閘門——雜訊段被剔除，不污染整段轉錄。
+        """
+        parts: list[TranscriptionResult] = []
+        parts_gen = -1
+
+        def _passes(result: TranscriptionResult | None) -> bool:
+            return (
+                result is not None
+                and bool(result.text.strip())
+                and result.confidence >= self.min_confidence
+            )
+
+        def _emit_partial(text: str) -> None:
+            if self.on_partial is None:
+                return
+            try:
+                self.on_partial(text, len(parts) - 1)
+            except Exception:  # noqa: BLE001 - 訂閱者壞掉不能斷轉錄
+                pass
+
         try:
             while True:
                 segment = await segments.get()
                 if segment is None:
                     break
                 token.raise_if_cancelled()
-                result = await loop.run_in_executor(
-                    None, self._backend.transcribe, segment.pcm, self.vad.sample_rate
+                if segment.gen != self._generation:
+                    continue  # 被 discard 作廢的段——連轉錄都省下來
+                if segment.gen != parts_gen:
+                    parts = []  # 上一個世代殘留的增量結果一併作廢
+                    parts_gen = segment.gen
+                result = (
+                    await loop.run_in_executor(
+                        None, self._backend.transcribe, segment.pcm, self.vad.sample_rate
+                    )
+                    if segment.pcm
+                    else None
                 )
-                if result is None or not result.text.strip():
+                if segment.gen != self._generation:
+                    continue  # 轉錄期間被 discard——結果作廢
+                if _passes(result):
+                    parts.append(result)
+                    _emit_partial(result.text.strip())
+                if not segment.final:
                     continue
-                if result.confidence < self.min_confidence:
-                    continue  # 雜訊誤轉錄：擋在 LLM 之前（見 min_confidence）
+
+                if not parts:
+                    continue  # 整個 turn 都是雜訊
+                texts = [r.text.strip() for r in parts]
+                total_chars = sum(len(t) for t in texts) or 1
+                confidence = (
+                    sum(r.confidence * len(r.text.strip()) for r in parts) / total_chars
+                )
+                language = next((r.language for r in parts if r.language), None)
+                parts = []
                 await out.put(
                     Utterance(
-                        text=result.text.strip(),
+                        text=" ".join(texts),
                         turn_id=new_turn_id(),
                         is_final=True,
-                        confidence=result.confidence,
-                        language=result.language,
+                        confidence=confidence,
+                        language=language,
                         started_at=segment.started_at,
                         ended_at=segment.ended_at,
                     )

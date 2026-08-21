@@ -50,7 +50,9 @@ from typing import Any
 
 from .. import config
 from ..contracts.cancellation import CancellationToken, CancelReason
+from ..contracts.style import EMOTION_DIMENSIONS, SpeechStyle
 from ..contracts.types import STT_SAMPLE_RATE, AudioChunk, TurnPhase, Utterance
+from ..core.emotion import EMOTION_PRESETS
 from ..core.pipeline import PipelineRunner
 from ..core.splitter import SplitPolicy
 from ..core.tracer import LatencyTracer
@@ -172,12 +174,21 @@ class StreamService:
         split_policy: SplitPolicy | None = None,
         system_prompt: str = "",
         trace_path: str | None = None,
+        store: Any | None = None,
     ) -> None:
         self.use_real_tts = use_real_tts
         self.use_real_llm = use_real_llm
         self.use_real_stt = use_real_stt
         self.split_policy = split_policy or SplitPolicy()
         self.system_prompt = system_prompt
+
+        self._store = store
+        """SessionControl 的 SessionStore。``None`` 時在 prepare 建立；
+        建不起來（repo 沒設定等）只停用會話功能，不擋管線。可注入供測試。"""
+
+        self._store_error: str | None = None
+        self._session_id = uuid.uuid4().hex[:8]
+        self._session_created = time.time()
 
         # 每次啟動自動開一個 session log（JSONL，逐 turn 一筆）——
         # 測試結果要能事後分析，不能只活在瀏覽器畫面上。
@@ -205,6 +216,10 @@ class StreamService:
 
         self._voice: dict[str, Any] | None = None
         """當前的語音 session（單使用者，一次一個）。"""
+
+        self._discard_turn = False
+        """捨棄請求打在進行中的 turn 上：voice loop 在 turn 收尾後
+        把這一輪從歷史裡拿掉（「這次輸入不算在其中」）。"""
 
         self._voice_lock = threading.Lock()
 
@@ -262,6 +277,7 @@ class StreamService:
                 system_prompt=self.system_prompt,
                 split_policy=self.split_policy,
                 tracer=self.tracer,
+                emotion_markers=True,
             )
         else:
             self._think = FakeThinkStage(
@@ -309,6 +325,296 @@ class StreamService:
         done.wait(timeout=2.0)
         return bool(result and result[0])
 
+    # --- 執行中調參 ---
+
+    def get_config(self) -> dict[str, Any]:
+        """回報當前可調參數的現值（給設定面板初始化）。"""
+        style: SpeechStyle | None = getattr(self._think, "default_style", None)
+        stt = self._stt
+        stt_policy = getattr(stt, "policy", None)
+        runner = self._runner
+        backend = getattr(self._think, "_backend", None)
+        return {
+            "tts": {
+                "speed": style.speed if style else 1.0,
+                "intensity": style.intensity if style else 0.6,
+                "emotion": style.normalized_emotion() if style else
+                           {dim: 0.0 for dim in EMOTION_DIMENSIONS},
+                "override": style is not None,
+            },
+            "presets": EMOTION_PRESETS,
+            "split": {
+                "first_min": self.split_policy.first_min_weight,
+                "first_max": self.split_policy.first_max_weight,
+                "min": self.split_policy.min_weight,
+                "max": self.split_policy.max_weight,
+            },
+            "turn": {
+                "silence_threshold_s": (
+                    stt_policy.silence_threshold_s if stt_policy else None
+                ),
+                "interruption_min_speech_s": (
+                    runner.policy.interruption_min_speech_s if runner else None
+                ),
+                "min_confidence": getattr(stt, "min_confidence", None),
+            },
+            "llm": {
+                "reasoning_effort": getattr(backend, "reasoning_effort", None),
+                "emotion_markers": getattr(self._think, "emotion_markers", False),
+            },
+        }
+
+    def apply_config(self, body: dict[str, Any]) -> dict[str, Any]:
+        """從 HTTP 執行緒套用設定。
+
+        **必須在 loop 執行緒上改**——asyncio 側的物件（policy dataclass、
+        stage 屬性）從 HTTP 執行緒直接動，會與正在跑的 turn 產生資料競爭。
+        """
+        if not self.ready:
+            return {"error": "管線尚未就緒"}
+        fut = asyncio.run_coroutine_threadsafe(self._apply_config(body), self._loop)
+        return fut.result(timeout=10.0)
+
+    async def _apply_config(self, body: dict[str, Any]) -> dict[str, Any]:
+        applied: dict[str, Any] = {}
+
+        tts = body.get("tts")
+        if isinstance(tts, dict):
+            # 面板的 TTS 設定做成「覆寫 default_style」：走與情緒標記相同的
+            # per-sentence _apply_style 路徑（executor 執行緒、句子序列合成，
+            # 改 backend 狀態安全），而不是另闢一條直接戳 backend 的路。
+            emotion = {
+                dim: float(v)
+                for dim, v in (tts.get("emotion") or {}).items()
+                if dim in EMOTION_DIMENSIONS and float(v) > 0.0
+            }
+            style = SpeechStyle(
+                emotion=emotion,
+                intensity=float(tts.get("intensity", 0.6)),
+                speed=float(tts.get("speed", 1.0)),
+            )
+            if style.is_neutral and style.speed == 1.0:
+                style = None  # 全中性 = 撤銷覆寫，回到角色檔預設
+            if hasattr(self._think, "default_style"):
+                self._think.default_style = style
+                applied["tts"] = {
+                    "override": style is not None,
+                    "speed": style.speed if style else 1.0,
+                    "intensity": style.intensity if style else None,
+                    "emotion": dict(style.emotion) if style else None,
+                }
+
+        split = body.get("split")
+        if isinstance(split, dict):
+            mapping = {
+                "first_min": "first_min_weight",
+                "first_max": "first_max_weight",
+                "min": "min_weight",
+                "max": "max_weight",
+            }
+            changed = {}
+            for key, attr in mapping.items():
+                if key in split:
+                    value = float(split[key])
+                    setattr(self.split_policy, attr, value)
+                    changed[key] = value
+            if changed:
+                applied["split"] = changed
+
+        turn = body.get("turn")
+        if isinstance(turn, dict):
+            changed = {}
+            # 兩個 TurnPolicy 都要改：turn 切分看 STT stage 的、
+            # barge-in 判定器看 runner 的（stage 持有引用，直接 mutate 生效）
+            policies = [
+                p
+                for p in (
+                    getattr(self._stt, "policy", None),
+                    self._runner.policy if self._runner else None,
+                )
+                if p is not None
+            ]
+            for key in ("silence_threshold_s", "interruption_min_speech_s"):
+                if key in turn:
+                    value = float(turn[key])
+                    for policy in policies:
+                        setattr(policy, key, value)
+                    changed[key] = value
+            if "min_confidence" in turn and hasattr(self._stt, "min_confidence"):
+                self._stt.min_confidence = float(turn["min_confidence"])
+                changed["min_confidence"] = float(turn["min_confidence"])
+            if changed:
+                applied["turn"] = changed
+
+        llm = body.get("llm")
+        if isinstance(llm, dict):
+            changed = {}
+            if "emotion_markers" in llm and hasattr(self._think, "emotion_markers"):
+                self._think.emotion_markers = bool(llm["emotion_markers"])
+                changed["emotion_markers"] = bool(llm["emotion_markers"])
+            if "reasoning_effort" in llm:
+                backend = getattr(self._think, "_backend", None)
+                if backend is not None and hasattr(backend, "reasoning_effort"):
+                    backend.reasoning_effort = str(llm["reasoning_effort"])
+                    changed["reasoning_effort"] = str(llm["reasoning_effort"])
+            if changed:
+                applied["llm"] = changed
+
+        # 寫進 session log——事後分析時才知道「當時的參數是什麼」
+        self._log({"type": "config", **applied})
+        return {"ok": True, "applied": applied}
+
+    # --- 會話管理 ---
+    #
+    # 歷史列表活在 asyncio 側（think stage 持有、turn 執行中會寫入），
+    # 所以所有會話操作一律經 run_coroutine_threadsafe 到 loop 執行緒，
+    # 與 apply_config 同一條規矩。store 的檔案讀寫也統一在 loop 執行緒，
+    # SessionStore 不是 thread-safe 的，兩條執行緒同時碰 index 會互咬。
+
+    def _history(self) -> list[dict[str, str]] | None:
+        return getattr(self._think, "history", None)
+
+    def _sessions_call(self, coro) -> dict[str, Any]:  # noqa: ANN001
+        if not self.ready:
+            coro.close()
+            return {"error": "管線尚未就緒"}
+        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return fut.result(timeout=15.0)
+
+    def sessions_list(self) -> dict[str, Any]:
+        return self._sessions_call(self._sessions_list())
+
+    def session_new(self) -> dict[str, Any]:
+        return self._sessions_call(self._session_new())
+
+    def session_switch(self, session_id: str) -> dict[str, Any]:
+        return self._sessions_call(self._session_switch(session_id))
+
+    def session_delete(self, session_id: str) -> dict[str, Any]:
+        return self._sessions_call(self._session_delete(session_id))
+
+    async def _sessions_list(self) -> dict[str, Any]:
+        if self._store is None:
+            return {
+                "error": self._store_error or "session store 未就緒",
+                "sessions": [],
+                "active": self._session_id,
+            }
+        sessions = []
+        for entry in self._store.list_sessions():
+            sid = entry["session_id"]
+            title = ""
+            try:
+                # title 存在 session 檔的 metadata，index 沒有這個欄位。
+                # 檔案很小、session 數是十位數等級，逐檔讀可接受。
+                _, meta = self._store.load(sid)
+                title = meta.get("title", "")
+            except Exception:  # noqa: BLE001 - 壞檔不擋列表
+                pass
+            sessions.append(
+                {
+                    "id": sid,
+                    "title": title or sid,
+                    "message_count": entry.get("message_count", 0),
+                    "saved_at": entry.get("saved_at"),
+                }
+            )
+        sessions.sort(key=lambda s: s.get("saved_at") or 0, reverse=True)
+        history = self._history() or []
+        return {
+            "sessions": sessions,
+            "active": self._session_id,
+            "active_message_count": len(history),
+        }
+
+    async def _session_new(self) -> dict[str, Any]:
+        history = self._history()
+        if history is None:
+            return {"error": "此模式不支援會話歷史"}
+        if self._runner is not None and self._runner.is_speaking:
+            return {"error": "有進行中的 turn——先等它結束或插話"}
+        self._save_active_session()
+        history.clear()
+        self._session_id = uuid.uuid4().hex[:8]
+        self._session_created = time.time()
+        self._log({"type": "session", "action": "new", "session": self._session_id})
+        return {"ok": True, "active": self._session_id, "history": []}
+
+    async def _session_switch(self, session_id: str) -> dict[str, Any]:
+        history = self._history()
+        if history is None:
+            return {"error": "此模式不支援會話歷史"}
+        if self._store is None:
+            return {"error": self._store_error or "session store 未就緒"}
+        if self._runner is not None and self._runner.is_speaking:
+            return {"error": "有進行中的 turn——先等它結束或插話"}
+        if session_id == self._session_id:
+            return {"ok": True, "active": session_id, "history": list(history)}
+
+        self._save_active_session()
+        try:
+            messages, meta = self._store.load(session_id)
+        except FileNotFoundError:
+            return {"error": f"找不到會話 {session_id}"}
+
+        # 只還原對話角色——之後壓縮進來可能混入 summary 等角色，
+        # 那些是 ContextManager 的內部狀態，不該直接餵回歷史
+        history[:] = [
+            {"role": m["role"], "content": m.get("content", "")}
+            for m in messages
+            if m.get("role") in ("user", "assistant")
+        ]
+        self._session_id = session_id
+        self._session_created = meta.get("created_at", time.time())
+        self._log(
+            {
+                "type": "session",
+                "action": "switch",
+                "session": session_id,
+                "messages": len(history),
+            }
+        )
+        return {"ok": True, "active": session_id, "history": list(history)}
+
+    async def _session_delete(self, session_id: str) -> dict[str, Any]:
+        if self._store is None:
+            return {"error": self._store_error or "session store 未就緒"}
+        if session_id == self._session_id:
+            history = self._history()
+            if history is not None:
+                if self._runner is not None and self._runner.is_speaking:
+                    return {"error": "有進行中的 turn——先等它結束或插話"}
+                history.clear()
+            self._session_id = uuid.uuid4().hex[:8]
+            self._session_created = time.time()
+        deleted = bool(self._store.delete(session_id))
+        self._log({"type": "session", "action": "delete", "session": session_id})
+        return {"ok": deleted, "active": self._session_id}
+
+    def _save_active_session(self) -> None:
+        """把當前歷史寫進 store。**只在 loop 執行緒呼叫。**
+
+        存檔失敗不擋對話——會話持久化是旁路，管線才是主體。
+        """
+        history = self._history()
+        if not history or self._store is None:
+            return
+        title = next(
+            (m["content"] for m in history if m.get("role") == "user"), ""
+        )[:24]
+        try:
+            self._store.save(
+                self._session_id,
+                [dict(m) for m in history],
+                {
+                    "title": title,
+                    "created_at": self._session_created,
+                    "backend": "echo_stream_web",
+                },
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
     # --- 記錄 ---
 
     def _log(self, record: dict[str, Any]) -> None:
@@ -346,11 +652,47 @@ class StreamService:
         session["source"].push(pcm)
         return True
 
-    def voice_stop(self, sid: str) -> bool:
-        """結束擷取。source 收尾後 STT 會 flush 殘餘語音再結束。"""
+    def _discard_input_on_loop(self) -> None:
+        """丟棄進行中的輸入與 turn。**只在 loop 執行緒呼叫。**"""
+        stage = self._stt
+        if stage is not None and hasattr(stage, "discard_current"):
+            stage.discard_current()
+        runner = self._runner
+        if runner is not None and runner.is_speaking:
+            # turn 已經在跑（LLM / TTS）：中止它，並讓 voice loop
+            # 把這一輪從歷史裡拿掉——捨棄不是插話，內容不該留下
+            self._discard_turn = True
+            runner.interrupt(CancelReason.BARGE_IN)
+
+    def voice_discard(self, sid: str) -> bool:
+        """丟棄這次輸入：別人講話、誤觸發——這一輪不算在對話裡。"""
         session = self._voice
         if session is None or session["sid"] != sid:
             return False
+        done = threading.Event()
+        self._loop.call_soon_threadsafe(
+            lambda: (self._discard_input_on_loop(), done.set())
+        )
+        done.wait(timeout=2.0)
+        with contextlib.suppress(queue.Full):
+            session["out"].put_nowait(
+                json_frame(FRAME_EVENT, {"event": "input_discarded"})
+            )
+        self._log({"type": "discard"})
+        return True
+
+    def voice_stop(self, sid: str) -> bool:
+        """結束擷取。**停止 = 乾淨收場**：丟棄未完成的輸入、中止進行中的
+        turn——不能有殘留的 STT flush 在停止之後又觸發一輪 LLM+TTS
+        （2026-08-21 艾斯維爾實測回饋）。"""
+        session = self._voice
+        if session is None or session["sid"] != sid:
+            return False
+        done = threading.Event()
+        self._loop.call_soon_threadsafe(
+            lambda: (self._discard_input_on_loop(), done.set())
+        )
+        done.wait(timeout=2.0)
         session["source"].close()
         return True
 
@@ -402,20 +744,44 @@ class StreamService:
                         self._log({"type": "barge_in"})
 
         stage.on_voice_event = on_event
+
+        # 增量轉錄：講話停頓處就把已轉出的段推給前端逐句條列，
+        # 不必等整個 turn 講完才看到自己說了什麼
+        partial_texts: list[str] = []
+
+        def on_partial(text: str, index: int) -> None:
+            partial_texts.append(text)
+            emit(json_frame(FRAME_UTTER, {"partial": True, "index": index, "text": text}))
+
+        stage.on_partial = on_partial
         try:
             async for utterance in stage.stream(session["source"], token):
                 stt_ms = (time.perf_counter() - utterance.ended_at) * 1000
                 utter_info = {
                     "text": utterance.text,
+                    "parts": list(partial_texts) or [utterance.text],
                     "stt_ms": round(stt_ms),
                     "confidence": round(utterance.confidence, 2),
                     "language": utterance.language,
                 }
+                partial_texts.clear()
                 emit(json_frame(FRAME_UTTER, utter_info))
                 self._log({"type": "utterance", **utter_info})
                 # 傳真的 Utterance 而不是重建——ended_at 是真實的說完時刻，
                 # tracer 的 TTFA 才會把 STT 的耗時算進去
+                history = self._history()
+                pre_len = len(history) if history is not None else 0
+                self._discard_turn = False
                 await self._run(utterance, emit)
+
+                if self._discard_turn:
+                    # 捨棄打在這一輪上：把 commit 進歷史的內容拿掉——
+                    # 「這次輸入不算在其中」，不是插話那種「講到一半算數」
+                    self._discard_turn = False
+                    if history is not None and len(history) > pre_len:
+                        del history[pre_len:]
+                    self._save_active_session()
+                    self._log({"type": "turn_discarded"})
 
                 # turn 結束補一個 padding frame：tunnel 代理（cloudflared）會
                 # 緩衝小尾巴，最後一段音訊可能卡在代理層直到下一輪資料把它
@@ -425,6 +791,7 @@ class StreamService:
             emit(json_frame(FRAME_ERROR, {"error": f"{type(exc).__name__}: {exc}"}))
         finally:
             stage.on_voice_event = None
+            stage.on_partial = None
             with contextlib.suppress(queue.Full):
                 out.put_nowait(None)
             if self._voice is session:
@@ -499,6 +866,8 @@ class StreamService:
         }
         emit(json_frame(FRAME_META, meta))
         self._log({"type": "turn", "input": utterance.text, **meta})
+        # 每輪落地一次——server 掛掉最多丟正在跑的那一輪，不會丟整個會話
+        self._save_active_session()
 
 
 class _EmitThink:
@@ -603,6 +972,10 @@ class _Handler(BaseHTTPRequestHandler):
                     "real_stt": self.service.use_real_stt,
                 },
             )
+        elif self.path == "/api/config":
+            self._json(200, self.service.get_config())
+        elif self.path == "/api/sessions":
+            self._json(200, self.service.sessions_list())
         elif self.path.startswith("/api/voice/stream"):
             sid = self._query_param("sid")
             self.send_response(200)
@@ -628,6 +1001,42 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/api/interrupt":
             self._json(200, {"interrupted": self.service.interrupt()})
             return
+        if self.path == "/api/config":
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except json.JSONDecodeError:
+                self._json(400, {"error": "invalid json"})
+                return
+            try:
+                self._json(200, self.service.apply_config(body))
+            except Exception as exc:  # noqa: BLE001 - 面板設錯值不該讓 server 掛掉
+                self._json(400, {"error": f"{type(exc).__name__}: {exc}"})
+            return
+        if self.path.startswith("/api/sessions/"):
+            action = self.path.removeprefix("/api/sessions/").split("?")[0]
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except json.JSONDecodeError:
+                self._json(400, {"error": "invalid json"})
+                return
+            sid = str(body.get("id") or "")
+            try:
+                if action == "new":
+                    result = self.service.session_new()
+                elif action == "switch":
+                    result = self.service.session_switch(sid)
+                elif action == "delete":
+                    result = self.service.session_delete(sid)
+                else:
+                    self._json(404, {"error": "not found"})
+                    return
+            except Exception as exc:  # noqa: BLE001
+                self._json(500, {"error": f"{type(exc).__name__}: {exc}"})
+                return
+            self._json(200 if "error" not in result else 409, result)
+            return
         if self.path == "/api/voice/start":
             self._json(200, self.service.voice_start())
             return
@@ -636,6 +1045,11 @@ class _Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             pcm = self.rfile.read(length) if length else b""
             ok = bool(pcm) and self.service.voice_push(sid, pcm)
+            self._json(200 if ok else 404, {"ok": ok})
+            return
+        if self.path.startswith("/api/voice/discard"):
+            sid = self._query_param("sid")
+            ok = self.service.voice_discard(sid)
             self._json(200 if ok else 404, {"ok": ok})
             return
         if self.path.startswith("/api/voice/stop"):
@@ -755,6 +1169,17 @@ def serve(
     host = host or config.get("ECHO_STREAM_WEB_HOST", "127.0.0.1")
     port = port or int(config.get("ECHO_STREAM_WEB_PORT", "8770"))
 
+    # store 在這裡建而不是 StreamService.prepare——單元測試直接建 service
+    # 時不該在 repo 根目錄長出 data/sessions/。建不起來只停用會話功能。
+    store = None
+    store_error: str | None = None
+    try:
+        from ..adapters.session_store import build_store
+
+        store = build_store()
+    except Exception as exc:  # noqa: BLE001
+        store_error = f"{type(exc).__name__}: {exc}"
+
     service = StreamService(
         use_real_tts=real_tts,
         use_real_llm=real_llm,
@@ -762,7 +1187,10 @@ def serve(
         split_policy=split_policy,
         system_prompt=system_prompt,
         trace_path=trace_path,
+        store=store,
     )
+    if store_error:
+        service._store_error = store_error
 
     print("═" * 56)
     print("  Echo Stream — Web 前端")
@@ -771,6 +1199,8 @@ def serve(
     print(f"  LLM: {'真 OpenAI' if real_llm else 'fake'}")
     print(f"  STT: {'真 Whisper' if real_stt else 'fake（只驗串流接收）'}")
     print(f"  Log: {service.log_path}")
+    if store_error:
+        print(f"  ⚠ 會話持久化停用：{store_error}")
     if system_prompt:
         print(f"  System prompt: {len(system_prompt)} 字")
     print("\n  載入管線中…", flush=True)

@@ -160,11 +160,12 @@ async def test_句子帶_style_會套到_backend():
             index=0,
             is_first=True,
             is_last=True,
-            style=SpeechStyle(emotion={"happy": 0.9}),
+            style=SpeechStyle(emotion={"happy": 0.9}, intensity=1.0),
         )
 
     _ = [c async for c in stage.stream(stream(), CancellationToken())]
-    assert backend.emotion_vector[0] == 0.9
+    # intensity（emo_alpha）的翻譯是向量 × 強度，這裡設 1.0 驗原值
+    assert backend.emotion_vector[0] == pytest.approx(0.9)
 
 
 async def test_沒有_style_時不動_backend():

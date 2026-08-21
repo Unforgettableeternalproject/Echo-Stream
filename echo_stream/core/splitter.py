@@ -56,6 +56,26 @@ SECONDARY_PUNCT = frozenset("，、,:：")
 CLOSING_PUNCT = frozenset("」』）\")'】》>")
 """結尾引號括號。句末標點後面若接這些，要一起帶走再切。"""
 
+BRACKET_PAIRS = {"《": "》", "〈": "〉", "「": "」", "『": "』", "【": "】",
+                 "（": "）", "(": ")", "[": "]"}
+"""成對括號。**括號內禁用次級切點**——書名《光與影：33號遠征隊》裡的
+冒號是標題的一部分，切下去就是「《光與影：」這種殘句（2026-08-21 實測）。"""
+
+_OPENING_BRACKETS = frozenset(BRACKET_PAIRS)
+_CLOSING_BRACKETS = frozenset(BRACKET_PAIRS.values())
+
+
+def bracket_depth(text: str) -> int:
+    """未閉合的括號層數。LLM 忘記閉合時深度會卡住，所以只用來
+    抑制**次級**切點——句末標點與強制切分不受它管，保證有出口。"""
+    depth = 0
+    for ch in text:
+        if ch in _OPENING_BRACKETS:
+            depth += 1
+        elif ch in _CLOSING_BRACKETS and depth > 0:
+            depth -= 1
+    return depth
+
 _NO_SPLIT_AFTER = frozenset("0123456789")
 """句末標點後面接數字 → 是小數點，不切。"""
 
@@ -151,6 +171,11 @@ class SplitPolicy:
     allow_secondary_split: bool = True
     """是否允許在逗號等次級標點切分。關掉可用來比較「只在句末切」的音質差異。"""
 
+    hard_cut_grace: float = 8.0
+    """超過上限後的寬限量：到達 max_weight **先不硬切**，再多等這麼多權重，
+    期間出現任何標點就在標點切。硬切點落在詞中間（「…遊戲吸/引…」）的
+    銜接假影遠比句子多幾個字難聽（2026-08-21 實測）。寬限也用完才真的硬切。"""
+
     metadata: dict = field(default_factory=dict)
 
 
@@ -182,6 +207,8 @@ class SentenceSplitter:
         """
         buffer = ""
         index = 0
+        depth = 0
+        """buffer 內未閉合的括號層數。逐字維護，切完重算。"""
         # 半形句末標點的 lookahead 狀態：記住「上次看到 ASCII 標點的位置」，
         # 等下一個字元進來才能判斷那是句末還是小數點
         pending_ascii_at = -1
@@ -194,6 +221,10 @@ class SentenceSplitter:
 
             for ch in tok:
                 buffer += ch
+                if ch in _OPENING_BRACKETS:
+                    depth += 1
+                elif ch in _CLOSING_BRACKETS and depth > 0:
+                    depth -= 1
 
                 # 1. 先處理待決的半形標點（已經看到下一個字元了）
                 if pending_ascii_at >= 0:
@@ -218,6 +249,7 @@ class SentenceSplitter:
                         )
                         if text_weight(head) >= floor:
                             buffer = buffer[cut:]
+                            depth = bracket_depth(buffer)
                             if head.strip():
                                 yield self._make(head, turn_id, index, "terminal")
                                 index += 1
@@ -237,6 +269,7 @@ class SentenceSplitter:
                 if ch in TERMINAL_PUNCT_FULLWIDTH:
                     if weight >= min_w:
                         head, buffer = buffer, ""
+                        depth = 0
                         if head.strip():
                             yield self._make(head, turn_id, index, "terminal")
                             index += 1
@@ -247,21 +280,27 @@ class SentenceSplitter:
                     pending_ascii_at = len(buffer) - 1
                     continue
 
-                # 4. 次級標點 + 長度達標
+                # 4. 次級標點 + 長度達標。**括號內不切**——書名、引文裡的
+                #    冒號逗號是內容的一部分，切出去就是殘句
                 if (
                     self.policy.allow_secondary_split
                     and ch in SECONDARY_PUNCT
                     and weight >= min_w
+                    and depth == 0
                 ):
                     head, buffer = buffer, ""
+                    depth = 0
                     if head.strip():
                         yield self._make(head, turn_id, index, "secondary")
                         index += 1
                     continue
 
-                # 5. 長度上限強制切
-                if weight >= max_w:
+                # 5. 長度上限。到達 max 不立刻硬切——硬切點多半落在詞中間，
+                #    先給一段寬限等自然切點（上面的規則 2/4 會在標點處收掉），
+                #    寬限也用完才回溯硬切。
+                if weight >= max_w + self.policy.hard_cut_grace:
                     head, buffer = self._force_cut(buffer)
+                    depth = bracket_depth(buffer)
                     if head.strip():
                         yield self._make(head, turn_id, index, "max_length")
                         index += 1

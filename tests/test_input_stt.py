@@ -273,3 +273,145 @@ class TestConfidenceGate:
         )
         results = await collect(stage, ScriptedSource(tone(0.8) + silence(1.0)))
         assert results == []
+
+
+# --- 增量轉錄（STT 端的逐句串流，2026-08-21） ---
+
+
+async def test_停頓處切出增量段並在_turn_結束拼裝():
+    backend = FakeBackend()
+    partials: list[tuple[int, str]] = []
+    stage = make_stage(
+        backend,
+        on_partial=lambda t, i: partials.append((i, t)),
+        partial_silence_s=0.35,
+        partial_min_speech_s=2.0,
+    )
+    # 2.5s 語音 → 0.5s 停頓（觸發增量）→ 2.5s 語音 → 1.0s 靜音（turn 結束）
+    script = tone(2.5) + silence(0.5) + tone(2.5) + silence(1.0)
+    utterances = [
+        u async for u in stage.stream(ScriptedSource(script), CancellationToken())
+    ]
+
+    assert len(utterances) == 1
+    assert utterances[0].text == "你好1 你好2"
+    assert [t for _, t in partials] == ["你好1", "你好2"]
+    assert [i for i, _ in partials] == [0, 1]
+    # 已切出去的段不重轉——長獨白的最終轉錄成本被攤平
+    assert len(backend.received) == 2
+
+
+async def test_不設_on_partial_時行為不變():
+    backend = FakeBackend()
+    stage = make_stage(backend, partial_silence_s=0.35, partial_min_speech_s=2.0)
+    script = tone(2.5) + silence(0.5) + tone(2.5) + silence(1.0)
+    utterances = [
+        u async for u in stage.stream(ScriptedSource(script), CancellationToken())
+    ]
+    assert len(utterances) == 1
+    assert len(backend.received) == 1  # 整個 turn 一次轉
+
+
+async def test_短句不觸發增量切分():
+    backend = FakeBackend()
+    partials: list[str] = []
+    stage = make_stage(
+        backend,
+        on_partial=lambda t, i: partials.append(t),
+        partial_silence_s=0.35,
+        partial_min_speech_s=2.0,
+    )
+    script = tone(1.0) + silence(1.0)
+    utterances = [
+        u async for u in stage.stream(ScriptedSource(script), CancellationToken())
+    ]
+    assert len(utterances) == 1
+    # 殘餘段也走 on_partial（讓前端的條列完整），但只該有一段
+    assert partials == ["你好1"]
+    assert len(backend.received) == 1
+
+
+async def test_低信心的增量段被剔除不污染整段():
+    class NoisyBackend(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.confidences = [0.9, 0.1, 0.9]  # 中段是雜訊
+
+        def transcribe(self, pcm, sample_rate):
+            result = super().transcribe(pcm, sample_rate)
+            conf = self.confidences[min(len(self.received) - 1, 2)]
+            return TranscriptionResult(text=result.text, language="zh", confidence=conf)
+
+    backend = NoisyBackend()
+    stage = make_stage(
+        backend,
+        on_partial=lambda t, i: None,
+        partial_silence_s=0.35,
+        partial_min_speech_s=2.0,
+    )
+    script = (
+        tone(2.5) + silence(0.5) + tone(2.5) + silence(0.5) + tone(2.5) + silence(1.0)
+    )
+    utterances = [
+        u async for u in stage.stream(ScriptedSource(script), CancellationToken())
+    ]
+    assert len(utterances) == 1
+    assert utterances[0].text == "你好1 你好3"
+
+
+# --- 捨棄輸入（discard_current，2026-08-21） ---
+
+
+class DiscardingSource(ScriptedSource):
+    """推完指定位元組後呼叫 discard 的來源——模擬「講到一半按捨棄」。"""
+
+    def __init__(self, pcm: bytes, discard_after: int, chunk_ms: int = 50) -> None:
+        super().__init__(pcm, chunk_ms)
+        self.discard_after = discard_after
+        self.stage: SttInputStage | None = None
+        self._fired = False
+
+    async def stream(self, token):
+        sent = 0
+        step = int(SR * self.chunk_ms / 1000) * 2
+        for i in range(0, len(self.pcm), step):
+            if token.is_cancelled:
+                return
+            yield self.pcm[i : i + step]
+            sent += step
+            if not self._fired and sent >= self.discard_after:
+                self._fired = True
+                assert self.stage is not None
+                self.stage.discard_current()
+            await asyncio.sleep(0)
+
+
+async def test_discard_丟棄累積中的輸入():
+    """捨棄後，捨棄前的語音不能變成 turn 或黏進下一個 turn。"""
+    backend = FakeBackend()
+    stage = make_stage(backend)
+    # 1.2s 語音（被捨棄）→ 0.6s 語音 + 1.0s 靜音（正常 turn）
+    pcm = tone(1.2) + tone(0.6) + silence(1.0)
+    source = DiscardingSource(pcm, discard_after=len(tone(1.2)))
+    source.stage = stage
+
+    utterances = [u async for u in stage.stream(source, CancellationToken())]
+
+    assert len(utterances) == 1
+    assert utterances[0].text == "你好1"
+    assert len(backend.received) == 1
+    # 收到的音訊裡不含被捨棄那 1.2s（0.6s + preroll 遠小於 1.2s）
+    assert len(backend.received[0]) < len(tone(1.0))
+
+
+async def test_discard_後殘餘不會在_source_結束時_flush():
+    backend = FakeBackend()
+    stage = make_stage(backend)
+    pcm = tone(1.5)  # 講到一半直接停（沒有靜音收尾）
+    source = DiscardingSource(pcm, discard_after=len(pcm) - 3200)
+    source.stage = stage
+
+    utterances = [u async for u in stage.stream(source, CancellationToken())]
+
+    assert utterances == []
+    assert backend.received == []

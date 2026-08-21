@@ -140,6 +140,12 @@ class FakeThinkStage:
         """commit 記錄 ``(turn_id, spoken_text, generated_text)``，供測試檢查
         barge-in 善後是否寫對了東西。"""
 
+        self.history: list[dict[str, str]] = []
+        """對話歷史，語意與 :class:`LLMThinkStage` 一致——fake 也要維護它，
+        Web 前端的會話切換才能在無 GPU 環境下驗證。"""
+
+        self._pending_user_text = ""
+
     async def prepare(self) -> None:
         return
 
@@ -151,6 +157,7 @@ class FakeThinkStage:
     ) -> AsyncIterator[Sentence]:
         response = self.responses[self._turn_count % len(self.responses)]
         self._turn_count += 1
+        self._pending_user_text = utterance.text
 
         # Memory retrieve 與 LLM 平行起跑（§7.4）
         memory_task = asyncio.ensure_future(self._retrieve(utterance.turn_id))
@@ -196,6 +203,12 @@ class FakeThinkStage:
         寫錯會讓 LLM 以為自己講完了整段。
         """
         self.committed.append((turn_id, spoken_text, generated_text))
+        # 與 LLMThinkStage 相同的歷史語意：兩邊要嘛都進、要嘛都不進
+        if self._pending_user_text:
+            self.history.append({"role": "user", "content": self._pending_user_text})
+        if spoken_text:
+            self.history.append({"role": "assistant", "content": spoken_text})
+        self._pending_user_text = ""
 
 
 class FakeSpeakStage:

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 from collections.abc import AsyncIterator, Sequence
 from typing import Any, Protocol, runtime_checkable
 
@@ -36,6 +37,7 @@ from .. import config
 from ..contracts.cancellation import CancellationToken, CancelledError
 from ..contracts.style import SpeechStyle
 from ..contracts.types import Sentence, Utterance
+from ..core.emotion import MARKER_PROMPT, extract_style
 from ..core.splitter import SentenceSplitter, SplitPolicy
 from ..core.tracer import (
     MARK_MEMORY_DONE,
@@ -135,6 +137,12 @@ class EchoBackend:
             yield ch
 
 
+_LIST_MARKER_RE = re.compile(r"^[\s\-–—•·・*]+\s*")
+"""句首的 markdown 列表符號。LLM 慣性輸出「- 《文明 VII》：…」這種列表，
+符號會被 TTS 唸出來、也讓字幕難看。只剝句首——句中的連字號可能是
+"well-known" 這種合法用法。"""
+
+
 class LLMThinkStage:
     """ThinkStage 實作：對話歷史 + LLM 串流 + 切句。"""
 
@@ -149,6 +157,7 @@ class LLMThinkStage:
         tracer: LatencyTracer | None = None,
         history_limit: int = 20,
         default_style: SpeechStyle | None = None,
+        emotion_markers: bool = False,
         memory: Any = None,
     ) -> None:
         self._backend = backend
@@ -160,6 +169,10 @@ class LLMThinkStage:
         的四層漸進式壓縮後就不需要粗暴截斷。"""
 
         self.default_style = default_style
+        self.emotion_markers = emotion_markers
+        """讓 LLM 夾帶 ``[開心]`` 這類標記、逐句轉成 SpeechStyle。
+        開啟時 system prompt 會自動補上標記指示（接在人設之後）。"""
+
         self.memory = memory
         """Phase 4 的 EchoMemory。平行 retrieve 的邏輯已經寫好，接上就生效。"""
 
@@ -203,6 +216,15 @@ class LLMThinkStage:
                 utterance.turn_id,
                 token,
             ):
+                if sentence.text:
+                    sentence.text = _LIST_MARKER_RE.sub("", sentence.text)
+                if self.emotion_markers and sentence.text:
+                    # 先解析再交給下游——sanitize_for_tts 只會剝括號符號、
+                    # 保留內容，順序反了標記就會被唸出來
+                    cleaned, style = extract_style(sentence.text, self.default_style)
+                    sentence.text = cleaned
+                    if style is not None:
+                        sentence.style = style
                 if self.default_style is not None and sentence.style is None:
                     sentence.style = self.default_style
                 yield sentence
@@ -218,7 +240,7 @@ class LLMThinkStage:
     ) -> AsyncIterator[str]:
         first = True
         stream = self.backend.stream_query(
-            messages, system_instruction=self.system_prompt or None
+            messages, system_instruction=self._system_instruction()
         )
         async for piece in stream:
             token.raise_if_cancelled()
@@ -227,6 +249,18 @@ class LLMThinkStage:
                     self.tracer.mark(turn_id, MARK_THINK_FIRST_TOKEN)
                 first = False
             yield piece
+
+    def _system_instruction(self) -> str | None:
+        """組出這一輪的 system prompt。
+
+        情緒標記指示**接在人設之後**——人設是基底，功能指示是補充，
+        順序反了會讓角色語氣被格式說明稀釋。
+        """
+        parts = [self.system_prompt or ""]
+        if self.emotion_markers:
+            parts.append(MARKER_PROMPT)
+        combined = "\n\n".join(p for p in parts if p)
+        return combined or None
 
     async def _retrieve(self, utterance: Utterance) -> None:
         """Phase 4 的掛載點。與 LLM 平行跑，**不擋首句**。
