@@ -324,3 +324,86 @@ async def test_列表符號從句首剝除():
     stage = LLMThinkStage(backend)
     sentences = await collect(stage)
     assert all(not s.text.lstrip().startswith("-") for s in sentences)
+
+
+# --- 記憶注入（Phase 4a）---
+
+
+class FakeMemory:
+    """回固定文字的假記憶。記錄查詢，可設定失敗。"""
+
+    def __init__(self, result: str | None = "他養的貓叫毛球", fail: bool = False):
+        self.result = result
+        self.fail = fail
+        self.queries: list[str] = []
+
+    async def retrieve(self, text: str) -> str | None:
+        if self.fail:
+            raise RuntimeError("記憶引擎壞了")
+        self.queries.append(text)
+        return self.result
+
+
+def _last_user_content(backend: FakeBackend) -> str:
+    for msg in reversed(backend.last_messages):
+        role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", "")
+        if role == "user":
+            return msg.get("content") if isinstance(msg, dict) else msg.content
+    return ""
+
+
+async def test_記憶下一輪才注入():
+    # delay 給事件迴圈讓 retrieve task 跑完——真 backend 的網路 await 天然如此
+    backend = FakeBackend(delay_s=0.001)
+    stage = LLMThinkStage(backend, memory=FakeMemory())
+
+    await collect(stage, "我家的貓很可愛")
+    # 本輪：retrieve 與生成平行，結果不進這一輪的 prompt
+    assert "毛球" not in _last_user_content(backend)
+    await stage.commit("t1", "好可愛。", "好可愛。")
+
+    await collect(stage, "牠叫什麼名字？")
+    content = _last_user_content(backend)
+    assert content.startswith("牠叫什麼名字？")
+    assert "毛球" in content
+
+
+async def test_記憶不寫進歷史():
+    backend = FakeBackend(delay_s=0.001)
+    stage = LLMThinkStage(backend, memory=FakeMemory())
+    await collect(stage, "第一輪")
+    await stage.commit("t1", "回一", "回一")
+    await collect(stage, "第二輪")
+    await stage.commit("t2", "回二", "回二")
+
+    assert all("毛球" not in m["content"] for m in stage.history)
+
+
+async def test_記憶注入後清空_不重複注入():
+    backend = FakeBackend(delay_s=0.001)
+    memory = FakeMemory()
+    stage = LLMThinkStage(backend, memory=memory)
+    await collect(stage, "第一輪")
+    await stage.commit("t1", "回一", "回一")
+
+    memory.result = None  # 第二輪 retrieve 撈不到東西
+    await collect(stage, "第二輪")
+    await stage.commit("t2", "回二", "回二")
+    assert "毛球" in _last_user_content(backend)  # 第一輪的結果在這裡用掉
+
+    await collect(stage, "第三輪")
+    assert "毛球" not in _last_user_content(backend)  # 不能再出現
+
+
+async def test_retrieve_失敗不炸管線():
+    backend = FakeBackend()
+    stage = LLMThinkStage(backend, memory=FakeMemory(fail=True))
+    sentences = await collect(stage, "你好")
+    assert sentences  # 生成照常
+
+
+async def test_沒接記憶時行為不變():
+    backend = FakeBackend()
+    stage = LLMThinkStage(backend)
+    await collect(stage, "你好")
+    assert _last_user_content(backend) == "你好"

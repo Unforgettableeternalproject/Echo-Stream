@@ -178,6 +178,11 @@ class LLMThinkStage:
 
         self.history: list[dict[str, str]] = []
         self._pending_user_text = ""
+        self._pending_memory: str | None = None
+        """上一輪 retrieve 的結果，這一輪注入。§7.4：late-context 注入
+        結構上不可能（KV cache 無法換前綴），所以是「下一輪生效」。"""
+        self.last_injected_memory: str | None = None
+        """這一輪實際注入了什麼——Web 除錯顯示用，不參與邏輯。"""
 
     @property
     def backend(self) -> StreamingBackend:
@@ -263,16 +268,19 @@ class LLMThinkStage:
         return combined or None
 
     async def _retrieve(self, utterance: Utterance) -> None:
-        """Phase 4 的掛載點。與 LLM 平行跑，**不擋首句**。
+        """與 LLM 平行跑，**不擋首句**。結果存起來，**下一輪**注入。
 
         retrieve 回來的內容不會注入到已經在生成的回應裡——那在技術上不可能
         （KV cache 一旦建立就無法替換前綴，所有 provider 皆然）。
-        正解是首句用不含記憶斷言的 filler，retrieve 完成後開新請求續寫。
+        正解是首句用不含記憶斷言的 filler，retrieve 完成後開新請求續寫；
+        起步版先驗證「下一輪生效」的體感夠不夠（§4 可選工項）。
         """
         if self.tracer is not None:
             self.tracer.mark(utterance.turn_id, MARK_MEMORY_START)
         try:
-            await self.memory.retrieve(utterance.text)
+            result = await self.memory.retrieve(utterance.text)
+            if result:
+                self._pending_memory = result
         except (CancelledError, Exception):  # noqa: B014 - 旁路，失敗不該炸管線
             return
         finally:
@@ -280,8 +288,29 @@ class LLMThinkStage:
                 self.tracer.mark(utterance.turn_id, MARK_MEMORY_DONE)
 
     def _build_messages(self, user_text: str) -> list[dict[str, str]]:
+        """組出這一輪的 messages。記憶附掛在**最後一則 user message 內**。
+
+        ⚠️ 不放 system prompt——system + history 是 prompt cache 的穩定前綴
+        （「越講越快」的來源），記憶每輪變、放前綴會讓 cache 全滅。
+
+        history 存的是**不含記憶的原文**：注入文字不進歷史，
+        代價是下一輪 prefill 會在「上一則 user message」處 cache 分歧、
+        重算最後一組對答（便宜）；換來的是 context 不被逐輪的記憶
+        blob 塞胖、過期記憶也不會殘留在歷史裡繼續影響後續輪次。
+        """
         messages = list(self.history[-self.history_limit :])
-        messages.append({"role": "user", "content": user_text})
+        content = user_text
+        if self._pending_memory:
+            content = (
+                f"{user_text}\n\n"
+                f"（系統檢索到的相關記憶，供參考，與問題無關時忽略：\n"
+                f"{self._pending_memory}）"
+            )
+            self.last_injected_memory = self._pending_memory
+            self._pending_memory = None
+        else:
+            self.last_injected_memory = None
+        messages.append({"role": "user", "content": content})
         return messages
 
     # --- 善後 ---
