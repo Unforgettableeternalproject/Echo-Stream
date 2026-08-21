@@ -65,7 +65,24 @@ def build_engine(
         Path(repo).expanduser().resolve() if repo else config.subsystem_path("MEMORY")
     )
 
+    # echo_memory 自帶的 APScheduler 是 lazy + 無差別的（見 core/dream_scheduler.py），
+    # 觸發時機改由 Echo Stream 的 DreamScheduler 決定。其 Config 在 import 時讀 env，
+    # 所以要在 import 前設；已 import 過則直接改 config 物件。setdefault 保留人工覆寫。
+    import os
+
+    os.environ.setdefault("DREAM_ENABLE_IDLE", "false")
+    os.environ.setdefault("DREAM_ENABLE_CRON", "false")
+
     from echo_memory import MemoryEngine
+
+    try:
+        from echo_memory.config import get_config
+
+        cfg = get_config()
+        cfg.dream_enable_idle = os.environ["DREAM_ENABLE_IDLE"].lower() == "true"
+        cfg.dream_enable_cron = os.environ["DREAM_ENABLE_CRON"].lower() == "true"
+    except Exception:  # noqa: BLE001 - 舊版沒有 get_config 就算了
+        pass
 
     params = inspect.signature(MemoryEngine.__init__).parameters
     if "namespace_id" not in params:
@@ -205,6 +222,37 @@ class EchoMemoryAdapter:
         return await asyncio.get_running_loop().run_in_executor(
             None, lambda: self.engine.dream(triggered_by)
         )
+
+    DISTILL_MIN_SALIENCE = 0.5
+    """與 echo_memory KnowledgeDistillation.MIN_SALIENCE_THRESHOLD 對齊——
+    低於這個值的 episode 蒸餾根本不會看，算進 pending 只會讓排程空跑。"""
+
+    async def pending_dream_count(self) -> int:
+        """有多少 episode 等著被蒸餾（未 dreamed 且顯著性過門檻）。
+
+        DreamScheduler 用這個數字決定「跑了會不會有產出」。
+        list_episodes 單頁上限 200，所以分頁掃。
+        """
+
+        def _work() -> int:
+            episodic = self.engine.episodic
+            total = episodic.count()
+            pending = 0
+            offset = 0
+            while offset < total:
+                page = episodic.list_episodes(limit=200, offset=offset)
+                if not page:
+                    break
+                pending += sum(
+                    1
+                    for ep in page
+                    if not ep.is_dreamed
+                    and ep.salience_score >= self.DISTILL_MIN_SALIENCE
+                )
+                offset += len(page)
+            return pending
+
+        return await asyncio.get_running_loop().run_in_executor(None, _work)
 
     def set_llm_fn(self, llm_fn: Callable[[str], str] | None) -> None:
         """事後補上蒸餾用的 LLM——backend 建立時機晚於 adapter 時用。"""

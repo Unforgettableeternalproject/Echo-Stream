@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import struct
 import threading
@@ -542,6 +543,9 @@ class StubMemory:
     async def dream(self, triggered_by="manual"):
         return {"triggered_by": triggered_by, "pruned": 1}
 
+    async def pending_dream_count(self):
+        return 7
+
 
 def _wait_for(cond, timeout=5.0):
     deadline = time.time() + timeout
@@ -648,3 +652,30 @@ def test_dream_背景執行並回報(server):
     assert status["running"] is False
     assert status["last_report"]["pruned"] == 1
     assert status["last_report"]["triggered_by"] == "manual"
+
+
+def test_dream_排程器與手動共用執行路徑(server):
+    base, service = server
+    memory = StubMemory()
+    service._memory = memory
+    # 模擬 _build_memory 成功後的接線
+    asyncio.run_coroutine_threadsafe(
+        _call_start(service, memory), service._loop
+    ).result(timeout=5)
+    sched = service._dream_scheduler
+    assert sched is not None
+
+    # 堆到 daydream 門檻以上，tick 一次就該觸發、且 triggered_by 正確落到報告
+    sched.policy.daydream_pending = 5
+    asyncio.run_coroutine_threadsafe(sched.tick(), service._loop).result(timeout=5)
+    assert _wait_for(lambda: service.dream_report is not None)
+    assert service.dream_report["triggered_by"] == "daydream"
+
+    status = _get_json(f"{base}/api/memory/dream")
+    assert status["scheduler"]["last_trigger"] == "daydream"
+    assert status["scheduler"]["pending"] == 7
+    sched.stop()
+
+
+async def _call_start(service, memory):
+    service._start_dream_scheduler(memory)

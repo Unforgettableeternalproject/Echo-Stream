@@ -52,6 +52,7 @@ from .. import config
 from ..contracts.cancellation import CancellationToken, CancelReason
 from ..contracts.style import EMOTION_DIMENSIONS, SpeechStyle
 from ..contracts.types import STT_SAMPLE_RATE, AudioChunk, Utterance
+from ..core.dream_scheduler import DreamPolicy, DreamScheduler
 from ..core.emotion import EMOTION_PRESETS
 from ..core.pipeline import PipelineRunner
 from ..core.splitter import SplitPolicy
@@ -189,6 +190,8 @@ class StreamService:
         adapter 與 engine 留著（重載要數十秒），開回來立即生效。"""
         self._dream_running = False
         self.dream_report: dict[str, Any] | None = None
+        self._dream_scheduler: DreamScheduler | None = None
+        """自動 dream 的觸發策略（累積 + 閒置 / daydream）。記憶建好才啟動。"""
         self.memory_error: str | None = None
         self.memory_warm_seconds: float | None = None
         self.split_policy = split_policy or SplitPolicy()
@@ -344,10 +347,30 @@ class StreamService:
                 )
             self._think.memory = memory
             self._memory = memory
+            self._start_dream_scheduler(memory)
         except Exception as exc:  # noqa: BLE001
             self.memory_error = f"{type(exc).__name__}: {exc}"
 
+    def _start_dream_scheduler(self, memory: Any) -> None:
+        """門檻走 .env：ECHO_STREAM_DREAM_{IDLE_MINUTES,MIN_PENDING,DAYDREAM_PENDING}。"""
+        policy = DreamPolicy(
+            idle_minutes=float(config.get("ECHO_STREAM_DREAM_IDLE_MINUTES",
+                                          str(DreamPolicy.idle_minutes))),
+            min_pending=int(config.get("ECHO_STREAM_DREAM_MIN_PENDING",
+                                       str(DreamPolicy.min_pending))),
+            daydream_pending=int(config.get("ECHO_STREAM_DREAM_DAYDREAM_PENDING",
+                                            str(DreamPolicy.daydream_pending))),
+        )
+        self._dream_scheduler = DreamScheduler(
+            pending_count=memory.pending_dream_count,
+            run_dream=self._run_dream,
+            policy=policy,
+        )
+        self._dream_scheduler.start()
+
     def shutdown(self) -> None:
+        if self._dream_scheduler is not None:
+            self._loop.call_soon_threadsafe(self._dream_scheduler.stop)
         if self._runner is not None:
             with_timeout = asyncio.run_coroutine_threadsafe(
                 self._runner.aclose(), self._loop
@@ -719,31 +742,39 @@ class StreamService:
             return {"error": self.memory_error or "記憶未啟用"}
         if self._dream_running:
             return {"error": "dream 進行中"}
-        self._dream_running = True
-
-        async def _go() -> None:
-            try:
-                report = await self._memory.dream("manual")
-                # DreamReport 可能含非 JSON 型別——先過一次 default=str
-                self.dream_report = json.loads(
-                    json.dumps(report, ensure_ascii=False, default=str)
-                )
-                self._log({"type": "dream", "report": self.dream_report})
-            except Exception as exc:  # noqa: BLE001 - 旁路
-                self.dream_report = {"error": f"{type(exc).__name__}: {exc}"}
-                self._log({"type": "dream", **self.dream_report})
-            finally:
-                self._dream_running = False
-
-        asyncio.run_coroutine_threadsafe(_go(), self._loop)
+        asyncio.run_coroutine_threadsafe(self._run_dream("manual"), self._loop)
         return {"ok": True, "started": True}
 
+    async def _run_dream(self, triggered_by: str) -> None:
+        """手動與排程共用的執行路徑。同時只跑一個；重入直接略過。
+
+        中斷語意是「重做」不是「復原」——echo_memory 只在整輪結束才標
+        is_dreamed，中途掛掉下次同一批從頭跑，不需要 checkpoint。
+        """
+        if self._memory is None or self._dream_running:
+            return
+        self._dream_running = True
+        try:
+            raw = await self._memory.dream(triggered_by)
+            # DreamReport 可能含非 JSON 型別——先過一次 default=str
+            report = json.loads(json.dumps(raw, ensure_ascii=False, default=str))
+        except Exception as exc:  # noqa: BLE001 - 旁路
+            report = {"error": f"{type(exc).__name__}: {exc}"}
+        finally:
+            # 旗標先放、報告後公布——讀到報告的人不會再看到 running=True
+            self._dream_running = False
+        self.dream_report = report
+        self._log({"type": "dream", "triggered_by": triggered_by, "report": report})
+
     def memory_dream_status(self) -> dict[str, Any]:
-        return {
+        status: dict[str, Any] = {
             "available": self._memory is not None,
             "running": self._dream_running,
             "last_report": self.dream_report,
         }
+        if self._dream_scheduler is not None:
+            status["scheduler"] = self._dream_scheduler.status()
+        return status
 
     # --- 記錄 ---
 
@@ -1004,6 +1035,9 @@ class StreamService:
         self._log({"type": "turn", "input": utterance.text, **meta})
         # 每輪落地一次——server 掛掉最多丟正在跑的那一輪，不會丟整個會話
         self._save_active_session()
+
+        if self._dream_scheduler is not None:
+            self._dream_scheduler.notify_interaction()
 
         # 記憶寫入：背景旁路，不擋下一輪。
         # **被捨棄的 turn 不寫**——voice_discard 在中止前就把 _discard_turn
