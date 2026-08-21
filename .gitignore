@@ -27,6 +27,7 @@ outputs/
 .claude/
 AGENTS.md
 CLAUDE.md
+docs/hidden/
 
 # 會話檔案
 data/sessions/
