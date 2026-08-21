@@ -447,6 +447,7 @@ class StreamService:
                 "error": self.memory_error,
                 "top_k": getattr(self._memory, "top_k", None),
                 "max_chars": getattr(self._memory, "max_chars", None),
+                "min_match": getattr(self._memory, "min_match", None),
             },
         }
 
@@ -549,6 +550,9 @@ class StreamService:
             if "max_chars" in memory:
                 self._memory.max_chars = max(50, int(memory["max_chars"]))
                 changed["max_chars"] = self._memory.max_chars
+            if "min_match" in memory:
+                self._memory.min_match = min(1.0, max(0.0, float(memory["min_match"])))
+                changed["min_match"] = self._memory.min_match
             if changed:
                 applied["memory"] = changed
 

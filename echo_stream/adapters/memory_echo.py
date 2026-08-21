@@ -46,6 +46,9 @@ DEFAULT_TOP_K = 3
 DEFAULT_MAX_CHARS = 500
 """注入 prompt 的記憶文字上限。記憶放在 user message 內（保 prompt cache），
 太長會吃掉 token 預算、也會影響切分行為——先保守，profiling 後再調。"""
+DEFAULT_MIN_MATCH = 0.45
+"""檢索相似度下限。echo_memory 預設 0.3，實測 35-41% 的匹配是純雜訊
+（「攀岩」撈出「深藍色」），注入只會讓 LLM 亂講。"""
 
 
 def build_engine(
@@ -130,6 +133,9 @@ class EchoMemoryAdapter:
         self.max_chars = max_chars or int(
             config.get("ECHO_STREAM_MEMORY_MAX_CHARS", str(DEFAULT_MAX_CHARS))
         )
+        self.min_match = float(
+            config.get("ECHO_STREAM_MEMORY_MIN_MATCH", str(DEFAULT_MIN_MATCH))
+        )
         self._session_id: str | None = None
         self.load_seconds: float | None = None
 
@@ -171,6 +177,7 @@ class EchoMemoryAdapter:
             context = self.engine.retrieve(
                 text,
                 top_k=self.top_k,
+                min_similarity=self.min_match,
                 exclude_session_id=self._session_id,
             )
             if context.is_empty():

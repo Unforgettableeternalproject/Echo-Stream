@@ -294,6 +294,11 @@
           <input type="number" id="cfg-mem-chars" min="50" max="2000" step="50">
           <span class="val"></span>
         </div>
+        <div class="field">
+          <label for="cfg-mem-match">匹配下限</label>
+          <input type="number" id="cfg-mem-match" min="0" max="1" step="0.05">
+          <span class="val"></span>
+        </div>
       </div>
       <div class="hint" id="cfg-mem-hint" style="display:none"></div>
 
@@ -870,6 +875,7 @@ async function loadConfig() {
       $("cfg-mem-enabled").checked = !!c.memory.enabled;
       if (c.memory.top_k != null) $("cfg-mem-topk").value = c.memory.top_k;
       if (c.memory.max_chars != null) $("cfg-mem-chars").value = c.memory.max_chars;
+      if (c.memory.min_match != null) $("cfg-mem-match").value = c.memory.min_match;
     } else {
       $("cfg-mem-section").style.display = "none";
       const hint = $("cfg-mem-hint");
@@ -917,6 +923,7 @@ async function applyConfig() {
       enabled: $("cfg-mem-enabled").checked,
       top_k: +$("cfg-mem-topk").value,
       max_chars: +$("cfg-mem-chars").value,
+      min_match: +$("cfg-mem-match").value,
     };
   }
   const msg = $("cfg-msg");
