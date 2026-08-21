@@ -539,6 +539,9 @@ class StubMemory:
             {"user": user_text, "spoken": spoken_text, **metadata}
         )
 
+    async def dream(self, triggered_by="manual"):
+        return {"triggered_by": triggered_by, "pruned": 1}
+
 
 def _wait_for(cond, timeout=5.0):
     deadline = time.time() + timeout
@@ -624,3 +627,24 @@ def test_config_記憶開關與參數(server):
     # 關閉後跑一輪，不該寫入
     post(f"{base}/api/say", {"text": "關掉之後說的話"})
     assert not _wait_for(lambda: service._memory.stored, timeout=1.0)
+
+
+def test_dream_未啟用記憶時回錯誤(server):
+    base, _ = server
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        post(f"{base}/api/memory/dream", {})
+    assert exc.value.code == 409
+
+
+def test_dream_背景執行並回報(server):
+    base, service = server
+    service._memory = StubMemory()
+
+    res = json.loads(post(f"{base}/api/memory/dream", {}))
+    assert res["ok"] is True
+
+    assert _wait_for(lambda: service.dream_report is not None)
+    status = _get_json(f"{base}/api/memory/dream")
+    assert status["running"] is False
+    assert status["last_report"]["pruned"] == 1
+    assert status["last_report"]["triggered_by"] == "manual"

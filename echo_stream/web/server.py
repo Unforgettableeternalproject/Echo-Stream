@@ -187,6 +187,8 @@ class StreamService:
         self._memory_enabled = True
         """面板開關。關掉 = 不 retrieve、不注入、不 store；
         adapter 與 engine 留著（重載要數十秒），開回來立即生效。"""
+        self._dream_running = False
+        self.dream_report: dict[str, Any] | None = None
         self.memory_error: str | None = None
         self.memory_warm_seconds: float | None = None
         self.split_policy = split_policy or SplitPolicy()
@@ -331,6 +333,15 @@ class StreamService:
             await memory.retrieve("暖機")
             self.memory_warm_seconds = time.perf_counter() - t0
             memory.set_session(self._session_id)
+            # 蒸餾 LLM 沿用主模型（艾斯維爾定調）：SessionControl backend 的
+            # 同步 query()，不另建第二套 LLM 存取。只在 dream（背景）用到，
+            # 不在對話熱路徑。
+            backend = getattr(self._think, "backend", None)
+            query = getattr(backend, "query", None)
+            if callable(query):
+                memory.set_llm_fn(
+                    lambda prompt: (query(prompt) or {}).get("text", "")
+                )
             self._think.memory = memory
             self._memory = memory
         except Exception as exc:  # noqa: BLE001
@@ -695,6 +706,44 @@ class StreamService:
             )
         except Exception:  # noqa: BLE001
             pass
+
+    # --- Dream（離線鞏固）---
+
+    def memory_dream(self) -> dict[str, Any]:
+        """手動觸發 Dream Engine。背景執行，不擋對話——立即回傳。
+
+        排程不做（本輪範圍）。競態鐵律在 echo_memory 本體：
+        保留原始 → 背景算 → 原子替換，絕不「先清原始再等 LLM」。
+        """
+        if self._memory is None:
+            return {"error": self.memory_error or "記憶未啟用"}
+        if self._dream_running:
+            return {"error": "dream 進行中"}
+        self._dream_running = True
+
+        async def _go() -> None:
+            try:
+                report = await self._memory.dream("manual")
+                # DreamReport 可能含非 JSON 型別——先過一次 default=str
+                self.dream_report = json.loads(
+                    json.dumps(report, ensure_ascii=False, default=str)
+                )
+                self._log({"type": "dream", "report": self.dream_report})
+            except Exception as exc:  # noqa: BLE001 - 旁路
+                self.dream_report = {"error": f"{type(exc).__name__}: {exc}"}
+                self._log({"type": "dream", **self.dream_report})
+            finally:
+                self._dream_running = False
+
+        asyncio.run_coroutine_threadsafe(_go(), self._loop)
+        return {"ok": True, "started": True}
+
+    def memory_dream_status(self) -> dict[str, Any]:
+        return {
+            "available": self._memory is not None,
+            "running": self._dream_running,
+            "last_report": self.dream_report,
+        }
 
     # --- 記錄 ---
 
@@ -1081,6 +1130,8 @@ class _Handler(BaseHTTPRequestHandler):
             )
         elif self.path == "/api/config":
             self._json(200, self.service.get_config())
+        elif self.path == "/api/memory/dream":
+            self._json(200, self.service.memory_dream_status())
         elif self.path == "/api/sessions":
             self._json(200, self.service.sessions_list())
         elif self.path.startswith("/api/voice/stream"):
@@ -1107,6 +1158,10 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         if self.path == "/api/interrupt":
             self._json(200, {"interrupted": self.service.interrupt()})
+            return
+        if self.path == "/api/memory/dream":
+            result = self.service.memory_dream()
+            self._json(200 if "error" not in result else 409, result)
             return
         if self.path == "/api/config":
             length = int(self.headers.get("Content-Length", "0"))
