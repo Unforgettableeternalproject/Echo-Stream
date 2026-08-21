@@ -25,3 +25,8 @@ outputs/
 
 # 本機設定
 .claude/
+AGENTS.md
+CLAUDE.md
+
+# 會話檔案
+data/sessions/
