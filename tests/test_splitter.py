@@ -56,7 +56,9 @@ def test_日文假名與中文同權重():
 
 
 async def test_全形句末標點立即切():
-    result = await collect("你好。今天天氣真好。", SplitPolicy(first_min_weight=1.0, min_weight=1.0))
+    result = await collect(
+        "你好。今天天氣真好。", SplitPolicy(first_min_weight=1.0, min_weight=1.0)
+    )
     assert result == ["你好。", "今天天氣真好。"]
 
 
@@ -66,7 +68,9 @@ async def test_全形問號驚嘆號():
 
 
 async def test_結尾引號跟著句子走():
-    result = await collect('他說「好啊."後面繼續講一些別的內容。', SplitPolicy(first_min_weight=1.0, min_weight=1.0))
+    result = await collect(
+        '他說「好啊."後面繼續講一些別的內容。', SplitPolicy(first_min_weight=1.0, min_weight=1.0)
+    )
     assert result[0].endswith('"') or "」" in result[0] or result[0].endswith("好啊.")
 
 
@@ -86,13 +90,17 @@ async def test_小數點不切():
 
 
 async def test_省略號不切():
-    result = await collect("我想想...應該可以吧。", SplitPolicy(first_min_weight=1.0, min_weight=1.0))
+    result = await collect(
+        "我想想...應該可以吧。", SplitPolicy(first_min_weight=1.0, min_weight=1.0)
+    )
     assert all("." not in r or r.count(".") >= 2 for r in result[:1])
     assert len(result) <= 2
 
 
 async def test_半形句號在後面有字時才切():
-    result = await collect("Hello world. This is fine.", SplitPolicy(first_min_weight=1.0, min_weight=1.0))
+    result = await collect(
+        "Hello world. This is fine.", SplitPolicy(first_min_weight=1.0, min_weight=1.0)
+    )
     assert len(result) >= 1
     assert result[0].startswith("Hello")
 
@@ -102,7 +110,9 @@ async def test_半形句號在後面有字時才切():
 
 async def test_首句用較低閾值_較早切出():
     policy = SplitPolicy(first_min_weight=6.0, min_weight=20.0)
-    result = await collect_full("我覺得這個想法不錯，可以再多想一下細節，然後我們就開始做。", policy)
+    result = await collect_full(
+        "我覺得這個想法不錯，可以再多想一下細節，然後我們就開始做。", policy
+    )
     texts = [s.text for s in result if s.text]
     assert texts[0] == "我覺得這個想法不錯，"
     assert result[0].is_first
@@ -203,7 +213,10 @@ async def test_取消時拋出():
 
 async def test_split_reason_可分類():
     """調參時要看這個分布：max_length 佔比過高代表閾值要調。"""
-    result = await collect_full("你好。這是一段比較長的句子，裡面有逗號分隔的內容。", SplitPolicy(first_min_weight=1.0, min_weight=1.0))
+    result = await collect_full(
+        "你好。這是一段比較長的句子，裡面有逗號分隔的內容。",
+        SplitPolicy(first_min_weight=1.0, min_weight=1.0),
+    )
     reasons = {s.split_reason for s in result}
     assert "terminal" in reasons
 

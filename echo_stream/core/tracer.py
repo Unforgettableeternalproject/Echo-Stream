@@ -287,7 +287,10 @@ class LatencyTracer:
         for label, key, budget_key in rows:
             value = segs.get(key)
             budget = BUDGET_MS.get(budget_key) if budget_key else None
-            lines.append(f"  {label:<18}{_fmt_ms(value):>10}{_fmt_ms(budget):>10}   {_verdict(value, budget)}")
+            lines.append(
+                f"  {label:<18}{_fmt_ms(value):>10}{_fmt_ms(budget):>10}"
+                f"   {_verdict(value, budget)}"
+            )
 
         lines.append("  " + "─" * 46)
         lines.append(

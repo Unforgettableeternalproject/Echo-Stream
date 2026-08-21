@@ -11,14 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from collections.abc import AsyncIterator
 
 import pytest
 
 from echo_stream.adapters.speak_indextts import IndexTTS2SpeakStage, tensor_to_pcm16
 from echo_stream.contracts.cancellation import CancellationToken, CancelReason
 from echo_stream.contracts.types import Sentence
-from tests.conftest import FakeTTSBackend as FakeBackend, sentence_stream
+from tests.conftest import FakeTTSBackend as FakeBackend
+from tests.conftest import sentence_stream
 
 np = pytest.importorskip("numpy", reason="adapter 的音訊轉換需要 numpy")
 
@@ -262,7 +262,6 @@ def test_過短的段不會因淡化壞掉():
 
 async def test_style_的情緒向量乘上強度():
     from echo_stream.contracts.style import SpeechStyle
-    from echo_stream.contracts.types import Sentence
 
     backend = FakeBackend(segments_per_sentence=1)
     stage = IndexTTS2SpeakStage(backend=backend)

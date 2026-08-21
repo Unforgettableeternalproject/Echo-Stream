@@ -10,7 +10,6 @@ from echo_stream.adapters.speak_indextts import (
 )
 from echo_stream.contracts.style import EMOTION_DIMENSIONS, NEUTRAL, SpeechStyle
 
-
 # --- 情緒向量 ---
 
 

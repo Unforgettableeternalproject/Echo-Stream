@@ -39,9 +39,9 @@ import asyncio
 import contextlib
 import time
 from collections import deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from .. import config
 from ..contracts.cancellation import CancellationToken, CancelledError
@@ -365,7 +365,9 @@ class SttInputStage:
                     anchor = time.perf_counter()
                     clock = self.vad.clock_s
                     end_clock = last_speech_clock if last_speech_clock is not None else clock
-                    start_clock = speech_start_clock if speech_start_clock is not None else end_clock
+                    start_clock = (
+                        speech_start_clock if speech_start_clock is not None else end_clock
+                    )
                     # 增量切過的部分不重轉——final 段只帶殘餘，
                     # 時間標記仍代表整個 turn
                     segment = _Segment(

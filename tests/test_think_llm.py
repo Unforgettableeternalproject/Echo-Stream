@@ -59,13 +59,17 @@ async def collect(stage: LLMThinkStage, text: str = "你好", token=None):
 
 
 async def test_切成句子():
-    stage = LLMThinkStage(FakeBackend(), split_policy=SplitPolicy(first_min_weight=1.0, min_weight=1.0))
+    stage = LLMThinkStage(
+        FakeBackend(), split_policy=SplitPolicy(first_min_weight=1.0, min_weight=1.0)
+    )
     sentences = await collect(stage)
     assert [s.text for s in sentences] == ["第一句很短。", "第二句也不長。"]
 
 
 async def test_首句有標記():
-    stage = LLMThinkStage(FakeBackend(), split_policy=SplitPolicy(first_min_weight=1.0, min_weight=1.0))
+    stage = LLMThinkStage(
+        FakeBackend(), split_policy=SplitPolicy(first_min_weight=1.0, min_weight=1.0)
+    )
     sentences = await collect(stage)
     assert sentences[0].is_first
     assert not sentences[1].is_first

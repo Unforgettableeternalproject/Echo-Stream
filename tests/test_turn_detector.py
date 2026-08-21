@@ -7,12 +7,12 @@
 from __future__ import annotations
 
 from echo_stream.contracts.turn import TurnPolicy, VoiceEvent, VoiceState
+from echo_stream.contracts.types import Utterance
 from echo_stream.core.turn_detector import (
     AlwaysAddressed,
     DurationInterruptionDetector,
     SilenceTurnDetector,
 )
-from echo_stream.contracts.types import Utterance
 
 
 def speech(duration: float, text: str = "") -> VoiceEvent:

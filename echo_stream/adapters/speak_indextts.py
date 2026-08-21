@@ -52,7 +52,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import config
-from ..contracts.cancellation import CancellationToken, CancelledError, CancelReason
+from ..contracts.cancellation import CancellationToken, CancelledError
 from ..contracts.style import SpeechStyle
 from ..contracts.types import TTS_SAMPLE_RATE, AudioChunk, Sentence
 from ..core.channel import StreamChannel

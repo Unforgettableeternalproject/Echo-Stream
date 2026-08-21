@@ -51,7 +51,7 @@ from typing import Any
 from .. import config
 from ..contracts.cancellation import CancellationToken, CancelReason
 from ..contracts.style import EMOTION_DIMENSIONS, SpeechStyle
-from ..contracts.types import STT_SAMPLE_RATE, AudioChunk, TurnPhase, Utterance
+from ..contracts.types import STT_SAMPLE_RATE, AudioChunk, Utterance
 from ..core.emotion import EMOTION_PRESETS
 from ..core.pipeline import PipelineRunner
 from ..core.splitter import SplitPolicy
@@ -1218,7 +1218,7 @@ def serve(
         print(f"\n  ✗ {host}:{port} 已被占用——有舊的 server 沒關乾淨。")
         print("    執行 serve_web.bat stop（會按 port 掃，不管是誰起的）再重試。")
         service.shutdown()
-        raise SystemExit(1)
+        raise SystemExit(1) from None
     print(f"\n  → http://{host}:{port}\n")
     print("  Ctrl+C 結束")
     print("═" * 56)
