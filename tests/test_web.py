@@ -514,3 +514,82 @@ def test_語音_discard_無效_sid_回_404(server):
     with pytest.raises(urllib.error.HTTPError) as exc:
         _post_raw(f"{base}/api/voice/discard?sid=nope", b"x")
     assert exc.value.code == 404
+
+
+# --- 記憶寫入（Phase 4a）---
+
+
+class StubMemory:
+    """記錄 store/set_session 呼叫的假記憶 adapter。"""
+
+    def __init__(self):
+        self.stored: list[dict] = []
+        self.sessions: list[str] = []
+
+    def set_session(self, session_id):
+        self.sessions.append(session_id)
+
+    async def retrieve(self, text):
+        return None
+
+    async def store(self, user_text, spoken_text, session_id=None, **metadata):
+        self.stored.append(
+            {"user": user_text, "spoken": spoken_text, **metadata}
+        )
+
+
+def _wait_for(cond, timeout=5.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if cond():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_每輪對話後背景寫入記憶(server):
+    base, service = server
+    memory = StubMemory()
+    service._memory = memory
+
+    post(f"{base}/api/say", {"text": "我養了一隻叫毛球的貓"})
+
+    assert _wait_for(lambda: memory.stored), "store 是背景任務，等它落地"
+    record = memory.stored[0]
+    assert record["user"] == "我養了一隻叫毛球的貓"
+    assert record["spoken"]  # 寫的是 spoken_text
+    assert record["origin"] == "text"
+    assert record["truncated"] is False
+
+
+def test_被捨棄的_turn_不寫入記憶(server):
+    base, service = server
+    memory = StubMemory()
+    service._memory = memory
+
+    # 模擬 voice_discard 在 turn 進行中把捨棄旗標立起來：
+    # _run 收尾時看到旗標就不該寫記憶（歷史剔除了、記憶留著 = 髒資料）
+    import asyncio as aio
+
+    from echo_stream.contracts.types import Utterance
+
+    service._discard_turn = True
+    fut = aio.run_coroutine_threadsafe(
+        service._run(Utterance(text="不該被記住的話"), lambda _: None,
+                     origin="voice"),
+        service._loop,
+    )
+    fut.result(timeout=30)
+    service._discard_turn = False
+
+    assert not _wait_for(lambda: memory.stored, timeout=1.0), "捨棄的 turn 寫進記憶了"
+
+
+def test_會話切換同步給記憶層(session_server):
+    base, service = session_server
+    memory = StubMemory()
+    service._memory = memory
+
+    post(f"{base}/api/sessions/new", {})
+    assert memory.sessions, "session new 沒有同步給記憶層"
+    assert memory.sessions[-1] == service._session_id

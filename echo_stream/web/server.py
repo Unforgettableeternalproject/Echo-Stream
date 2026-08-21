@@ -171,6 +171,7 @@ class StreamService:
         use_real_tts: bool = False,
         use_real_llm: bool = False,
         use_real_stt: bool = False,
+        use_real_memory: bool = False,
         split_policy: SplitPolicy | None = None,
         system_prompt: str = "",
         trace_path: str | None = None,
@@ -179,6 +180,12 @@ class StreamService:
         self.use_real_tts = use_real_tts
         self.use_real_llm = use_real_llm
         self.use_real_stt = use_real_stt
+        self.use_real_memory = use_real_memory
+
+        self._memory = None
+        """EchoMemoryAdapter。旁路——建不起來只停用記憶，不擋管線。"""
+        self.memory_error: str | None = None
+        self.memory_warm_seconds: float | None = None
         self.split_policy = split_policy or SplitPolicy()
         self.system_prompt = system_prompt
 
@@ -243,6 +250,13 @@ class StreamService:
                     "real_stt": self.use_real_stt,
                     "real_llm": self.use_real_llm,
                     "real_tts": self.use_real_tts,
+                    "real_memory": self.use_real_memory,
+                    "memory_error": self.memory_error,
+                    "memory_warm_seconds": (
+                        round(self.memory_warm_seconds, 1)
+                        if self.memory_warm_seconds is not None
+                        else None
+                    ),
                     "system_prompt_chars": len(self.system_prompt),
                     "load_seconds": round(self.load_seconds, 1),
                 }
@@ -284,12 +298,40 @@ class StreamService:
                 split_policy=self.split_policy, tracer=self.tracer
             )
 
+        if self.use_real_memory:
+            await self._build_memory()
+
         self._runner = PipelineRunner(
             think_stage=self._think,
             speak_stage=self._speak,
             tracer=self.tracer,
         )
         await self._runner.prepare()
+
+    async def _build_memory(self) -> None:
+        """建立並暖機記憶層。旁路——失敗記在 memory_error，不擋管線。
+
+        暖機的 dummy retrieve 是關鍵：embedding 模型（bge-small-zh）的
+        首載實測 ~50s（含下載）/ 數秒（已快取），必須在啟動階段吸收，
+        不能落在使用者的第一輪對話上。
+        """
+        if not self.use_real_llm:
+            # 注入走 LLMThinkStage 的 _pending_memory，fake think 沒有這條路
+            self.memory_error = "記憶需要 --real-llm（注入走 LLMThinkStage）"
+            return
+        try:
+            from ..adapters.memory_echo import EchoMemoryAdapter
+
+            memory = EchoMemoryAdapter()
+            await memory.prepare()
+            t0 = time.perf_counter()
+            await memory.retrieve("暖機")
+            self.memory_warm_seconds = time.perf_counter() - t0
+            memory.set_session(self._session_id)
+            self._think.memory = memory
+            self._memory = memory
+        except Exception as exc:  # noqa: BLE001
+            self.memory_error = f"{type(exc).__name__}: {exc}"
 
     def shutdown(self) -> None:
         if self._runner is not None:
@@ -537,8 +579,15 @@ class StreamService:
         history.clear()
         self._session_id = uuid.uuid4().hex[:8]
         self._session_created = time.time()
+        self._sync_memory_session()
         self._log({"type": "session", "action": "new", "session": self._session_id})
         return {"ok": True, "active": self._session_id, "history": []}
+
+    def _sync_memory_session(self) -> None:
+        """會話邊界同步給記憶層——exclude_session_id（防自我回聲）與
+        episode 標記都要跟著當前會話走。記憶本身跨會話，namespace 不變。"""
+        if self._memory is not None:
+            self._memory.set_session(self._session_id)
 
     async def _session_switch(self, session_id: str) -> dict[str, Any]:
         history = self._history()
@@ -566,6 +615,7 @@ class StreamService:
         ]
         self._session_id = session_id
         self._session_created = meta.get("created_at", time.time())
+        self._sync_memory_session()
         self._log(
             {
                 "type": "session",
@@ -587,6 +637,7 @@ class StreamService:
                 history.clear()
             self._session_id = uuid.uuid4().hex[:8]
             self._session_created = time.time()
+            self._sync_memory_session()
         deleted = bool(self._store.delete(session_id))
         self._log({"type": "session", "action": "delete", "session": session_id})
         return {"ok": deleted, "active": self._session_id}
@@ -772,7 +823,7 @@ class StreamService:
                 history = self._history()
                 pre_len = len(history) if history is not None else 0
                 self._discard_turn = False
-                await self._run(utterance, emit)
+                await self._run(utterance, emit, origin="voice")
 
                 if self._discard_turn:
                     # 捨棄打在這一輪上：把 commit 進歷史的內容拿掉——
@@ -829,7 +880,12 @@ class StreamService:
             )
             fut.result()
 
-    async def _run(self, utterance: Utterance, emit: Callable[[bytes], None]) -> None:
+    async def _run(
+        self,
+        utterance: Utterance,
+        emit: Callable[[bytes], None],
+        origin: str = "text",
+    ) -> None:
         runner = self._runner
         assert runner is not None
 
@@ -868,6 +924,25 @@ class StreamService:
         self._log({"type": "turn", "input": utterance.text, **meta})
         # 每輪落地一次——server 掛掉最多丟正在跑的那一輪，不會丟整個會話
         self._save_active_session()
+
+        # 記憶寫入：背景旁路，不擋下一輪。
+        # **被捨棄的 turn 不寫**——voice_discard 在中止前就把 _discard_turn
+        # 立起來了，這裡看得到；歷史剔除了、記憶卻留著 = 髒資料。
+        # 沒播出任何內容的 turn 也不寫（錯誤或開口前就被砍，不成一輪對話）。
+        # **寫 spoken 不寫 generated**——與歷史同一條語意。
+        if (
+            self._memory is not None
+            and not self._discard_turn
+            and result.spoken_text
+        ):
+            asyncio.ensure_future(
+                self._memory.store(
+                    utterance.text,
+                    result.spoken_text,
+                    origin=origin,
+                    truncated=bool(result.cancel_reason),
+                )
+            )
 
 
 class _EmitThink:
@@ -1162,6 +1237,7 @@ def serve(
     real_tts: bool = False,
     real_llm: bool = False,
     real_stt: bool = False,
+    real_memory: bool = False,
     split_policy: SplitPolicy | None = None,
     system_prompt: str = "",
     trace_path: str | None = None,
@@ -1184,6 +1260,7 @@ def serve(
         use_real_tts=real_tts,
         use_real_llm=real_llm,
         use_real_stt=real_stt,
+        use_real_memory=real_memory,
         split_policy=split_policy,
         system_prompt=system_prompt,
         trace_path=trace_path,
