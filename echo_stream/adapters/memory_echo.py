@@ -47,12 +47,12 @@ DEFAULT_MAX_CHARS = 500
 """注入 prompt 的記憶文字上限。記憶放在 user message 內（保 prompt cache），
 太長會吃掉 token 預算、也會影響切分行為——先保守，profiling 後再調。"""
 DEFAULT_MIN_MATCH = 0.45
+"""檢索相似度下限。echo_memory 預設 0.3，實測 35-41% 的匹配是純雜訊
+（「攀岩」撈出「深藍色」），注入只會讓 LLM 亂講。"""
 ASSESS_MODES = ("llm", "heuristic", "off")
 """salience 評估模式（ECHO_STREAM_MEMORY_ASSESS）：
 llm = SubconsciousAssessor 打一次 LLM（背景，不在熱路徑）；
 heuristic = echo_memory 的文字啟發式，零 token；off = 全部 0.5（Phase 4a 行為）。"""
-"""檢索相似度下限。echo_memory 預設 0.3，實測 35-41% 的匹配是純雜訊
-（「攀岩」撈出「深藍色」），注入只會讓 LLM 亂講。"""
 
 
 def build_engine(
@@ -136,6 +136,7 @@ class EchoMemoryAdapter:
         """評估用 LLM。五維打分不需要 reasoning，server 會給一個壓低 effort 的版本；
         沒給就退回 dream 用的 llm_fn。"""
         self._assessor: Any = None
+        self._judge: Any = None
         self.assess_mode = config.get("ECHO_STREAM_MEMORY_ASSESS", "llm") or "llm"
         if self.assess_mode not in ASSESS_MODES:
             logger.warning("ECHO_STREAM_MEMORY_ASSESS=%r 不認得，改用 llm", self.assess_mode)
@@ -245,10 +246,15 @@ class EchoMemoryAdapter:
     def _evaluate_salience(
         self, user_text: str, spoken_text: str, context: Any
     ) -> dict[str, Any]:
-        """Entry.py Step 3 的精簡版：assess → signals → 三值 → 更新 neurochem。
+        """Entry.py Step 3：assess → signals → 三值 → neurochem → StorageJudge 微調。
 
-        StorageJudge（第二次 LLM 微調）刻意不接——先看三值本身夠不夠用。
         推理全在 echo_memory；這裡只是把它們串起來。
+
+        StorageJudge 是第二段：OpenSoul 公式偏重 complexity/novelty，
+        「我妹妹要去筑波大學」「別再糾正我的英文」這種簡單但該記住的話
+        baseline 只有 0.35-0.45，過不了蒸餾門檻（2026-08-22 實測）。
+        Judge 的 JudgeGate 只在信號進灰區才打 LLM，用 salience_delta /
+        force_remember / metadata_tags（correction、preference…）補這一段。
         """
         from echo_memory.affect.salience import SalienceEvaluator
         from echo_memory.affect.signals import SalienceSignals
@@ -256,16 +262,60 @@ class EchoMemoryAdapter:
         assessment = self.assessor.assess(user_text, context)
         signals = SalienceSignals.from_subconscious(assessment)
         evaluator = SalienceEvaluator(self.engine.neurochem)
-        salience, da, ht = evaluator.evaluate(
+        baseline, da, ht = evaluator.evaluate(
             signals, user_input=user_text, agent_response=spoken_text
         )
         evaluator.update_neurochem(signals)
-        return {
-            "salience": salience,
+        result: dict[str, Any] = {
+            "salience": baseline,
             "da_weight": da,
             "ht_weight": ht,
             "assessment": assessment.to_dict(),
         }
+        if self.judge_enabled:
+            try:
+                decision = self.judge.storage_decision(
+                    user_input=user_text,
+                    agent_response=spoken_text,
+                    baseline_salience=baseline,
+                    assessment=assessment,
+                    context=context if context is not None and not context.is_empty()
+                    else None,
+                )
+            except Exception as exc:  # noqa: BLE001 - judge 是加分項，炸了用 baseline
+                logger.warning("StorageJudge 失敗，用 baseline：%s: %s",
+                               type(exc).__name__, exc)
+            else:
+                result["salience"] = max(0.0, min(1.0, baseline + decision.salience_delta))
+                judge: dict[str, Any] = {"source": decision.source}
+                if decision.salience_delta:
+                    judge["delta"] = round(decision.salience_delta, 3)
+                if decision.metadata_tags:
+                    judge["tags"] = list(decision.metadata_tags)
+                if decision.force_remember:
+                    judge["force_remember"] = True
+                    result["force_remember"] = True
+                if decision.entity_triggers:
+                    result["entity_triggers"] = True
+                if decision.reasoning:
+                    judge["reasoning"] = decision.reasoning[:200]
+                result["judge"] = judge
+        return result
+
+    @property
+    def judge_enabled(self) -> bool:
+        return self.assess_mode == "llm" and (
+            config.get("ECHO_STREAM_MEMORY_JUDGE", "on") or "on"
+        ).lower() not in ("off", "false", "0")
+
+    @property
+    def judge(self) -> Any:
+        """StorageJudge，lazy。與 assessor 共用評估用的 LLM。"""
+        if self._judge is None:
+            from echo_memory.affect.judge import StorageJudge
+
+            self._judge = StorageJudge(llm_fn=self._assess_llm_fn or self._llm_fn)
+        return self._judge
 
     async def store(
         self,
@@ -372,6 +422,7 @@ class EchoMemoryAdapter:
         self._llm_fn = llm_fn
         self._assess_llm_fn = assess_llm_fn
         self._assessor = None  # 下次用到時以新的 fn 重建
+        self._judge = None
         if self._engine is not None and hasattr(self._engine, "set_llm_fn"):
             self._engine.set_llm_fn(llm_fn)
 

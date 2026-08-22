@@ -225,3 +225,44 @@ async def test_heuristic模式不給llm(fake_affect):
     adapter.assess_mode = "heuristic"
     await adapter.store("問", "答")
     assert fake_affect["assess"][0][2] is None
+
+
+async def test_judge_微調salience並帶標籤(fake_affect, monkeypatch):
+    class Decision:
+        salience_delta = 0.3
+        metadata_tags = ["correction"]
+        force_remember = True
+        entity_triggers = False
+        reasoning = "使用者要求不要再糾正"
+        source = "llm"
+
+    class StorageJudge:
+        def __init__(self, llm_fn=None, structured_llm_fn=None):
+            pass
+
+        def storage_decision(self, **kw):
+            assert kw["baseline_salience"] == 0.82
+            return Decision()
+
+    mod = types.ModuleType("x")
+    mod.StorageJudge = StorageJudge
+    monkeypatch.setitem(sys.modules, "echo_memory.affect.judge", mod)
+    monkeypatch.setenv("ECHO_STREAM_MEMORY_JUDGE", "on")
+
+    engine = _StoreEngine()
+    adapter = EchoMemoryAdapter(engine=engine, llm_fn=lambda p: "{}")
+    out = await adapter.store("別再糾正我", "好")
+    kw = engine.stored[0]
+    assert kw["salience"] == 1.0  # 0.82 + 0.3 夾到 1
+    assert kw["force_remember"] is True
+    assert kw["judge"]["tags"] == ["correction"]
+    assert out["judge"]["source"] == "llm"
+
+
+async def test_judge_關閉時不呼叫(fake_affect, monkeypatch):
+    monkeypatch.setenv("ECHO_STREAM_MEMORY_JUDGE", "off")
+    monkeypatch.setitem(sys.modules, "echo_memory.affect.judge", None)  # import 會炸
+    engine = _StoreEngine()
+    adapter = EchoMemoryAdapter(engine=engine, llm_fn=lambda p: "{}")
+    await adapter.store("問", "答")
+    assert engine.stored[0]["salience"] == 0.82 and "judge" not in engine.stored[0]
