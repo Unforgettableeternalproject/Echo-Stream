@@ -546,6 +546,11 @@ class StubMemory:
     async def pending_dream_count(self):
         return 7
 
+    profile_text = ""
+
+    async def profile(self):
+        return self.profile_text
+
 
 def _wait_for(cond, timeout=5.0):
     deadline = time.time() + timeout
@@ -652,6 +657,20 @@ def test_dream_背景執行並回報(server):
     assert status["running"] is False
     assert status["last_report"]["pruned"] == 1
     assert status["last_report"]["triggered_by"] == "manual"
+
+
+def test_dream_後刷新profile並掛到think(server):
+    base, service = server
+    memory = StubMemory()
+    memory.profile_text = "- 討厭香菜：使用者不吃香菜"
+    service._memory = memory
+    assert getattr(service._think, "profile", "") == ""
+    res = json.loads(post(f"{base}/api/memory/dream", {}))
+    assert res["ok"] is True
+    assert _wait_for(lambda: getattr(service._think, "profile", "") != "")
+    assert service._think.profile == "- 討厭香菜：使用者不吃香菜"
+    status = _get_json(f"{base}/api/memory/dream")
+    assert status["profile"] == "- 討厭香菜：使用者不吃香菜"
 
 
 def test_dream_排程器與手動共用執行路徑(server):

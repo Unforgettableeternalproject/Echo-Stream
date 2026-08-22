@@ -368,6 +368,21 @@ class EchoMemoryAdapter:
                            type(exc).__name__, exc)
             return None
 
+    async def profile(self) -> str:
+        """使用者 profile 文字（subject=user 的 concept 全列）。沒有就空字串。
+
+        常駐脈絡，不是檢索結果——server 在暖機與每次 dream 後刷新一次，
+        不在每輪熱路徑呼叫。
+        """
+        max_chars = int(config.get("ECHO_STREAM_MEMORY_PROFILE_MAX_CHARS", "800"))
+        get_profile = getattr(self.engine, "get_profile", None)
+        if get_profile is None:
+            logger.warning("echo_memory 沒有 get_profile——分支太舊，profile 停用")
+            return ""
+        return await asyncio.get_running_loop().run_in_executor(
+            None, lambda: get_profile(max_chars=max_chars) or ""
+        )
+
     async def dream(self, triggered_by: str = "manual") -> dict[str, Any]:
         """離線鞏固（蒸餾/重播/修剪）。背景執行，不擋對話。
 

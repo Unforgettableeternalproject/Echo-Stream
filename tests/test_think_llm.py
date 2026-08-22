@@ -407,3 +407,24 @@ async def test_沒接記憶時行為不變():
     stage = LLMThinkStage(backend)
     await collect(stage, "你好")
     assert _last_user_content(backend) == "你好"
+
+
+async def test_profile_接在人設之後_標記之前():
+    from echo_stream.core.emotion import MARKER_PROMPT
+
+    backend = FakeBackend()
+    stage = LLMThinkStage(backend, system_prompt="人設在前", emotion_markers=True)
+    stage.profile = "- 妹妹：使用者的妹妹即將就讀筑波大學"
+    await collect(stage)
+    sys_ = backend.last_system
+    assert sys_.startswith("人設在前")
+    assert "關於這位使用者" in sys_ and "筑波大學" in sys_
+    assert sys_.index("筑波大學") < sys_.index(MARKER_PROMPT), "profile 在情緒標記指示之前"
+
+
+async def test_profile_空字串不加區塊():
+    backend = FakeBackend()
+    stage = LLMThinkStage(backend, system_prompt="人設")
+    stage.profile = ""
+    await collect(stage)
+    assert backend.last_system == "人設"

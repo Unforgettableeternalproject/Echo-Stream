@@ -352,9 +352,24 @@ class StreamService:
                 )
             self._think.memory = memory
             self._memory = memory
+            await self._refresh_profile()
             self._start_dream_scheduler(memory)
         except Exception as exc:  # noqa: BLE001
             self.memory_error = f"{type(exc).__name__}: {exc}"
+
+    async def _refresh_profile(self) -> None:
+        """把使用者 profile 掛到 think stage 的 system prompt。暖機與 dream 後各一次。"""
+        if self._memory is None or not hasattr(self._memory, "profile"):
+            return
+        try:
+            text = await self._memory.profile()
+        except Exception as exc:  # noqa: BLE001 - 旁路
+            logger_warn = f"{type(exc).__name__}: {exc}"
+            self._log({"type": "profile", "error": logger_warn})
+            return
+        if text != getattr(self._think, "profile", ""):
+            self._think.profile = text
+            self._log({"type": "profile", "chars": len(text), "text": text})
 
     def _start_dream_scheduler(self, memory: Any) -> None:
         """門檻走 .env：ECHO_STREAM_DREAM_{IDLE_MINUTES,MIN_PENDING,DAYDREAM_PENDING}。"""
@@ -774,6 +789,8 @@ class StreamService:
             self._dream_running = False
         self.dream_report = report
         self._log({"type": "dream", "triggered_by": triggered_by, "report": report})
+        # 蒸餾可能長出新的 subject=user concept——刷新常駐 profile
+        await self._refresh_profile()
 
     def memory_dream_status(self) -> dict[str, Any]:
         status: dict[str, Any] = {
@@ -783,6 +800,7 @@ class StreamService:
         }
         if self._dream_scheduler is not None:
             status["scheduler"] = self._dream_scheduler.status()
+        status["profile"] = getattr(self._think, "profile", "")
         return status
 
     # --- 記錄 ---
