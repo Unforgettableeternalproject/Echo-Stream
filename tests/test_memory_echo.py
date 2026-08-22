@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import sys
+import types
 from dataclasses import dataclass, field
+
+import pytest
 
 from echo_stream.adapters.memory_echo import EchoMemoryAdapter
 
@@ -94,3 +98,130 @@ async def test_pending_dream_count_跨頁():
     eps = [_Ep(str(i), "x") for i in range(450)]
     adapter = EchoMemoryAdapter(engine=_Engine(_Ctx(), eps))
     assert await adapter.pending_dream_count() == 450
+
+
+# --- salience（Phase 4b）---
+# echo_memory 不在測試環境；用假模組塞進 sys.modules，只驗 adapter 的串接責任。
+
+
+
+class _StoreEngine(_Engine):
+    def __init__(self, ctx=None):
+        super().__init__(ctx or _Ctx())
+        self.neurochem = object()
+        self.stored: list[dict] = []
+
+    def store_episode(self, **kw):
+        self.stored.append(kw)
+        return "ep_test"
+
+
+@pytest.fixture
+def fake_affect(monkeypatch):
+    """假的 echo_memory.affect：assess 回固定五維、evaluate 回固定三值。"""
+    calls: dict = {"assess": [], "neurochem_updates": 0}
+
+    class Assessment:
+        def __init__(self, novelty=0.9):
+            self.novelty = novelty
+
+        def to_dict(self):
+            return {"novelty": self.novelty}
+
+    class SubconsciousAssessor:
+        def __init__(self, llm_fn=None, structured_llm_fn=None):
+            self.llm_fn = llm_fn
+
+        def assess(self, user_input, memory_ctx=None, agent_response=""):
+            calls["assess"].append((user_input, memory_ctx, self.llm_fn))
+            if user_input == "炸":
+                raise RuntimeError("assess boom")
+            return Assessment()
+
+    class SalienceSignals:
+        @classmethod
+        def from_subconscious(cls, assessment, **_):
+            return ("signals", assessment)
+
+    class SalienceEvaluator:
+        def __init__(self, neurochem):
+            self.neurochem = neurochem
+
+        def evaluate(self, signals, user_input="", agent_response=""):
+            return (0.82, 0.6, 0.4)
+
+        def update_neurochem(self, signals):
+            calls["neurochem_updates"] += 1
+
+    mods = {
+        "echo_memory": types.ModuleType("echo_memory"),
+        "echo_memory.affect": types.ModuleType("echo_memory.affect"),
+        "echo_memory.affect.subconscious": types.ModuleType("x"),
+        "echo_memory.affect.signals": types.ModuleType("x"),
+        "echo_memory.affect.salience": types.ModuleType("x"),
+    }
+    mods["echo_memory.affect.subconscious"].SubconsciousAssessor = SubconsciousAssessor
+    mods["echo_memory.affect.signals"].SalienceSignals = SalienceSignals
+    mods["echo_memory.affect.salience"].SalienceEvaluator = SalienceEvaluator
+    for name, mod in mods.items():
+        monkeypatch.setitem(sys.modules, name, mod)
+    return calls
+
+
+async def test_store_帶三值與評估維度(fake_affect):
+    engine = _StoreEngine()
+    adapter = EchoMemoryAdapter(engine=engine, llm_fn=lambda p: "{}")
+    adapter.assess_mode = "llm"
+    out = await adapter.store("我在學薩克斯風", "好棒", origin="voice")
+    kw = engine.stored[0]
+    assert (kw["salience"], kw["da_weight"], kw["ht_weight"]) == (0.82, 0.6, 0.4)
+    assert kw["assessment"] == {"novelty": 0.9}
+    assert kw["origin"] == "voice"
+    assert out["episode_id"] == "ep_test" and out["salience"] == 0.82
+    assert fake_affect["neurochem_updates"] == 1
+
+
+async def test_store_評估失敗退回預設照存(fake_affect):
+    engine = _StoreEngine()
+    adapter = EchoMemoryAdapter(engine=engine, llm_fn=lambda p: "{}")
+    out = await adapter.store("炸", "回覆")
+    kw = engine.stored[0]
+    assert "salience" not in kw, "評估炸了就交給 store_episode 的預設 0.5"
+    assert out["episode_id"] == "ep_test"
+
+
+async def test_store_off模式不評估(fake_affect):
+    engine = _StoreEngine()
+    adapter = EchoMemoryAdapter(engine=engine)
+    adapter.assess_mode = "off"
+    await adapter.store("問", "答")
+    assert fake_affect["assess"] == []
+    assert "salience" not in engine.stored[0]
+
+
+async def test_store_用同一輪retrieve的context評估(fake_affect):
+    ctx = _Ctx(episodes=[_Ep("a", "舊事")], similarities={"a": 0.7})
+    engine = _StoreEngine(ctx)
+    adapter = EchoMemoryAdapter(engine=engine, llm_fn=lambda p: "{}")
+    await adapter.retrieve("第一輪")
+    await adapter.retrieve("第二輪")
+    # 第一輪的 store 比第二輪的 retrieve 晚到——仍要配到第一輪的 context
+    await adapter.store("第一輪", "答")
+    _, used_ctx, _ = fake_affect["assess"][0]
+    assert used_ctx is ctx
+    assert "第一輪" not in adapter._contexts, "用過就釋放"
+
+
+async def test_assessor_用評估專用的llm_fn(fake_affect):
+    adapter = EchoMemoryAdapter(engine=_StoreEngine())
+    cheap = lambda p: "cheap"  # noqa: E731
+    adapter.set_llm_fn(lambda p: "full", assess_llm_fn=cheap)
+    await adapter.store("問", "答")
+    assert fake_affect["assess"][0][2] is cheap
+
+
+async def test_heuristic模式不給llm(fake_affect):
+    adapter = EchoMemoryAdapter(engine=_StoreEngine(), llm_fn=lambda p: "full")
+    adapter.assess_mode = "heuristic"
+    await adapter.store("問", "答")
+    assert fake_affect["assess"][0][2] is None

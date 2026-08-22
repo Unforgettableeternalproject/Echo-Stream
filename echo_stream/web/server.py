@@ -343,7 +343,12 @@ class StreamService:
             query = getattr(backend, "query", None)
             if callable(query):
                 memory.set_llm_fn(
-                    lambda prompt: (query(prompt) or {}).get("text", "")
+                    lambda prompt: (query(prompt) or {}).get("text", ""),
+                    # 每輪 salience 評估：五維打分不需要推理，壓到最低、限制輸出長度。
+                    # 跑在背景 executor，與下一輪串流並行打同一顆 backend（query 無狀態）。
+                    assess_llm_fn=lambda prompt: (
+                        query(prompt, reasoning_effort="low", max_tokens=200) or {}
+                    ).get("text", ""),
                 )
             self._think.memory = memory
             self._memory = memory
@@ -1055,13 +1060,19 @@ class StreamService:
             and result.spoken_text
         ):
             asyncio.ensure_future(
-                self._memory.store(
+                self._store_memory(
                     utterance.text,
                     result.spoken_text,
                     origin=origin,
                     truncated=bool(result.cancel_reason),
                 )
             )
+
+    async def _store_memory(self, user_text: str, spoken_text: str, **meta: Any) -> None:
+        """背景寫入 + 把 salience 結果記進 session log（驗收看這個）。"""
+        stored = await self._memory.store(user_text, spoken_text, **meta)
+        if stored:
+            self._log({"type": "memory_store", "input": user_text[:80], **stored})
 
 
 class _EmitThink:
