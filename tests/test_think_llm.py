@@ -474,7 +474,9 @@ class ToolBackend:
     async def stream_query(
         self, messages: Sequence[Any], system_instruction: str | None = None, **kwargs
     ) -> AsyncIterator[Any]:
-        self.requests.append({"messages": list(messages), **kwargs})
+        self.requests.append(
+            {"messages": list(messages), "system_instruction": system_instruction, **kwargs}
+        )
         has_tool_result = any(_d(m)["role"] == "tool" for m in messages)
         if "tools" in kwargs and (not has_tool_result or self.call_again):
             for ch in self.preface:
@@ -595,3 +597,21 @@ async def test_工具區間有打點():
     assert MARK_TOOL_START in trace.marks and MARK_TOOL_DONE in trace.marks
     assert trace.segments_ms()["tool"] is not None
     assert MARK_THINK_FIRST_TOKEN in trace.marks, "filler 算首 token"
+
+
+async def test_有工具時_system_prompt_帶使用指引_接在profile後():
+    from echo_stream.adapters.think_llm import TOOLS_PROMPT
+
+    backend = ToolBackend(final="ok")
+    stage = LLMThinkStage(
+        backend, system_prompt="人設", tools=[{"x": 1}], tool_executor=_executor([]),
+        emotion_markers=True,
+    )
+    stage.profile = "- 妹妹會畫畫"
+    await collect(stage)
+    sys_ = backend.requests[0]["system_instruction"]
+    assert sys_.index("人設") < sys_.index("妹妹會畫畫") < sys_.index(TOOLS_PROMPT)
+
+    plain = FakeBackend()
+    await collect(LLMThinkStage(plain, system_prompt="人設"))
+    assert TOOLS_PROMPT not in plain.last_system
