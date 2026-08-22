@@ -23,14 +23,31 @@ ContextManager 的四層壓縮**——半套的壓縮比沒有壓縮更難除錯
 
 ⚠️ 屆時要注意壓縮的競態陷阱：絕不能「先清空原始內容再等 LLM 回摘要」
 （Claude Code #40352、Codex #13946 都踩過，API 失敗時原始對話被永久吞掉）。
+
+## 工具呼叫（Phase 4b C 段）
+
+建構子給 ``tools``（OpenAI function schema）與 ``tool_executor`` 後，
+backend 在串流裡 yield 的工具呼叫事件（duck-typing：有 ``name`` / ``arguments``
+/ ``id``）會在這裡被攔下：執行 → 把「發出呼叫的 assistant 訊息 + tool 結果」
+接回 messages → **開第二段串流續寫**。對切句器來說這一切都是同一條 token 流。
+
+一次工具往返是完整的 LLM round-trip（~2-3s），TTFA 會多一段。所以當模型
+**開口前**就決定查記憶，先把 ``tool_filler``（「嗯，讓我想一下。」）當作
+第一句送進 TTS，查完再續寫。filler 文案**不得含可被推翻的記憶斷言**——
+「我不記得了」是斷言，查完可能打臉；「讓我想一下」才安全。
+
+工具往返的訊息**不進跨輪歷史**：commit 寫的是 spoken_text，結果已經反映在
+回答裡，把整段 tool 結果留在歷史只會逐輪塞胖 context。
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import re
-from collections.abc import AsyncIterator, Sequence
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from typing import Any, Protocol, runtime_checkable
 
 from .. import config
@@ -43,6 +60,8 @@ from ..core.tracer import (
     MARK_MEMORY_DONE,
     MARK_MEMORY_START,
     MARK_THINK_FIRST_TOKEN,
+    MARK_TOOL_DONE,
+    MARK_TOOL_START,
     LatencyTracer,
 )
 
@@ -52,6 +71,35 @@ PROFILE_PROMPT = """## 關於這位使用者（長期記憶）
 自然地運用，不要逐條複述，也不要在使用者沒問時主動宣告「我記得你…」。
 
 {profile}"""
+
+
+DEFAULT_TOOL_FILLER = "嗯，讓我想一下。"
+"""工具往返前的 filler。只能是「正在想」這類中性語句——見模組 docstring。"""
+
+ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
+"""``(name, args) -> {"success": bool, "result": str}``。結果文字原樣回給 LLM。"""
+
+
+def _is_tool_call(piece: Any) -> bool:
+    """backend 的工具呼叫事件。用形狀判斷，不 import echo_thought_core 的型別。"""
+    return (
+        not isinstance(piece, str)
+        and hasattr(piece, "name")
+        and hasattr(piece, "arguments")
+        and hasattr(piece, "id")
+    )
+
+
+def _parse_args(raw: str) -> dict[str, Any]:
+    """模型給的 arguments 是 JSON 字串，壞掉時退成空 dict——由 executor 回報缺參數，
+    而不是在這裡炸掉整輪。"""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 @runtime_checkable
@@ -113,7 +161,19 @@ def to_messages(pairs: Sequence[dict[str, str]]) -> list[Any]:
         from echo_thought_core.schemas.message import Message as SessionMessage
     except ImportError:  # 測試用假 backend 時不需要真的 schema
         return list(pairs)
-    return [SessionMessage(role=p["role"], content=p["content"]) for p in pairs]
+    out = []
+    for p in pairs:
+        msg = SessionMessage(
+            role=p["role"],
+            content=p.get("content") or "",
+            tool_call_id=p.get("tool_call_id"),
+            tool_name=p.get("tool_name"),
+        )
+        if p.get("tool_calls"):
+            # 發出工具呼叫的 assistant 訊息——backend 從 metadata 讀 tool_calls
+            msg.metadata["tool_calls"] = list(p["tool_calls"])
+        out.append(msg)
+    return out
 
 
 class EchoBackend:
@@ -166,6 +226,10 @@ class LLMThinkStage:
         default_style: SpeechStyle | None = None,
         emotion_markers: bool = False,
         memory: Any = None,
+        tools: Sequence[dict[str, Any]] | None = None,
+        tool_executor: ToolExecutor | None = None,
+        tool_filler: str | None = DEFAULT_TOOL_FILLER,
+        max_tool_rounds: int = 2,
     ) -> None:
         self._backend = backend
         self.system_prompt = system_prompt
@@ -182,6 +246,17 @@ class LLMThinkStage:
 
         self.memory = memory
         """Phase 4 的 EchoMemory。平行 retrieve 的邏輯已經寫好，接上就生效。"""
+
+        self.tools: list[dict[str, Any]] = list(tools or [])
+        """OpenAI function schema 列表。空 → 不帶 tools 參數，行為與 Phase 2 完全相同。"""
+        self.tool_executor = tool_executor
+        self.tool_filler = tool_filler
+        self.max_tool_rounds = max_tool_rounds
+        """一輪最多幾次工具往返。每次往返都是完整 round-trip，超過就收回 tools
+        逼模型用手上的東西回答。"""
+        self.last_tool_calls: list[dict[str, Any]] = []
+        """這一輪實際呼叫了什麼——``[{name, args, duration_ms, ok, result_summary}]``，
+        Web meta / session log 用，不參與邏輯。"""
 
         self.history: list[dict[str, str]] = []
         self._pending_user_text = ""
@@ -255,17 +330,120 @@ class LLMThinkStage:
     async def _tokens(
         self, messages: Sequence[Any], turn_id: str, token: CancellationToken
     ) -> AsyncIterator[str]:
+        """LLM token 流，含工具往返。對上游的切句器來說這就是一條連續的文字流。"""
+        self.last_tool_calls = []
+        messages = list(messages)
         first = True
-        stream = self.backend.stream_query(
-            messages, system_instruction=self._system_instruction()
-        )
-        async for piece in stream:
-            token.raise_if_cancelled()
-            if first:
-                if self.tracer is not None:
+        spoke = False
+        rounds = 0
+        system = self._system_instruction()
+
+        while True:
+            kwargs: dict[str, Any] = {}
+            tools_open = bool(self.tools) and self.tool_executor is not None
+            if tools_open and rounds < self.max_tool_rounds:
+                kwargs["tools"] = self.tools
+            calls: list[Any] = []
+            round_text: list[str] = []
+
+            async for piece in self.backend.stream_query(
+                messages, system_instruction=system, **kwargs
+            ):
+                token.raise_if_cancelled()
+                if _is_tool_call(piece):
+                    calls.append(piece)
+                    continue
+                if first:
+                    if self.tracer is not None:
+                        self.tracer.mark(turn_id, MARK_THINK_FIRST_TOKEN)
+                    first = False
+                spoke = True
+                round_text.append(piece)
+                yield piece
+
+            if not calls:
+                return
+
+            rounds += 1
+            # 開口前就決定查工具 → 先講 filler，讓 TTS 有東西做；它也進這則
+            # assistant 訊息的 content，第二段續寫時模型知道自己已經說了什麼
+            filler = ""
+            if not spoke and self.tool_filler:
+                filler = self.tool_filler
+                if first and self.tracer is not None:
                     self.tracer.mark(turn_id, MARK_THINK_FIRST_TOKEN)
                 first = False
-            yield piece
+                spoke = True
+                yield filler
+
+            messages.extend(
+                to_messages(
+                    await self._run_tools(
+                        calls, "".join(round_text) or filler, turn_id, token
+                    )
+                )
+            )
+
+    async def _run_tools(
+        self,
+        calls: Sequence[Any],
+        assistant_text: str,
+        turn_id: str,
+        token: CancellationToken,
+    ) -> list[dict[str, Any]]:
+        """執行工具、組出要接回 messages 的兩種訊息。
+
+        呼叫用 ``tool_call_id`` 配對，每一個 call **都要有對應的 tool 訊息**，
+        少一個 API 會拒絕整段對話——所以 executor 炸了也要回一則錯誤結果。
+        """
+        if self.tracer is not None:
+            self.tracer.mark(turn_id, MARK_TOOL_START)
+        results: list[dict[str, Any]] = [
+            {
+                "role": "assistant",
+                "content": assistant_text,
+                "tool_calls": [
+                    {
+                        "id": c.id,
+                        "type": "function",
+                        "function": {"name": c.name, "arguments": c.arguments or "{}"},
+                    }
+                    for c in calls
+                ],
+            }
+        ]
+        for call in calls:
+            args = _parse_args(call.arguments)
+            t0 = time.perf_counter()
+            try:
+                outcome = await self.tool_executor(call.name, args)
+            except (CancelledError, asyncio.CancelledError):
+                raise
+            except Exception as exc:  # noqa: BLE001 - 單一工具失敗不該拖垮整輪
+                outcome = {"success": False, "result": f"{type(exc).__name__}: {exc}"}
+            token.raise_if_cancelled()
+            duration_ms = (time.perf_counter() - t0) * 1000
+            text = str(outcome.get("result", ""))
+            self.last_tool_calls.append(
+                {
+                    "name": call.name,
+                    "args": args,
+                    "ok": bool(outcome.get("success")),
+                    "duration_ms": round(duration_ms, 1),
+                    "result_summary": text[:200],
+                }
+            )
+            results.append(
+                {
+                    "role": "tool",
+                    "content": text or "(no result)",
+                    "tool_call_id": call.id,
+                    "tool_name": call.name,
+                }
+            )
+        if self.tracer is not None:
+            self.tracer.mark(turn_id, MARK_TOOL_DONE, overwrite=True)
+        return results
 
     def _system_instruction(self) -> str | None:
         """組出這一輪的 system prompt。
@@ -347,6 +525,8 @@ class LLMThinkStage:
 
 
 __all__ = [
+    "DEFAULT_TOOL_FILLER",
+    "ToolExecutor",
     "StreamingBackend",
     "LLMThinkStage",
     "EchoBackend",

@@ -70,6 +70,10 @@ MARK_MEMORY_DONE = "memory_done"
 """Memory retrieve 起訖。§7.4 定案與 LLM prefill 平行，
 所以 memory_done 晚於 think_first_token 是**正常的**，不是異常。"""
 
+MARK_TOOL_START = "tool_start"
+MARK_TOOL_DONE = "tool_done"
+"""工具呼叫（記憶 deep_recall / force_remember）的區間。多次往返只記第一次開始、
+最後一次結束——報告要的是「這輪被工具吃掉多久」。"""
 MARK_THINK_FIRST_TOKEN = "think_first_token"
 """LLM 吐出第一個 token。"""
 
@@ -151,6 +155,7 @@ class TurnTrace:
         return {
             "stt": self.span_ms(MARK_SPEECH_END, MARK_INPUT_FINAL),
             "memory": self.span_ms(MARK_MEMORY_START, MARK_MEMORY_DONE),
+            "tool": self.span_ms(MARK_TOOL_START, MARK_TOOL_DONE),
             "llm_first_token": self.span_ms(MARK_INPUT_FINAL, MARK_THINK_FIRST_TOKEN),
             "llm_first_sentence": self.span_ms(
                 MARK_INPUT_FINAL, MARK_THINK_FIRST_SENTENCE
@@ -208,13 +213,18 @@ class LatencyTracer:
     def get(self, turn_id: str) -> TurnTrace | None:
         return self._traces.get(turn_id)
 
-    def mark(self, turn_id: str, name: str, at: float | None = None) -> None:
+    def mark(
+        self, turn_id: str, name: str, at: float | None = None, *, overwrite: bool = False
+    ) -> None:
         """打點。**同一個名稱只記第一次**——``think_first_token`` 這類
-        「首次」語意的打點，重複呼叫必須不覆蓋。"""
+        「首次」語意的打點，重複呼叫必須不覆蓋。
+
+        ``overwrite=True`` 給「最後一次」語意的打點用（``tool_done``：
+        多次工具往返要記最後一次結束）。"""
         trace = self._traces.get(turn_id)
         if trace is None:
             trace = self.start(turn_id)
-        if name in trace.marks:
+        if name in trace.marks and not overwrite:
             return
         trace.marks[name] = at if at is not None else time.perf_counter()
 
@@ -279,6 +289,7 @@ class LatencyTracer:
         rows = [
             ("STT 最終轉錄", "stt", "stt"),
             ("Memory retrieve", "memory", "memory"),
+            ("工具呼叫", "tool", None),
             ("LLM 首 token", "llm_first_token", None),
             ("LLM 首句", "llm_first_sentence", "llm_first_sentence"),
             ("TTS 首段", "tts_first_chunk", "tts_first_chunk"),

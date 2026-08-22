@@ -1,7 +1,8 @@
 """Memory adapter：Echo Memory（Phase 4a）。
 
 **這是唯一 import echo_memory 的地方**，其餘程式碼只認
-:class:`EchoMemoryAdapter` 的三個方法（retrieve / store / set_session）。
+:class:`EchoMemoryAdapter` 的幾個方法（retrieve / store / set_session /
+tool_definitions / execute_tool）。
 
 ## 為什麼是 adapter 而不是直接用 MemoryEngine
 
@@ -49,6 +50,14 @@ DEFAULT_MAX_CHARS = 500
 DEFAULT_MIN_MATCH = 0.45
 """檢索相似度下限。echo_memory 預設 0.3，實測 35-41% 的匹配是純雜訊
 （「攀岩」撈出「深藍色」），注入只會讓 LLM 亂講。"""
+DEFAULT_TOOLS = "deep_recall,force_remember"
+"""預設開放給 LLM 的記憶工具（ECHO_STREAM_MEMORY_TOOLS，逗號分隔，``off`` 關閉）。
+echo_memory 有四個：deep_recall（純讀）、force_remember（寫一筆高顯著性 episode）、
+adjust_importance（改既有 episode 的 salience）、trigger_dream（觸發鞏固）。
+後兩個讓模型自主決定風險高，預設不給——要開自己寫進 .env。"""
+DEFAULT_TOOL_MAX_CHARS = 1500
+"""工具結果回給 LLM 的字數上限。deep_recall 的 top_k 可到 20、門檻比自動注入鬆
+（0.2 vs 0.45），不截會把第二段續寫的 prompt 塞爆。"""
 ASSESS_MODES = ("llm", "heuristic", "off")
 """salience 評估模式（ECHO_STREAM_MEMORY_ASSESS）：
 llm = SubconsciousAssessor 打一次 LLM（背景，不在熱路徑）；
@@ -156,6 +165,15 @@ class EchoMemoryAdapter:
         )
         self._session_id: str | None = None
         self.load_seconds: float | None = None
+        self._tool_executor: Any = None
+        self.tool_max_chars = int(
+            config.get("ECHO_STREAM_MEMORY_TOOL_MAX_CHARS", str(DEFAULT_TOOL_MAX_CHARS))
+        )
+        raw_tools = config.get("ECHO_STREAM_MEMORY_TOOLS", DEFAULT_TOOLS) or DEFAULT_TOOLS
+        self.enabled_tools: list[str] = (
+            [] if raw_tools.strip().lower() in ("off", "none", "false", "0")
+            else [t.strip() for t in raw_tools.split(",") if t.strip()]
+        )
 
     @property
     def engine(self) -> Any:
@@ -179,6 +197,63 @@ class EchoMemoryAdapter:
         """換會話。之後的 retrieve 會排除這個會話的 episodes（防自我回聲），
         store 會把 episodes 標上這個 session_id。"""
         self._session_id = session_id
+        self._tool_executor = None  # echo_memory 的 ToolExecutor 綁 session_id，換會話重建
+
+    # --- 工具呼叫（C 段）---
+
+    def tool_definitions(self) -> list[dict[str, Any]]:
+        """開放給 LLM 的工具，OpenAI function schema。空列表 = 不給工具。
+
+        schema 來自 echo_memory 的 ``TOOL_DECLARATIONS``（它是 Gemini 格式的 dict，
+        欄位剛好與 OpenAI 的 function 一致，只差外面要包一層 ``type: function``）。
+        """
+        if not self.enabled_tools:
+            return []
+        try:
+            from llm_integration.tools.definitions import TOOL_DECLARATIONS
+        except ImportError as exc:
+            logger.warning("echo_memory 沒有 llm_integration.tools——工具停用：%s", exc)
+            return []
+        known = {d["name"]: d for d in TOOL_DECLARATIONS}
+        out = []
+        for name in self.enabled_tools:
+            decl = known.get(name)
+            if decl is None:
+                logger.warning(
+                    "ECHO_STREAM_MEMORY_TOOLS 裡的 %r 不是 echo_memory 的工具，略過", name
+                )
+                continue
+            out.append({"type": "function", "function": dict(decl)})
+        return out
+
+    @property
+    def tool_executor(self) -> Any:
+        """echo_memory 的 ToolExecutor，lazy、綁當前 session。"""
+        if self._tool_executor is None:
+            from llm_integration.tools.executor import ToolExecutor
+
+            self._tool_executor = ToolExecutor(
+                self.engine, session_id=self._session_id or "unknown"
+            )
+        return self._tool_executor
+
+    async def execute_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        """給 LLMThinkStage 的 ``tool_executor``。
+
+        白名單再擋一次——schema 只給了兩個，模型照理叫不出別的，
+        但「照理」不是防線。結果截到 ``tool_max_chars``。
+        """
+        if name not in self.enabled_tools:
+            return {"success": False, "result": f"Tool {name!r} is not available."}
+
+        def _work() -> dict[str, Any]:
+            outcome = self.tool_executor.execute(name, dict(args))
+            text = str(outcome.get("result", ""))
+            if len(text) > self.tool_max_chars:
+                outcome = {**outcome, "result": text[: self.tool_max_chars] + "…"}
+            return outcome
+
+        return await asyncio.get_running_loop().run_in_executor(None, _work)
 
     # --- 管線介面 ---
 

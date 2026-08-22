@@ -301,6 +301,7 @@
         </div>
       </div>
       <div class="hint" id="cfg-mem-hint" style="display:none"></div>
+      <div class="hint" id="cfg-tool-stats"></div>
 
       <div class="apply-row">
         <button id="cfg-apply">套用</button>
@@ -314,7 +315,7 @@
 const FRAME = { AUDIO: 1, META: 2, ERROR: 3, TEXT: 4, UTTER: 5, EVENT: 6 };
 const BUDGET = { stt: 700, memory: 300, llm_first_sentence: 800, tts_first_chunk: 1800, ttfa: 3500 };
 const LABEL = {
-  stt: "STT 最終轉錄", memory: "Memory retrieve",
+  stt: "STT 最終轉錄", memory: "Memory retrieve", tool: "工具呼叫",
   llm_first_token: "LLM 首 token", llm_first_sentence: "LLM 首句",
   tts_first_chunk: "TTS 首段", ttfa: "TTFA", total: "總時長",
 };
@@ -404,7 +405,7 @@ function verdict(key, value) {
 
 function renderReport(meta) {
   const seg = meta.segments_ms || {};
-  const rows = ["stt", "memory", "llm_first_token", "llm_first_sentence", "tts_first_chunk"]
+  const rows = ["stt", "memory", "tool", "llm_first_token", "llm_first_sentence", "tts_first_chunk"]
     .filter(k => seg[k] != null)
     .map(k => `<tr><td>${LABEL[k]}</td>
                    <td class="num">${Math.round(seg[k])}ms</td>
@@ -440,7 +441,51 @@ function renderReport(meta) {
       <summary class="muted" style="font-size:12px;cursor:pointer">🧠 本輪注入的記憶</summary>
       <pre style="font-size:11px;white-space:pre-wrap;margin:6px 0 0">${
         escapeHtml(meta.memory_injected)}</pre>
-    </details>` : ""}`;
+    </details>` : ""}
+    ${(meta.tool_calls || []).map(renderToolCall).join("")}`;
+  addToolMarkers(meta.tool_calls || []);
+}
+
+const TOOL_ICON = { deep_recall: "🔍", force_remember: "📌", adjust_importance: "⚖️", trigger_dream: "💤" };
+
+function renderToolCall(c) {
+  const icon = TOOL_ICON[c.name] || "🔧";
+  return `<details style="margin-top:6px">
+      <summary class="muted" style="font-size:12px;cursor:pointer">${icon} ${c.name}
+        ${c.ok ? "" : '<span class="bad">失敗</span>'} · ${Math.round(c.duration_ms)}ms</summary>
+      <pre style="font-size:11px;white-space:pre-wrap;margin:6px 0 0">${
+        escapeHtml(JSON.stringify(c.args))}
+→ ${escapeHtml(c.result_summary || "")}</pre>
+    </details>`;
+}
+
+// 句子串底下掛一列小標記：這輪她查了什麼。點開看參數與結果摘要。
+function addToolMarkers(calls) {
+  if (!calls.length) return;
+  const box = $("sentences");
+  const el = document.createElement("div");
+  el.className = "sent tools";
+  el.innerHTML = `<span class="idx">🔧</span><span class="ms"></span><span>` +
+    calls.map(c => `<details style="display:inline-block;margin-right:8px">
+        <summary style="cursor:pointer;list-style:none">${TOOL_ICON[c.name] || "🔧"} ${c.name}</summary>
+        <pre style="font-size:11px;white-space:pre-wrap;margin:4px 0 0">${
+          escapeHtml(JSON.stringify(c.args))}
+→ ${escapeHtml(c.result_summary || "")}</pre>
+      </details>`).join("") + `</span>`;
+  box.appendChild(el);
+  calls.forEach(c => { toolTally[c.name] = (toolTally[c.name] || 0) + 1; });
+  renderToolStats();
+}
+
+let toolTally = {};
+let toolsEnabled = [];
+function renderToolStats() {
+  const el = $("cfg-tool-stats");
+  if (!el) return;
+  if (!toolsEnabled.length) { el.textContent = "工具：未開放"; return; }
+  const counts = toolsEnabled.map(n =>
+    `${TOOL_ICON[n] || "🔧"} ${n} ×${toolTally[n] || 0}`).join("　");
+  el.textContent = "工具（本次 serve 累計）：" + counts;
 }
 
 function escapeHtml(s) {
@@ -876,6 +921,9 @@ async function loadConfig() {
       if (c.memory.top_k != null) $("cfg-mem-topk").value = c.memory.top_k;
       if (c.memory.max_chars != null) $("cfg-mem-chars").value = c.memory.max_chars;
       if (c.memory.min_match != null) $("cfg-mem-match").value = c.memory.min_match;
+      toolsEnabled = c.memory.tools || [];
+      toolTally = Object.assign({}, c.memory.tool_calls_total || {});
+      renderToolStats();
     } else {
       $("cfg-mem-section").style.display = "none";
       const hint = $("cfg-mem-hint");

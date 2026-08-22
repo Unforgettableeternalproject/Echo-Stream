@@ -186,6 +186,8 @@ class StreamService:
 
         self._memory = None
         """EchoMemoryAdapter。旁路——建不起來只停用記憶，不擋管線。"""
+        self._tool_counts: dict[str, int] = {}
+        """本次 serve 期間各工具被呼叫的次數——面板累計顯示用。"""
         self._memory_enabled = True
         """面板開關。關掉 = 不 retrieve、不注入、不 store；
         adapter 與 engine 留著（重載要數十秒），開回來立即生效。"""
@@ -355,6 +357,7 @@ class StreamService:
                 )
             self._think.memory = memory
             self._memory = memory
+            self._attach_tools(memory)
             await self._refresh_profile()
             self._start_dream_scheduler(memory)
         except Exception as exc:  # noqa: BLE001
@@ -373,6 +376,27 @@ class StreamService:
         if text != getattr(self._think, "profile", ""):
             self._think.profile = text
             self._log({"type": "profile", "chars": len(text), "text": text})
+
+    def _attach_tools(self, memory: Any) -> None:
+        """把記憶工具（deep_recall / force_remember）掛上 think stage。
+
+        schema 與 executor 都來自 adapter；think stage 只認「工具列表 + 一個
+        async callable」，不知道背後是 echo_memory。filler 文案走設定，
+        但**不得含可被推翻的記憶斷言**（見 think_llm 模組 docstring）。
+        """
+        defs = memory.tool_definitions()
+        if not defs:
+            self._think.tools = []
+            self._think.tool_executor = None
+            return
+        self._think.tools = defs
+        self._think.tool_executor = memory.execute_tool
+        filler = config.get("ECHO_STREAM_TOOL_FILLER")
+        if filler is not None and filler.strip().lower() in ("off", "none", ""):
+            self._think.tool_filler = None
+        elif filler:
+            self._think.tool_filler = filler
+        self._log({"type": "tools", "enabled": [d["function"]["name"] for d in defs]})
 
     def _start_dream_scheduler(self, memory: Any) -> None:
         """門檻走 .env：ECHO_STREAM_DREAM_{IDLE_MINUTES,MIN_PENDING,DAYDREAM_PENDING}。"""
@@ -471,6 +495,10 @@ class StreamService:
                 "top_k": getattr(self._memory, "top_k", None),
                 "max_chars": getattr(self._memory, "max_chars", None),
                 "min_match": getattr(self._memory, "min_match", None),
+                "tools": [
+                    d["function"]["name"] for d in getattr(self._think, "tools", []) or []
+                ],
+                "tool_calls_total": dict(self._tool_counts),
             },
         }
 
@@ -566,6 +594,8 @@ class StreamService:
                 self._memory_enabled = enabled
                 if hasattr(self._think, "memory"):
                     self._think.memory = self._memory if enabled else None
+                    # 工具跟著記憶開關走——記憶關了還讓模型 deep_recall 沒道理
+                    self._think.tools = self._memory.tool_definitions() if enabled else []
                 changed["enabled"] = enabled
             if "top_k" in memory:
                 self._memory.top_k = max(1, int(memory["top_k"]))
@@ -1059,10 +1089,14 @@ class StreamService:
             "split_reasons": dict(trace.split_reasons) if trace else {},
             "audio_seconds": round(sink.written_duration_s, 2),
             "memory_injected": getattr(self._think, "last_injected_memory", None),
+            "tool_calls": list(getattr(self._think, "last_tool_calls", []) or []),
             "report": self.tracer.report(turn_id),
         }
         emit(json_frame(FRAME_META, meta))
         self._log({"type": "turn", "input": utterance.text, **meta})
+        for call in meta["tool_calls"]:
+            self._tool_counts[call["name"]] = self._tool_counts.get(call["name"], 0) + 1
+            self._log({"type": "tool_call", "turn_id": turn_id, **call})
         # 每輪落地一次——server 掛掉最多丟正在跑的那一輪，不會丟整個會話
         self._save_active_session()
 

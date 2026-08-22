@@ -266,3 +266,72 @@ async def test_judge_關閉時不呼叫(fake_affect, monkeypatch):
     adapter = EchoMemoryAdapter(engine=engine, llm_fn=lambda p: "{}")
     await adapter.store("問", "答")
     assert engine.stored[0]["salience"] == 0.82 and "judge" not in engine.stored[0]
+
+
+# --- 工具呼叫（C 段）---
+
+
+@pytest.fixture
+def fake_tools(monkeypatch):
+    """假的 echo_memory llm_integration.tools：三個 schema + 記錄呼叫的 executor。"""
+    calls: list = []
+    decls = [
+        {"name": "deep_recall", "description": "d", "parameters": {"type": "object"}},
+        {"name": "force_remember", "description": "f", "parameters": {"type": "object"}},
+        {"name": "trigger_dream", "description": "t", "parameters": {"type": "object"}},
+    ]
+
+    class ToolExecutor:
+        def __init__(self, engine, session_id, dream_cooldown_turns=5):
+            self.engine = engine
+            self.session_id = session_id
+
+        def execute(self, name, args):
+            calls.append((self.session_id, name, args))
+            return {"success": True, "result": "R" * 3000}
+
+    mods = {
+        "llm_integration": types.ModuleType("llm_integration"),
+        "llm_integration.tools": types.ModuleType("llm_integration.tools"),
+        "llm_integration.tools.definitions": types.ModuleType("x"),
+        "llm_integration.tools.executor": types.ModuleType("x"),
+    }
+    mods["llm_integration.tools.definitions"].TOOL_DECLARATIONS = decls
+    mods["llm_integration.tools.executor"].ToolExecutor = ToolExecutor
+    for name, mod in mods.items():
+        monkeypatch.setitem(sys.modules, name, mod)
+    return calls
+
+
+def test_tool_definitions_預設只開兩個且包成openai格式(fake_tools, monkeypatch):
+    monkeypatch.delenv("ECHO_STREAM_MEMORY_TOOLS", raising=False)
+    adapter = EchoMemoryAdapter(_Engine(_Ctx()))
+    defs = adapter.tool_definitions()
+    assert [d["function"]["name"] for d in defs] == ["deep_recall", "force_remember"]
+    assert all(d["type"] == "function" for d in defs)
+
+
+def test_tool_definitions_可用設定關閉或擴充(fake_tools, monkeypatch):
+    monkeypatch.setenv("ECHO_STREAM_MEMORY_TOOLS", "off")
+    assert EchoMemoryAdapter(_Engine(_Ctx())).tool_definitions() == []
+    monkeypatch.setenv("ECHO_STREAM_MEMORY_TOOLS", "deep_recall, trigger_dream, nope")
+    names = [d["function"]["name"] for d in EchoMemoryAdapter(_Engine(_Ctx())).tool_definitions()]
+    assert names == ["deep_recall", "trigger_dream"]
+
+
+async def test_execute_tool_綁session_擋白名單_截結果(fake_tools, monkeypatch):
+    monkeypatch.delenv("ECHO_STREAM_MEMORY_TOOLS", raising=False)
+    monkeypatch.setenv("ECHO_STREAM_MEMORY_TOOL_MAX_CHARS", "100")
+    adapter = EchoMemoryAdapter(_Engine(_Ctx()))
+    adapter.set_session("s1")
+
+    out = await adapter.execute_tool("deep_recall", {"query": "貓"})
+    assert out["success"] and len(out["result"]) == 101
+    assert fake_tools == [("s1", "deep_recall", {"query": "貓"})]
+
+    denied = await adapter.execute_tool("trigger_dream", {})
+    assert denied["success"] is False and len(fake_tools) == 1
+
+    adapter.set_session("s2")
+    await adapter.execute_tool("force_remember", {"content": "x"})
+    assert fake_tools[-1][0] == "s2", "換會話後 executor 重建"

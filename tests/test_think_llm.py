@@ -428,3 +428,170 @@ async def test_profile_空字串不加區塊():
     stage.profile = ""
     await collect(stage)
     assert backend.last_system == "人設"
+
+
+# --- 工具呼叫（C 段）---
+
+
+class _Call:
+    """模仿 SessionControl 的 ToolCall 事件——think stage 只看形狀。"""
+
+    def __init__(self, id: str, name: str, arguments: str) -> None:
+        self.id = id
+        self.name = name
+        self.arguments = arguments
+
+
+def _d(m: Any) -> dict[str, Any]:
+    """messages 在有 echo_thought_core 時是 pydantic Message、沒有時是 dict——測試兩邊都要過。"""
+    if isinstance(m, dict):
+        return m
+    out = {"role": m.role, "content": m.content}
+    if m.tool_call_id:
+        out["tool_call_id"] = m.tool_call_id
+        out["tool_name"] = m.tool_name
+    if m.metadata.get("tool_calls"):
+        out["tool_calls"] = m.metadata["tool_calls"]
+    return out
+
+
+class ToolBackend:
+    """第一段：（可選文字後）提出工具呼叫；收到 tool 結果後第二段吐續寫。"""
+
+    def __init__(
+        self,
+        call: _Call | None = None,
+        preface: str = "",
+        final: str = "你上次說你養了一隻叫小黑的貓。",
+        call_again: bool = False,
+    ) -> None:
+        self.call = call or _Call("call_1", "deep_recall", '{"query": "貓"}')
+        self.preface = preface
+        self.final = final
+        self.call_again = call_again
+        self.requests: list[dict[str, Any]] = []
+
+    async def stream_query(
+        self, messages: Sequence[Any], system_instruction: str | None = None, **kwargs
+    ) -> AsyncIterator[Any]:
+        self.requests.append({"messages": list(messages), **kwargs})
+        has_tool_result = any(_d(m)["role"] == "tool" for m in messages)
+        if "tools" in kwargs and (not has_tool_result or self.call_again):
+            for ch in self.preface:
+                yield ch
+            yield self.call
+            return
+        for ch in self.final:
+            yield ch
+
+
+def _executor(log: list, result: str = "找到：使用者養了一隻貓叫小黑"):
+    async def run(name: str, args: dict) -> dict:
+        log.append((name, args))
+        return {"success": True, "result": result}
+
+    return run
+
+
+async def test_工具往返_先filler後續寫_結果接回第二段():
+    log: list = []
+    backend = ToolBackend()
+    stage = LLMThinkStage(
+        backend, tools=[{"type": "function", "function": {"name": "deep_recall"}}],
+        tool_executor=_executor(log), tool_filler="嗯，讓我想一下。",
+    )
+    texts = [s.text for s in await collect(stage, "我的貓叫什麼")]
+
+    assert texts[0] == "嗯，讓我想一下。", "開口前就查工具 → filler 先出"
+    assert "".join(texts[1:]) == "你上次說你養了一隻叫小黑的貓。"
+    assert log == [("deep_recall", {"query": "貓"})]
+
+    assert "tools" in backend.requests[0]
+    second = [_d(m) for m in backend.requests[1]["messages"]]
+    assert second[-2]["role"] == "assistant"
+    assert second[-2]["content"] == "嗯，讓我想一下。", "filler 進 assistant 訊息，模型知道自己說過"
+    assert second[-2]["tool_calls"][0]["id"] == "call_1"
+    assert second[-1] == {
+        "role": "tool", "content": "找到：使用者養了一隻貓叫小黑",
+        "tool_call_id": "call_1", "tool_name": "deep_recall",
+    }
+    assert stage.last_tool_calls[0]["name"] == "deep_recall"
+    assert stage.last_tool_calls[0]["ok"] is True
+    assert stage.last_tool_calls[0]["args"] == {"query": "貓"}
+
+
+async def test_模型已開口則不插filler():
+    backend = ToolBackend(preface="好的，")
+    stage = LLMThinkStage(
+        backend, tools=[{"x": 1}], tool_executor=_executor([]),
+    )
+    texts = "".join(s.text for s in await collect(stage))
+    assert texts.startswith("好的，")
+    assert "讓我想一下" not in texts
+    assert _d(backend.requests[1]["messages"][-2])["content"] == "好的，"
+
+
+async def test_沒給工具時請求不帶tools():
+    backend = FakeBackend()
+    stage = LLMThinkStage(backend)
+    await collect(stage)
+    assert stage.last_tool_calls == []
+
+
+async def test_超過最大往返就收回tools():
+    backend = ToolBackend(call_again=True)
+    stage = LLMThinkStage(
+        backend, tools=[{"x": 1}], tool_executor=_executor([]), max_tool_rounds=2,
+    )
+    texts = "".join(s.text for s in await collect(stage))
+    assert texts.endswith("你上次說你養了一隻叫小黑的貓。")
+    assert len(backend.requests) == 3
+    assert "tools" in backend.requests[0] and "tools" in backend.requests[1]
+    assert "tools" not in backend.requests[2], "第三段不帶 tools，逼模型回答"
+    assert len(stage.last_tool_calls) == 2
+
+
+async def test_executor炸了回錯誤結果不斷鏈():
+    async def boom(name, args):
+        raise RuntimeError("engine down")
+
+    backend = ToolBackend()
+    stage = LLMThinkStage(backend, tools=[{"x": 1}], tool_executor=boom)
+    texts = "".join(s.text for s in await collect(stage))
+    assert "小黑" in texts
+    tool_msg = _d(backend.requests[1]["messages"][-1])
+    assert tool_msg["role"] == "tool" and "engine down" in tool_msg["content"]
+    assert stage.last_tool_calls[0]["ok"] is False
+
+
+async def test_壞掉的arguments退成空dict():
+    log: list = []
+    backend = ToolBackend(call=_Call("c", "deep_recall", "{not json"))
+    stage = LLMThinkStage(backend, tools=[{"x": 1}], tool_executor=_executor(log))
+    await collect(stage)
+    assert log == [("deep_recall", {})]
+
+
+async def test_工具往返不進跨輪歷史():
+    backend = ToolBackend()
+    stage = LLMThinkStage(backend, tools=[{"x": 1}], tool_executor=_executor([]))
+    await collect(stage, "我的貓")
+    await stage.commit("t", "嗯，讓我想一下。你上次說你養了一隻叫小黑的貓。", "")
+    assert [m["role"] for m in stage.history] == ["user", "assistant"]
+
+
+async def test_工具區間有打點():
+    from echo_stream.core.tracer import MARK_TOOL_DONE, MARK_TOOL_START
+
+    tracer = LatencyTracer()
+    backend = ToolBackend()
+    stage = LLMThinkStage(
+        backend, tools=[{"x": 1}], tool_executor=_executor([]), tracer=tracer,
+    )
+    utt = Utterance(text="貓")
+    tracer.start(utt.turn_id)
+    _ = [s async for s in stage.stream(utt, CancellationToken())]
+    trace = tracer.get(utt.turn_id)
+    assert MARK_TOOL_START in trace.marks and MARK_TOOL_DONE in trace.marks
+    assert trace.segments_ms()["tool"] is not None
+    assert MARK_THINK_FIRST_TOKEN in trace.marks, "filler 算首 token"
