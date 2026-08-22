@@ -290,3 +290,26 @@ async def test_未閉合括號不會永久卡死切分():
     )
     result = await collect("他提到《某本書，內容還不錯。之後再說。", policy)
     assert len(result) == 2  # 兩個句號各切一次，沒有被括號深度擋住
+
+
+async def test_FLUSH_訊號強制切句_不看長度下限():
+    from echo_stream.core.splitter import FLUSH
+
+    async def toks():
+        for t in ["嗯，", "讓我想一下。", FLUSH, "你上次說你養了一隻叫小黑的貓。"]:
+            yield t
+
+    out = [s async for s in SentenceSplitter(SplitPolicy(first_min_weight=8.0)).split(toks(), "t")]
+    assert [s.text for s in out][:2] == ["嗯，讓我想一下。", "你上次說你養了一隻叫小黑的貓。"]
+    assert out[0].split_reason == "flush" and out[0].index == 0 and out[1].index == 1
+
+
+async def test_FLUSH_空buffer不產生空句():
+    from echo_stream.core.splitter import FLUSH
+
+    async def toks():
+        for t in [FLUSH, "好。"]:
+            yield t
+
+    out = [s async for s in SentenceSplitter(SplitPolicy()).split(toks(), "t")]
+    assert [s.text for s in out if s.text] == ["好。"]

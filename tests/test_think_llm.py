@@ -615,3 +615,18 @@ async def test_有工具時_system_prompt_帶使用指引_接在profile後():
     plain = FakeBackend()
     await collect(LLMThinkStage(plain, system_prompt="人設"))
     assert TOOLS_PROMPT not in plain.last_system
+
+
+async def test_filler_短於首句下限也立刻成句():
+    """面板把首句下限調到 8 時，權重 6 的 filler 不能被扣在 buffer 裡等第二段。"""
+    backend = ToolBackend()
+    stage = LLMThinkStage(
+        backend, tools=[{"x": 1}], tool_executor=_executor([]),
+        tool_filler="嗯，讓我想一下。",
+        split_policy=SplitPolicy(first_min_weight=8.0, first_max_weight=20.0),
+    )
+    sentences = await collect(stage, "貓")
+    assert sentences[0].text == "嗯，讓我想一下。"
+    assert sentences[0].split_reason == "flush"
+    assert sentences[0].is_first
+    assert "讓我想一下" not in "".join(x.text for x in sentences[1:])

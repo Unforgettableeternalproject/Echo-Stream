@@ -55,7 +55,7 @@ from ..contracts.cancellation import CancellationToken, CancelledError
 from ..contracts.style import SpeechStyle
 from ..contracts.types import Sentence, Utterance
 from ..core.emotion import MARKER_PROMPT, extract_style
-from ..core.splitter import SentenceSplitter, SplitPolicy
+from ..core.splitter import FLUSH, SentenceSplitter, SplitPolicy
 from ..core.tracer import (
     MARK_MEMORY_DONE,
     MARK_MEMORY_START,
@@ -390,6 +390,9 @@ class LLMThinkStage:
                 first = False
                 spoke = True
                 yield filler
+                # 逼切句器立刻放出 filler——它通常短於首句下限，不逼就會被扣到
+                # 第二段 token 回來，filler 形同沒講
+                yield FLUSH
 
             messages.extend(
                 to_messages(
