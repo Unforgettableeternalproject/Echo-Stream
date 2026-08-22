@@ -66,9 +66,9 @@ def test_pcm_轉成可播的_wav():
 
 
 @pytest.fixture
-def server():
-    """起一個跑 fake 管線的 server。"""
-    service = StreamService(use_real_tts=False, use_real_llm=False)
+def server(tmp_path):
+    """起一個跑 fake 管線的 server。log 走 tmp_path，不污染 outputs/web_logs。"""
+    service = StreamService(use_real_tts=False, use_real_llm=False, log_dir=tmp_path)
     service.prepare()
 
     handler = type("H", (_Handler,), {"service": service})
@@ -405,9 +405,11 @@ class StubStore:
 
 
 @pytest.fixture
-def session_server():
+def session_server(tmp_path):
     """帶 StubStore 的 fake 管線 server。"""
-    service = StreamService(use_real_tts=False, use_real_llm=False, store=StubStore())
+    service = StreamService(
+        use_real_tts=False, use_real_llm=False, store=StubStore(), log_dir=tmp_path
+    )
     service.prepare()
 
     handler = type("H", (_Handler,), {"service": service})

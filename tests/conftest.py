@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import pytest
 
@@ -94,4 +95,31 @@ async def sentence_stream(
             is_first=i == 0,
             is_last=i == len(texts) - 1,
             style=style,
+        )
+
+
+# ─── 守門：測試不得往 outputs/ 寫東西 ──────────────────────────────
+# outputs/web_logs 是真對話的分析材料；pytest 每跑一次噴一批 session_*.jsonl
+# 進去，艾斯維爾得手動清（2026-08-22）。任何新測試若建 StreamService 忘了傳
+# log_dir=tmp_path，這裡會直接 fail 而不是默默污染。
+
+_OUTPUTS = Path(__file__).resolve().parents[1] / "outputs"
+
+
+def _outputs_snapshot() -> set[Path]:
+    return set(_OUTPUTS.rglob("*")) if _OUTPUTS.exists() else set()
+
+
+@pytest.fixture(autouse=True)
+def _no_writes_to_outputs():
+    before = _outputs_snapshot()
+    yield
+    leaked = sorted(p for p in _outputs_snapshot() - before if p.is_file())
+    if leaked:
+        for p in leaked:
+            p.unlink(missing_ok=True)
+        names = ", ".join(p.name for p in leaked[:5])
+        pytest.fail(
+            f"測試往 outputs/ 寫了 {len(leaked)} 個檔（已清掉）：{names} —— "
+            "StreamService 要傳 log_dir=tmp_path"
         )

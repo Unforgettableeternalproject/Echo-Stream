@@ -177,6 +177,7 @@ class StreamService:
         system_prompt: str = "",
         trace_path: str | None = None,
         store: Any | None = None,
+        log_dir: str | Path | None = None,
     ) -> None:
         self.use_real_tts = use_real_tts
         self.use_real_llm = use_real_llm
@@ -207,8 +208,10 @@ class StreamService:
 
         # 每次啟動自動開一個 session log（JSONL，逐 turn 一筆）——
         # 測試結果要能事後分析，不能只活在瀏覽器畫面上。
+        # log_dir 可注入：測試要走 tmp_path，不然每跑一次 pytest 就在
+        # outputs/web_logs 噴一批垃圾（艾斯維爾 2026-08-22 抱怨過）。
         session_tag = time.strftime("%Y%m%d_%H%M%S")
-        log_dir = Path(__file__).parents[2] / "outputs" / "web_logs"
+        log_dir = Path(log_dir) if log_dir else Path(__file__).parents[2] / "outputs" / "web_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         self.log_path: Path = log_dir / f"session_{session_tag}.jsonl"
         if trace_path is None:
