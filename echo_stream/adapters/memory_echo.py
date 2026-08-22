@@ -180,6 +180,18 @@ class EchoMemoryAdapter:
                 min_similarity=self.min_match,
                 exclude_session_id=self._session_id,
             )
+            # 第二道門檻：EcphoryRAG 圖擴散出來的 episode 在 similarity_to_query
+            # 回 None 時不會被 min_similarity 擋（2026-08-22 實測注入了 30-36%
+            # 的東西）。顯示給 LLM 的匹配度必須是真的過了門檻的。
+            sims = getattr(context, "similarities", {}) or {}
+            kept = [
+                ep for ep in context.episodes
+                if sims.get(ep.id, 0.0) >= self.min_match
+            ]
+            if len(kept) != len(context.episodes):
+                logger.info("memory retrieve：圖擴散漏過門檻，丟棄 %d 筆",
+                            len(context.episodes) - len(kept))
+                context.episodes = kept
             if context.is_empty():
                 return None
             rendered = context.to_text()
