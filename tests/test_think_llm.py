@@ -307,14 +307,22 @@ async def test_標記關閉時不動_prompt_也不解析():
     assert any("[開心]" in s.text for s in sentences)
 
 
-async def test_無標記的句子退回_default_style():
+async def test_無標記的後續句沿用上一個標記_neutral才回default():
     default = SpeechStyle(emotion={"calm": 0.5}, speed=1.1)
-    backend = FakeBackend(response="[開心]第一句有標記喔！後面這句就沒有標記了。")
-    stage = LLMThinkStage(backend, emotion_markers=True, default_style=default)
+    backend = FakeBackend(
+        response="[開心]第一句有標記喔！後面這句就沒有標記了。[neutral]這句回到預設。"
+    )
+    stage = LLMThinkStage(
+        backend, emotion_markers=True, default_style=default,
+        split_policy=SplitPolicy(first_min_weight=3, first_max_weight=12, min_weight=3),
+    )
     sentences = await collect(stage)
     assert sentences[0].style.emotion.get("happy", 0) > 0
     assert sentences[0].style.speed == 1.1  # base 的語速被保留
+    assert sentences[1].style is sentences[0].style, "沒新標記就沿用"
+    assert sentences[1].metadata.get("emotion_carried") is True
     assert sentences[-1].style is default
+    assert sentences[-1].text == "這句回到預設。"
 
 
 async def test_列表符號從句首剝除():
@@ -630,3 +638,25 @@ async def test_filler_短於首句下限也立刻成句():
     assert sentences[0].split_reason == "flush"
     assert sentences[0].is_first
     assert "讓我想一下" not in "".join(x.text for x in sentences[1:])
+
+
+async def test_標記的情緒延續到同段被切出的後續句():
+    backend = FakeBackend(
+        "[開心]太好了，成功了，我們做到了！然後呢，[難過]可是他走了，再也不回來。"
+    )
+    stage = LLMThinkStage(
+        backend, emotion_markers=True,
+        split_policy=SplitPolicy(
+            first_min_weight=3, first_max_weight=8, min_weight=3, max_weight=8
+        ),
+    )
+    sentences = await collect(stage)
+    markers = [s.metadata.get("emotion_marker") for s in sentences]
+    assert markers[0] == "happy"
+    assert "sad" in markers
+    # happy 段被切成多句：第二句沒標記但沿用 happy，並標成 carried
+    first_sad = markers.index("sad")
+    assert all(m == "happy" for m in markers[:first_sad])
+    assert any(s.metadata.get("emotion_carried") for s in sentences[:first_sad])
+    assert sentences[0].metadata.get("emotion_carried") is None
+    assert all("[" not in s.text for s in sentences)

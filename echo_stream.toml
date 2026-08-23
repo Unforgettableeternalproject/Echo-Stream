@@ -9,6 +9,7 @@
 # false = 用角色檔預設，只在面板手動調時覆寫
 override = true
 speed = 1.1
+# 0~1 相對刻度，adapter 映射到 TTS 定案的區間（0.57~0.73）；0.5 = 甜蜜點 0.65
 intensity = 0.75
 
 [tts.emotion]

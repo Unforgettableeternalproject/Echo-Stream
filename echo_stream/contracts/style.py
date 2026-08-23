@@ -70,8 +70,10 @@ class SpeechStyle:
     """情緒分佈。key 取自 :data:`EMOTION_DIMENSIONS`，值 0.0-1.0。
     未列出的維度視為 0。空 dict 代表「用後端的預設」。"""
 
-    intensity: float = 0.6
-    """情緒強度。對應 IndexTTS 的 ``emo_alpha``。"""
+    intensity: float = 0.5
+    """情緒強度，0~1 的**相對**刻度，由 adapter 映射到後端的可用區間——
+    0.5 = 後端的甜蜜點（IndexTTS2 是總和 0.65，區間 0.57~0.73）。
+    不是絕對值：contracts 不知道任何後端的數字。"""
 
     expressiveness: float | None = None
     """表現力——「這個人講話有多戲劇化」。對應 Chatterbox 的 ``exaggeration``。

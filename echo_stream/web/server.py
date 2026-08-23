@@ -52,6 +52,7 @@ from .. import config, defaults
 from ..contracts.cancellation import CancellationToken, CancelReason
 from ..contracts.style import EMOTION_DIMENSIONS, SpeechStyle
 from ..contracts.types import STT_SAMPLE_RATE, AudioChunk, Utterance
+from ..core import emotion
 from ..core.dream_scheduler import DreamPolicy, DreamScheduler
 from ..core.emotion import EMOTION_PRESETS
 from ..core.gap_filler import GapFiller, GapFillerPolicy
@@ -214,7 +215,7 @@ def _startup_config_from_defaults() -> dict[str, Any]:
     if tts.get("override"):
         body["tts"] = {
             "speed": tts.get("speed", 1.0),
-            "intensity": tts.get("intensity", 0.6),
+            "intensity": tts.get("intensity", 0.5),
             "emotion": tts.get("emotion") or {},
         }
     for name in ("turn", "llm", "memory"):
@@ -359,6 +360,7 @@ class StreamService:
             self._speak = IndexTTS2SpeakStage()
         else:
             self._speak = FakeSpeakStage()
+        self._load_emotion_presets()
 
         if self.use_real_llm:
             from ..adapters.think_llm import LLMThinkStage
@@ -417,6 +419,24 @@ class StreamService:
                 "build_seconds": round(gap.build_seconds or 0.0, 2),
                 "start_delay_s": gap.policy.start_delay_s,
             }
+        )
+
+    def _load_emotion_presets(self) -> None:
+        """把 echo_tts 的 emotion_presets.yaml 注入 core 當 preset 表。
+
+        一份定義兩邊共用：LLM 標記、面板下拉、TTS 本身都看同一張表。
+        fake TTS 也試著讀（只要 echo_tts repo 在）——讀不到就用內建退路，不擋。
+        """
+        try:
+            from ..adapters.speak_indextts import load_emotion_presets
+
+            presets, aliases = load_emotion_presets()
+        except Exception as exc:  # noqa: BLE001 - 沒 echo_tts 就用內建表
+            self._log({"type": "emotion_presets", "source": "builtin", "reason": str(exc)[:120]})
+            return
+        emotion.register_presets(presets, aliases)
+        self._log(
+            {"type": "emotion_presets", "source": "echo_tts", "presets": list(presets)}
         )
 
     async def _build_memory(self) -> None:
@@ -561,12 +581,15 @@ class StreamService:
         return {
             "tts": {
                 "speed": style.speed if style else 1.0,
-                "intensity": style.intensity if style else 0.6,
+                "intensity": style.intensity if style else 0.5,
                 "emotion": style.normalized_emotion() if style else
                            {dim: 0.0 for dim in EMOTION_DIMENSIONS},
                 "override": style is not None,
             },
             "presets": EMOTION_PRESETS,
+            "preset_labels": dict(
+                zip(EMOTION_PRESETS, emotion.preset_labels(), strict=False)
+            ) if len(emotion.preset_labels()) == len(EMOTION_PRESETS) else {},
             "split": {
                 "first_min": self.split_policy.first_min_weight,
                 "first_max": self.split_policy.first_max_weight,
@@ -635,7 +658,7 @@ class StreamService:
             }
             style = SpeechStyle(
                 emotion=emotion,
-                intensity=float(tts.get("intensity", 0.6)),
+                intensity=float(tts.get("intensity", 0.5)),
                 speed=float(tts.get("speed", 1.0)),
             )
             if style.is_neutral and style.speed == 1.0:
@@ -1227,6 +1250,7 @@ class StreamService:
             "memory_injected": getattr(self._think, "last_injected_memory", None),
             "tool_calls": list(getattr(self._think, "last_tool_calls", []) or []),
             "gap_filler": self.gap_filler.last_emitted,
+            "styles": list(getattr(runner.think_stage, "styles", []) or []),
             "report": self.tracer.report(turn_id),
         }
         emit(json_frame(FRAME_META, meta))
@@ -1269,6 +1293,24 @@ class StreamService:
             self._log({"type": "memory_store", "input": user_text[:80], **stored})
 
 
+def _style_info(sentence: Any) -> dict[str, Any] | None:
+    """句子的情緒 style 摘要（前端標籤 / session log）。沒 style 回 None。
+
+    這是情緒標記的**唯一可觀測點**——標記在 think stage 就被剝掉了，
+    沒這個你只能靠耳朵猜她有沒有標（2026-08-23 之前就是這樣）。
+    """
+    style = getattr(sentence, "style", None)
+    if style is None:
+        return None
+    return {
+        "marker": sentence.metadata.get("emotion_marker") or style.style or None,
+        "carried": bool(sentence.metadata.get("emotion_carried")),
+        "emotion": {k: round(float(v), 3) for k, v in style.emotion.items() if v},
+        "intensity": style.intensity,
+        "speed": style.speed,
+    }
+
+
 class _EmitThink:
     """在句子流上分岔一份給前端顯示，不改變內容。
 
@@ -1293,8 +1335,12 @@ class _EmitThink:
         await self._inner.aclose()
 
     async def stream(self, utterance, token):
+        self.styles = []
         async for sentence in self._inner.stream(utterance, token):
             if sentence.text:
+                style = _style_info(sentence)
+                if style is not None:
+                    self.styles.append({"index": sentence.index, **style})
                 self._emit(
                     json_frame(
                         FRAME_TEXT,
@@ -1304,6 +1350,7 @@ class _EmitThink:
                             "is_first": sentence.is_first,
                             "split_reason": sentence.split_reason,
                             "ms": (time.perf_counter() - self._t0) * 1000,
+                            "style": style,
                         },
                     )
                 )

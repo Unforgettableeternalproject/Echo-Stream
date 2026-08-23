@@ -64,6 +64,8 @@
   header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 4px; }
   h1 { font-size: 20px; margin: 0; letter-spacing: .5px; }
   .sub { color: var(--dim); font-size: 12px; }
+  .emo { color: var(--accent); font-size: 11px; margin-right: 4px; }
+  .emo.carried { opacity: 0.45; }
   .badge {
     font-size: 11px; padding: 2px 8px; border-radius: 10px;
     border: 1px solid var(--line); color: var(--dim);
@@ -211,8 +213,8 @@
       </div>
       <div class="field">
         <label for="cfg-intensity">情緒強度</label>
-        <input type="range" id="cfg-intensity" min="0" max="1" step="0.05" value="0.6">
-        <span class="val" id="cfg-intensity-val">0.60</span>
+        <input type="range" id="cfg-intensity" min="0" max="1" step="0.05" value="0.5">
+        <span class="val" id="cfg-intensity-val">0.50</span>
       </div>
       <div class="field">
         <label for="cfg-preset">情緒 preset</label>
@@ -403,9 +405,13 @@ function addSentence(s) {
   const label = (s.is_first ? "" : "+") + Math.round(delta) + "ms";
   const el = document.createElement("div");
   el.className = "sent" + (s.is_first ? " first" : "");
+  const st = s.style;
+  const tag = st && st.marker
+    ? `<span class="emo${st.carried ? " carried" : ""}" title="${escapeHtml(JSON.stringify(st.emotion))} · 強度 ${st.intensity}">[${escapeHtml(st.marker)}]</span>`
+    : "";
   el.innerHTML = `<span class="idx">${s.index}</span>
                   <span class="ms" title="累計 ${Math.round(s.ms)}ms">${label}</span>
-                  <span>${s.text.replace(/</g, "&lt;")}</span>`;
+                  <span>${tag}${s.text.replace(/</g, "&lt;")}</span>`;
   box.appendChild(el);
 }
 
@@ -918,7 +924,7 @@ async function loadConfig() {
     cfgPresets = c.presets || {};
     const sel = $("cfg-preset");
     sel.innerHTML = '<option value="">（角色檔預設）</option>' +
-      Object.keys(cfgPresets).map(n => `<option value="${n}">${n}</option>`).join("");
+      Object.keys(cfgPresets).map(n => `<option value="${n}">${(c.preset_labels || {})[n] || n}</option>`).join("");
     $("cfg-speed").value = c.tts.speed;
     $("cfg-speed-val").textContent = (+c.tts.speed).toFixed(2) + "×";
     $("cfg-intensity").value = c.tts.intensity;

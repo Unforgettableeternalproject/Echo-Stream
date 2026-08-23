@@ -53,7 +53,7 @@ from typing import Any
 
 from .. import config
 from ..contracts.cancellation import CancellationToken, CancelledError
-from ..contracts.style import SpeechStyle
+from ..contracts.style import EMOTION_DIMENSIONS, SpeechStyle
 from ..contracts.types import TTS_SAMPLE_RATE, AudioChunk, Sentence
 from ..core.channel import StreamChannel
 
@@ -71,6 +71,43 @@ CONFIG_STRETCH_RATIO = 1.72
 引擎裡的關係是 ``stretch_ratio = config_stretch_ratio - speed × 0.5``，
 stretch 越大唸得越慢。
 """
+
+
+def scale_emotion(vector: list[float], intensity: float) -> list[float]:
+    """八維向量 × 相對強度 → 送進引擎的向量（總和落在 echo_tts 定案區間）。
+
+    區間常數與縮放函式從 echo_tts import——TTS 那邊調區間，這裡自動跟，
+    不在整合層再抄一份數字。import 不到（舊分支）退回「向量 × 強度」。
+    """
+    try:
+        from echo_tts.config.emotion_presets import scale_to_user_strength
+    except ImportError:
+        alpha = max(0.0, min(1.0, intensity))
+        return [v * alpha for v in vector]
+    return scale_to_user_strength(list(vector), intensity)
+
+
+def load_emotion_presets(
+    path: str | None = None,
+) -> tuple[dict[str, dict[str, float]], dict[str, str]]:
+    """讀 echo_tts 的 ``emotion_presets.yaml``，轉成 core 的 preset 表形狀。
+
+    回傳 ``(presets, aliases)``：presets 是 key → 八維分佈（只取 vector，
+    ``overrides`` 那些 dynamics / text_markers 是 echo_tts session 層的功能，
+    這條管線繞過它，不接）；aliases 目前空——中文別名在 core 的內建表。
+    """
+    from echo_tts.config.emotion_presets import get_preset_vector, load_presets
+
+    raw = load_presets(path) if path else load_presets()
+    presets: dict[str, dict[str, float]] = {}
+    for key, entry in raw.items():
+        vec = list(get_preset_vector(entry))
+        presets[str(key)] = {
+            dim: float(v)
+            for dim, v in zip(EMOTION_DIMENSIONS, vec, strict=False)
+            if float(v) > 0.0
+        }
+    return presets, {}
 
 
 def speed_multiplier_to_offset(multiplier: float) -> float:
@@ -458,9 +495,11 @@ class IndexTTS2SpeakStage:
         會被忽略——這是刻意的，SpeechStyle 是**各後端取所需**的共同描述，
         不是每個欄位都保證被實作。
 
-        ``intensity``（emo_alpha）的翻譯是**向量 × 強度**：引擎的
-        ``normalize_emotion_vector`` 只在總和超過上限時壓縮，所以縮放
-        向量本身就等於調整情緒的整體強度。
+        ``intensity`` 的翻譯走 echo_tts 的強度區間（2026-08-23 改）：
+        0~1 刻度 → ``user_to_strength`` → 總和 0.57~0.73（0.5 = 0.65 甜蜜點），
+        再 ``scale_to_strength`` 等比縮放——preset 向量只剩比例有意義。
+        舊做法「向量 × intensity」送進去的總和多半 < 0.5，落在 TTS 那邊定案的
+        「情緒表現不足」區，LLM 標記聽起來跟沒標一樣。
 
         style 為 None 或中性時**還原**角色檔預設，而不是不動——
         上一句的情緒殘留在 backend 狀態裡，是「一句開心之後全部都開心」
@@ -470,8 +509,7 @@ class IndexTTS2SpeakStage:
 
         # 情緒向量：有 style 就換算，沒有就還原預設
         if style is not None and not style.is_neutral:
-            alpha = max(0.0, min(1.0, style.intensity))
-            backend.emotion_vector = [v * alpha for v in style.emotion_vector()]
+            backend.emotion_vector = scale_emotion(style.emotion_vector(), style.intensity)
         else:
             backend.emotion_vector = (
                 list(self._default_emotion) if self._default_emotion else None
@@ -512,6 +550,8 @@ __all__ = [
     "smooth_segment_edges",
     "tensor_to_pcm16",
     "speed_multiplier_to_offset",
+    "scale_emotion",
+    "load_emotion_presets",
     "DEFAULT_SAMPLE_RATE",
     "CONFIG_STRETCH_RATIO",
 ]

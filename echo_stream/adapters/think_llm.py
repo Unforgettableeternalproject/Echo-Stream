@@ -54,7 +54,7 @@ from .. import config
 from ..contracts.cancellation import CancellationToken, CancelledError
 from ..contracts.style import SpeechStyle
 from ..contracts.types import Sentence, Utterance
-from ..core.emotion import MARKER_PROMPT, extract_style
+from ..core.emotion import extract_style, marker_prompt
 from ..core.splitter import FLUSH, SentenceSplitter, SplitPolicy
 from ..core.tracer import (
     MARK_MEMORY_DONE,
@@ -316,6 +316,10 @@ class LLMThinkStage:
             else None
         )
 
+        # 這一輪目前生效的標記 style。標記只出現在情緒段落的開頭，但切句器會在
+        # 逗號把一段切成好幾句——沒新標記的後續句沿用上一個，而不是退回預設
+        # （退回預設 = 「只有第一小段有情緒」，艾斯維爾 2026-08-23 實測抱怨的點）
+        carried: SpeechStyle | None = None
         try:
             splitter = SentenceSplitter(self.split_policy)
             async for sentence in splitter.split(
@@ -329,9 +333,17 @@ class LLMThinkStage:
                     # 先解析再交給下游——sanitize_for_tts 只會剝括號符號、
                     # 保留內容，順序反了標記就會被唸出來
                     cleaned, style = extract_style(sentence.text, self.default_style)
+                    if cleaned != sentence.text and style is None:
+                        carried = None  # 認得但空配方（[neutral]）或不認得的標記：回預設
                     sentence.text = cleaned
                     if style is not None:
                         sentence.style = style
+                        carried = style
+                        sentence.metadata["emotion_marker"] = style.style
+                    elif carried is not None:
+                        sentence.style = carried
+                        sentence.metadata["emotion_marker"] = carried.style
+                        sentence.metadata["emotion_carried"] = True
                 if self.default_style is not None and sentence.style is None:
                     sentence.style = self.default_style
                 yield sentence
@@ -477,7 +489,7 @@ class LLMThinkStage:
             # 而每輪都有自動注入，她永遠覺得夠（2026-08-22 實機 12 輪零呼叫）
             parts.append(TOOLS_PROMPT)
         if self.emotion_markers:
-            parts.append(MARKER_PROMPT)
+            parts.append(marker_prompt())
         combined = "\n\n".join(p for p in parts if p)
         return combined or None
 

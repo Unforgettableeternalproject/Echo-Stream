@@ -328,7 +328,7 @@ def test_config_GET_回報現值(server):
     with urllib.request.urlopen(f"{base}/api/config", timeout=10) as r:
         cfg = json.loads(r.read())
     assert cfg["split"]["first_min"] == service.split_policy.first_min_weight
-    assert "presets" in cfg and "開心" in cfg["presets"]
+    assert "presets" in cfg and "happy" in cfg["presets"]
     assert cfg["turn"]["silence_threshold_s"] is not None
     assert cfg["turn"]["min_confidence"] is not None
 
