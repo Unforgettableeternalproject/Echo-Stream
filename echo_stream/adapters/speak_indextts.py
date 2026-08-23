@@ -46,7 +46,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
+import shutil
 import tempfile
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -56,6 +59,45 @@ from ..contracts.cancellation import CancellationToken, CancelledError
 from ..contracts.style import EMOTION_DIMENSIONS, SpeechStyle
 from ..contracts.types import TTS_SAMPLE_RATE, AudioChunk, Sentence
 from ..core.channel import StreamChannel
+
+logger = logging.getLogger(__name__)
+
+TEMP_PREFIX = "echo_stream_tts_"
+STALE_TEMP_AGE_S = 24 * 3600
+
+
+def sweep_stale_tempdirs(
+    root: str | Path | None = None, max_age_s: float = STALE_TEMP_AGE_S
+) -> int:
+    """清掉上一次沒正常收工留下的暫存目錄，回傳清了幾個。
+
+    ``TemporaryDirectory`` 只在 ``aclose()`` 時 cleanup；殺 port、關視窗、程式炸掉
+    這些結束方式（已知陷阱 #1 那種殘留 server 正是這樣收的）目錄會留著。
+    實測 %TEMP% 躺了 23 個空目錄（2026-08-23）。規則：空的一律刪、非空但超過
+    ``max_age_s`` 也刪——非空代表某次合成到一半被殺，那個 wav 沒人會再用。
+    **不碰自己這次建的**（prepare 時自己的 _tempdir 還沒建，所以天然排除）。
+    """
+    base = Path(root) if root is not None else Path(tempfile.gettempdir())
+    removed = 0
+    now = time.time()
+    try:
+        candidates = list(base.glob(f"{TEMP_PREFIX}*"))
+    except OSError:
+        return 0
+    for d in candidates:
+        if not d.is_dir():
+            continue
+        try:
+            empty = not any(d.iterdir())
+            old = now - d.stat().st_mtime > max_age_s
+            if empty or old:
+                shutil.rmtree(d, ignore_errors=True)
+                removed += 1
+        except OSError:
+            continue
+    if removed:
+        logger.info("清掉 %d 個殘留的 TTS 暫存目錄", removed)
+    return removed
 
 DEFAULT_SAMPLE_RATE = TTS_SAMPLE_RATE
 """22050Hz，對齊 IndexTTS2 config 的 ``s2mel.preprocess_params.sr``。"""
@@ -274,6 +316,8 @@ class IndexTTS2SpeakStage:
         if self._prepared:
             return
         loop = asyncio.get_running_loop()
+        # 先掃上次沒收乾淨的暫存目錄，再建自己的
+        await loop.run_in_executor(None, sweep_stale_tempdirs)
         if self._backend is None:
             self._backend = await loop.run_in_executor(None, self._build_backend)
         load = getattr(self._backend, "load", None)
@@ -550,6 +594,7 @@ __all__ = [
     "smooth_segment_edges",
     "tensor_to_pcm16",
     "speed_multiplier_to_offset",
+    "sweep_stale_tempdirs",
     "scale_emotion",
     "load_emotion_presets",
     "DEFAULT_SAMPLE_RATE",

@@ -309,3 +309,31 @@ def test_sanitize_把列表破折號換成頓點():
     assert sanitize_for_tts("小說 - 死亡擱淺") == "小說，死亡擱淺"
     # 連字號緊貼單字（well-known、2-3）不受影響
     assert sanitize_for_tts("a well-known game") == "a well-known game"
+
+
+# --- 暫存目錄清掃 ---
+
+
+def test_sweep_刪空目錄與過期目錄_留新的非空目錄(tmp_path):
+    import os
+    import time
+
+    from echo_stream.adapters.speak_indextts import TEMP_PREFIX, sweep_stale_tempdirs
+
+    empty = tmp_path / f"{TEMP_PREFIX}empty"
+    empty.mkdir()
+    stale = tmp_path / f"{TEMP_PREFIX}stale"
+    stale.mkdir()
+    (stale / "x.wav").write_bytes(b"0")
+    old = time.time() - 3 * 24 * 3600
+    os.utime(stale, (old, old))
+    fresh = tmp_path / f"{TEMP_PREFIX}fresh"
+    fresh.mkdir()
+    (fresh / "y.wav").write_bytes(b"0")
+    other = tmp_path / "unrelated"
+    other.mkdir()
+
+    assert sweep_stale_tempdirs(tmp_path) == 2
+    assert not empty.exists() and not stale.exists()
+    assert fresh.exists() and other.exists()
+    assert sweep_stale_tempdirs(tmp_path) == 0
