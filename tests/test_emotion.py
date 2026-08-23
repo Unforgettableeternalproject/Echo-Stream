@@ -106,7 +106,7 @@ def test_prompt_列出所有_preset():
     for name in EMOTION_PRESETS:
         assert name in MARKER_PROMPT
     assert "開心(happy)" in MARKER_PROMPT, "中英並列"
-    assert "第一句一定要" in MARKER_PROMPT
+    assert "一定" not in MARKER_PROMPT, "不強制標——沒標就是預設情緒"
 
 
 # --- 中英別名 + 注入的 preset 表 ---
