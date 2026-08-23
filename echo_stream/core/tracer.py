@@ -81,6 +81,8 @@ MARK_THINK_FIRST_SENTENCE = "think_first_sentence"
 """SentenceSplitter 切出第一句。"""
 
 MARK_THINK_DONE = "think_done"
+MARK_GAP_FIRST_AUDIO = "gap_first_audio"
+"""墊片音（GapFiller）第一段寫進 sink 的時刻。感知 TTFA = min(這個, speak_first_chunk)。"""
 MARK_SPEAK_FIRST_CHUNK = "speak_first_chunk"
 """第一段音訊就緒。**TTFA 的終點。**"""
 
@@ -150,6 +152,15 @@ class TurnTrace:
         """Time To First Audio。這是唯一真正決定體感的數字。"""
         return self.rel_ms(MARK_SPEAK_FIRST_CHUNK)
 
+    def perceived_ttfa_ms(self) -> float | None:
+        """使用者第一次聽到任何聲音——墊片音或真音訊，哪個先算哪個。
+        與 ``ttfa`` 並列，不取代：TTFA 量的是管線、這個量的是體感。"""
+        candidates = [
+            v for v in (self.rel_ms(MARK_GAP_FIRST_AUDIO), self.rel_ms(MARK_SPEAK_FIRST_CHUNK))
+            if v is not None
+        ]
+        return min(candidates) if candidates else None
+
     def segments_ms(self) -> dict[str, float | None]:
         """拆解成設計文件 §5 的五個欄位。"""
         return {
@@ -164,6 +175,8 @@ class TurnTrace:
                 MARK_THINK_FIRST_SENTENCE, MARK_SPEAK_FIRST_CHUNK
             ),
             "ttfa": self.ttfa_ms,
+            "gap_audio": self.rel_ms(MARK_GAP_FIRST_AUDIO),
+            "perceived_ttfa": self.perceived_ttfa_ms(),
             "total": self.rel_ms(MARK_TURN_END),
         }
 
@@ -308,6 +321,11 @@ class LatencyTracer:
             f"  {'TTFA':<18}{_fmt_ms(segs['ttfa']):>10}{_fmt_ms(BUDGET_MS['ttfa']):>10}"
             f"   {_verdict(segs['ttfa'], BUDGET_MS['ttfa'])}"
         )
+        if segs.get("gap_audio") is not None:
+            lines.append(
+                f"  {'感知 TTFA':<18}{_fmt_ms(segs['perceived_ttfa']):>10}{'':>10}"
+                f"   墊片音 @ {_fmt_ms(segs['gap_audio'])}"
+            )
         lines.append(f"  {'總時長':<18}{_fmt_ms(segs['total']):>10}")
         lines.append(
             f"  句數 {trace.sentence_count} / 音訊段 {trace.chunk_count}"

@@ -1,0 +1,60 @@
+# Echo Stream 預設參數
+#
+# serve 啟動時套用；右側面板改的值只活在這次執行，下次啟動又回到這裡。
+# 密鑰、repo 路徑、模型名稱仍在 .env——這個檔只放「可以隨手調的數值」。
+# 路徑可用 ECHO_STREAM_CONFIG 覆寫。沒有的段落 / 鍵就用程式碼預設。
+
+[tts]
+# override = true 才會把下面的語速 / 情緒當作每句的預設風格（情緒標記仍可逐句覆寫）；
+# false = 用角色檔預設，只在面板手動調時覆寫
+override = true
+speed = 1.1
+intensity = 0.75
+
+[tts.emotion]
+# 八維情緒向量，0 ~ 1，只列非零的就好
+happy = 0.65
+surprised = 0.25
+calm = 0.15
+
+[split]
+# 切句權重（中文字 1、英文詞約 0.5、標點 0）。first_* 管首句：短 → TTFA 低但語氣碎
+first_min = 6.0
+first_max = 14.0
+min = 20.0
+max = 48.0
+
+[turn]
+# 講完後靜音多久算一輪結束。0.7 對中文剛好、對英文口語太短（常被切）
+silence_threshold_s = 0.7
+# 講多久才算 barge-in（擋咳嗽、嗯啊）
+interruption_min_speech_s = 0.4
+# STT 信心下限，低於就丟棄（只在 --real-stt 有效）
+min_confidence = 0.45
+
+[llm]
+emotion_markers = true
+# 模型開口前就決定查記憶工具時先說的話；"" = 關閉。
+# ⚠️ 不得含可被推翻的記憶斷言（「我不記得了」禁用）。開了 gap_filler 可考慮關掉，免得兩個疊在一起
+tool_filler = ""
+
+[memory]
+enabled = true
+top_k = 3
+max_chars = 500
+min_match = 0.45
+
+[gap_filler]
+# 墊片音（D 段）：STT 完成後先出一聲「嗯…」，真音訊排在它後面。一輪最多一聲。
+enabled = true
+# STT 完成後先停多久才出聲（人類接話也不是零間隔）
+start_delay_s = 0.4
+# 候選文案，**按語言分組**（key = STT 偵測到的語言碼；講英文就不能「嗯」中文）。
+# 每輪從該語言的池子隨機挑一句、不連續重複；沒對應池子就用 default_language。
+# 只能是零語意的語助詞——「對」「是啊」在問句後會變成回答；「我不記得了」是記憶斷言；都不能用
+default_language = "zh"
+
+[gap_filler.phrases]
+zh = ["嗯...", "欸...", "啊...", "唔...", "呃...", "喔...", "哎...", "唉...", "哈...", "嘿...", "......"]
+en = ["Hmm...", "Uh...", "Well...", "Let me see...", "Oh..."]
+ja = ["えっと...", "うーん...", "あー...", "そうですね..."]

@@ -48,12 +48,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from .. import config
+from .. import config, defaults
 from ..contracts.cancellation import CancellationToken, CancelReason
 from ..contracts.style import EMOTION_DIMENSIONS, SpeechStyle
 from ..contracts.types import STT_SAMPLE_RATE, AudioChunk, Utterance
 from ..core.dream_scheduler import DreamPolicy, DreamScheduler
 from ..core.emotion import EMOTION_PRESETS
+from ..core.gap_filler import GapFiller, GapFillerPolicy
 from ..core.pipeline import PipelineRunner
 from ..core.splitter import SplitPolicy
 from ..core.tracer import LatencyTracer
@@ -163,6 +164,66 @@ class _FakeWebTranscriber:
         return TranscriptionResult(text=f"（fake 轉錄：收到 {seconds:.1f}s 語音）")
 
 
+def _split_policy_from_defaults() -> SplitPolicy:
+    sec = defaults.section("split")
+    mapping = {
+        "first_min": "first_min_weight",
+        "first_max": "first_max_weight",
+        "min": "min_weight",
+        "max": "max_weight",
+    }
+    kwargs = {attr: float(sec[key]) for key, attr in mapping.items() if key in sec}
+    return SplitPolicy(**kwargs)
+
+
+def _gap_policy_from_defaults() -> GapFillerPolicy:
+    sec = defaults.section("gap_filler")
+    policy = GapFillerPolicy()
+    if "enabled" in sec:
+        policy.enabled = bool(sec["enabled"])
+    if "start_delay_s" in sec:
+        policy.start_delay_s = max(0.0, float(sec["start_delay_s"]))
+    phrases = sec.get("phrases")
+    if isinstance(phrases, dict) and phrases:
+        policy.phrases = _phrase_pools(phrases)
+    elif isinstance(phrases, list) and phrases:  # 舊寫法：單一列表 = 預設語言
+        policy.phrases = {policy.default_language: [str(t) for t in phrases if str(t).strip()]}
+    if "default_language" in sec:
+        policy.default_language = str(sec["default_language"])
+    return policy
+
+
+def _phrase_pools(raw: dict[str, Any]) -> dict[str, list[str]]:
+    pools: dict[str, list[str]] = {}
+    for lang, items in raw.items():
+        if isinstance(items, list):
+            texts = [str(t) for t in items if str(t).strip()]
+            if texts:
+                pools[str(lang).lower()] = texts
+    return pools
+
+
+def _startup_config_from_defaults() -> dict[str, Any]:
+    """把 echo_stream.toml 的 tts / turn / llm / memory 段轉成 apply_config 的 body。
+
+    split 與 gap_filler 在建構時就用掉了（policy 物件），不在這裡。
+    tts 只有 ``override = true`` 才套——否則角色檔的預設風格就被蓋掉了。
+    """
+    body: dict[str, Any] = {}
+    tts = defaults.section("tts")
+    if tts.get("override"):
+        body["tts"] = {
+            "speed": tts.get("speed", 1.0),
+            "intensity": tts.get("intensity", 0.6),
+            "emotion": tts.get("emotion") or {},
+        }
+    for name in ("turn", "llm", "memory"):
+        sec = defaults.section(name)
+        if sec:
+            body[name] = sec
+    return body
+
+
 class StreamService:
     """持有管線與常駐 event loop。"""
 
@@ -197,8 +258,10 @@ class StreamService:
         """自動 dream 的觸發策略（累積 + 閒置 / daydream）。記憶建好才啟動。"""
         self.memory_error: str | None = None
         self.memory_warm_seconds: float | None = None
-        self.split_policy = split_policy or SplitPolicy()
+        self.split_policy = split_policy or _split_policy_from_defaults()
         self.system_prompt = system_prompt
+        self.gap_filler = GapFiller(_gap_policy_from_defaults())
+        """墊片音（D 段）。語音庫在 _build 末尾合成；改 TTS 風格後重建。"""
 
         self._store = store
         """SessionControl 的 SessionStore。``None`` 時在 prepare 建立；
@@ -318,8 +381,43 @@ class StreamService:
             think_stage=self._think,
             speak_stage=self._speak,
             tracer=self.tracer,
+            gap_filler=self.gap_filler,
         )
         await self._runner.prepare()
+
+        # echo_stream.toml 的預設值走與面板完全相同的套用路徑——
+        # 一份邏輯、一種結果，面板打開就看得到檔案裡的值
+        startup = _startup_config_from_defaults()
+        if startup:
+            await self._apply_config(startup)
+        await self._build_gap_bank()
+
+    async def _build_gap_bank(self) -> None:
+        """用當前聲線合成墊片音語音庫。**只在沒人講話時跑**——會佔 TTS。
+
+        fake TTS 幾毫秒；IndexTTS2 每句 ~2s 固定開銷，三句約 6s，吸收在啟動 /
+        改風格之後，不落在對話上。失敗只停用墊片，不擋管線。
+        """
+        gap = self.gap_filler
+        if not gap.policy.enabled:
+            return
+        if self._runner is not None and self._runner.is_speaking:
+            gap.dirty = True  # turn 結束後再建
+            return
+        try:
+            await gap.build(self._speak, getattr(self._think, "default_style", None))
+        except Exception as exc:  # noqa: BLE001
+            self._log({"type": "gap_filler", "error": f"{type(exc).__name__}: {exc}"})
+            return
+        self._log(
+            {
+                "type": "gap_filler",
+                "phrases": gap.phrases,
+                "bank": len(gap._bank),
+                "build_seconds": round(gap.build_seconds or 0.0, 2),
+                "start_delay_s": gap.policy.start_delay_s,
+            }
+        )
 
     async def _build_memory(self) -> None:
         """建立並暖機記憶層。旁路——失敗記在 memory_error，不擋管線。
@@ -487,6 +585,15 @@ class StreamService:
             "llm": {
                 "reasoning_effort": getattr(backend, "reasoning_effort", None),
                 "emotion_markers": getattr(self._think, "emotion_markers", False),
+                "tool_filler": getattr(self._think, "tool_filler", None) or "",
+            },
+            "gap_filler": {
+                "enabled": self.gap_filler.policy.enabled,
+                "start_delay_s": self.gap_filler.policy.start_delay_s,
+                "phrases": {k: list(v) for k, v in self.gap_filler.policy.phrases.items()},
+                "default_language": self.gap_filler.policy.default_language,
+                "ready": self.gap_filler.ready,
+                "build_seconds": self.gap_filler.build_seconds,
             },
             "memory": {
                 "available": self._memory is not None,
@@ -541,6 +648,9 @@ class StreamService:
                     "intensity": style.intensity if style else None,
                     "emotion": dict(style.emotion) if style else None,
                 }
+                # 聲線變了，墊片音庫要跟著重合成（背景；正在講話就標 dirty）
+                self.gap_filler.dirty = True
+                asyncio.ensure_future(self._build_gap_bank())
 
         split = body.get("split")
         if isinstance(split, dict):
@@ -620,8 +730,34 @@ class StreamService:
                 if backend is not None and hasattr(backend, "reasoning_effort"):
                     backend.reasoning_effort = str(llm["reasoning_effort"])
                     changed["reasoning_effort"] = str(llm["reasoning_effort"])
+            if "tool_filler" in llm and hasattr(self._think, "tool_filler"):
+                text = str(llm["tool_filler"] or "").strip()
+                self._think.tool_filler = text or None
+                changed["tool_filler"] = text
             if changed:
                 applied["llm"] = changed
+
+        gap = body.get("gap_filler")
+        if isinstance(gap, dict):
+            changed = {}
+            policy = self.gap_filler.policy
+            if "enabled" in gap:
+                policy.enabled = bool(gap["enabled"])
+                changed["enabled"] = policy.enabled
+                if policy.enabled and not self.gap_filler.ready:
+                    asyncio.ensure_future(self._build_gap_bank())
+            if "start_delay_s" in gap:
+                policy.start_delay_s = max(0.0, float(gap["start_delay_s"]))
+                changed["start_delay_s"] = policy.start_delay_s
+            if "phrases" in gap and isinstance(gap["phrases"], dict):
+                pools = _phrase_pools(gap["phrases"])
+                if pools:
+                    policy.phrases = pools
+                    changed["phrases"] = {k: list(v) for k, v in pools.items()}
+                    self.gap_filler.dirty = True
+                    asyncio.ensure_future(self._build_gap_bank())
+            if changed:
+                applied["gap_filler"] = changed
 
         # 寫進 session log——事後分析時才知道「當時的參數是什麼」
         self._log({"type": "config", **applied})
@@ -1090,6 +1226,7 @@ class StreamService:
             "audio_seconds": round(sink.written_duration_s, 2),
             "memory_injected": getattr(self._think, "last_injected_memory", None),
             "tool_calls": list(getattr(self._think, "last_tool_calls", []) or []),
+            "gap_filler": self.gap_filler.last_emitted,
             "report": self.tracer.report(turn_id),
         }
         emit(json_frame(FRAME_META, meta))
@@ -1102,6 +1239,8 @@ class StreamService:
 
         if self._dream_scheduler is not None:
             self._dream_scheduler.notify_interaction()
+        if self.gap_filler.dirty:
+            asyncio.ensure_future(self._build_gap_bank())
 
         # 記憶寫入：背景旁路，不擋下一輪。
         # **被捨棄的 turn 不寫**——voice_discard 在中止前就把 _discard_turn

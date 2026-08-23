@@ -37,6 +37,7 @@ from ..contracts.stages import AudioSink, AudioSource, SpeakStage, ThinkStage
 from ..contracts.turn import TurnPolicy
 from ..contracts.types import AudioChunk, Sentence, TurnPhase, TurnResult, Utterance
 from . import tracer as marks
+from .gap_filler import GAP_SENTENCE_INDEX, GapFiller
 from .tracer import LatencyTracer
 
 
@@ -59,6 +60,7 @@ class PipelineRunner:
         sink: AudioSink | None = None,
         tracer: LatencyTracer | None = None,
         policy: TurnPolicy | None = None,
+        gap_filler: GapFiller | None = None,
     ) -> None:
         self.input_stage = input_stage
         self.think_stage = think_stage
@@ -66,6 +68,8 @@ class PipelineRunner:
         self.sink = sink
         self.tracer = tracer or LatencyTracer()
         self.policy = policy or TurnPolicy()
+        self.gap_filler = gap_filler
+        """墊片音（D 段）。None = 不用。它只碰 sink，不碰三層。"""
 
         self._current_token: CancellationToken | None = None
         self._current_turn_id: str | None = None
@@ -150,6 +154,15 @@ class PipelineRunner:
         cancel_reason: str | None = None
         error: str | None = None
 
+        # 墊片音：STT 完成就開始計時，真音訊來之前排進 sink（排隊，不打斷）
+        gap = self.gap_filler
+        if gap is not None:
+            gap.start(
+                self.sink, turn_id, token,
+                on_first_audio=lambda: self.tracer.mark(turn_id, marks.MARK_GAP_FIRST_AUDIO),
+                language=utterance.language,
+            )
+
         try:
             sentence_stream = self._trace_sentences(
                 self.think_stage.stream(utterance, token), turn_id, sentences
@@ -158,6 +171,10 @@ class PipelineRunner:
 
             async for chunk in chunk_stream:
                 token.raise_if_cancelled()
+                if gap is not None:
+                    # 寫第一段真音訊之前先收掉墊片——它正在寫的那段要寫完，
+                    # 之後不能再追加，否則 sink 裡會倒序
+                    await gap.stop()
                 self.tracer.mark(turn_id, marks.MARK_SPEAK_FIRST_CHUNK)
                 trace.phase = TurnPhase.SPEAKING
 
@@ -184,6 +201,8 @@ class PipelineRunner:
             error = f"{type(exc).__name__}: {exc}"
             token.cancel(CancelReason.UPSTREAM_ERROR, error)
         finally:
+            if gap is not None:
+                await gap.stop()
             self._current_token = None
             self._current_turn_id = None
 
@@ -191,7 +210,8 @@ class PipelineRunner:
             sentences[i].text for i in sorted(sentences) if sentences[i].text
         )
         spoken_text, spoken_duration = self._resolve_spoken(
-            sentences, timeline, emitted_duration
+            sentences, timeline, emitted_duration,
+            gap_duration=gap.emitted_duration_s if gap is not None else 0.0,
         )
 
         # commit 嚴格排在確認實際播出量之後——見模組 docstring 的 Pipecat #4111
@@ -255,6 +275,7 @@ class PipelineRunner:
         sentences: dict[int, Sentence],
         timeline: list[tuple[int, float]],
         emitted_duration: float,
+        gap_duration: float = 0.0,
     ) -> tuple[str, float]:
         """推算「使用者實際聽到了什麼」。
 
@@ -272,7 +293,11 @@ class PipelineRunner:
         played = emitted_duration
         if self.sink is not None:
             with contextlib.suppress(Exception):
-                played = min(emitted_duration, float(self.sink.played_duration_s))
+                # sink 的播放量含墊片音（它排在最前面），對回文字前要扣掉——
+                # 不扣就會把「嗯…」那一秒算成真句子已播出
+                played = min(
+                    emitted_duration, float(self.sink.played_duration_s) - gap_duration
+                )
 
         max_index = -1
         for sentence_index, cumulative in timeline:
@@ -291,4 +316,4 @@ class PipelineRunner:
         return spoken, played
 
 
-__all__ = ["PipelineRunner", "AudioChunk"]
+__all__ = ["PipelineRunner", "AudioChunk", "GAP_SENTENCE_INDEX"]

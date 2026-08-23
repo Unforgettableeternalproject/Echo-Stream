@@ -12,6 +12,18 @@ import pytest
 from echo_stream.contracts.types import Sentence
 
 
+@pytest.fixture(autouse=True)
+def _isolate_defaults(monkeypatch, tmp_path):
+    """測試不讀 repo 根目錄的 echo_stream.toml——那是艾斯維爾自己的調參檔，
+    內容隨時會變；測試要的預設值自己在測試裡給。"""
+    from echo_stream import defaults
+
+    monkeypatch.setenv("ECHO_STREAM_CONFIG", str(tmp_path / "no-such.toml"))
+    defaults.load_defaults.cache_clear()
+    yield
+    defaults.load_defaults.cache_clear()
+
+
 class FakeTTSBackend:
     """模擬 ``IndexTTS2Backend`` 的同步 push callback 行為。
 
