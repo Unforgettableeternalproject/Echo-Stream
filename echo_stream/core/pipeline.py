@@ -239,18 +239,18 @@ class PipelineRunner:
         drain_task = asyncio.ensure_future(self.sink.drain())
         cancel_task = asyncio.ensure_future(token.wait())
         try:
-            done, _ = await asyncio.wait(
+            await asyncio.wait(
                 {drain_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED
             )
+            # 播放完成與插話可能同時到達，取消優先。播放失敗也必須交給
+            # run_turn 記為 FAILED，不能因為生成完成就誤報 DONE。
+            token.raise_if_cancelled()
+            drain_task.result()
         finally:
             for task in (drain_task, cancel_task):
                 if not task.done():
                     task.cancel()
-        if drain_task in done:
-            with contextlib.suppress(Exception):
-                drain_task.result()
-        else:
-            token.raise_if_cancelled()
+            await asyncio.gather(drain_task, cancel_task, return_exceptions=True)
 
     async def _trace_sentences(
         self,
@@ -295,8 +295,9 @@ class PipelineRunner:
             with contextlib.suppress(Exception):
                 # sink 的播放量含墊片音（它排在最前面），對回文字前要扣掉——
                 # 不扣就會把「嗯…」那一秒算成真句子已播出
-                played = min(
-                    emitted_duration, float(self.sink.played_duration_s) - gap_duration
+                played = max(
+                    0.0,
+                    min(emitted_duration, float(self.sink.played_duration_s) - gap_duration),
                 )
 
         max_index = -1
