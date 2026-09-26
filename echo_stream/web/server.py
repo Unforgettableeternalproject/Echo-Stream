@@ -34,9 +34,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import io
 import json
-import queue
 import struct
 import sys
 import threading
@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import config, defaults
-from ..contracts.cancellation import CancellationToken, CancelReason
+from ..contracts.cancellation import CancellationToken, CancelledError, CancelReason
 from ..contracts.style import EMOTION_DIMENSIONS, SpeechStyle
 from ..contracts.types import STT_SAMPLE_RATE, AudioChunk, Utterance
 from ..core import emotion
@@ -72,6 +72,9 @@ FRAME_UTTER = 0x05
 
 FRAME_EVENT = 0x06
 """狀態事件：VAD speech/silence、barge_in。前端據此顯示聆聽狀態、停播。"""
+FRAME_AUDIO_END = 0x07
+FRAME_AUDIO_ABORT = 0x08
+FRAME_AUDIO_BEGIN = 0x09
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -300,6 +303,7 @@ class StreamService:
 
         self._voice: dict[str, Any] | None = None
         """當前的語音 session（單使用者，一次一個）。"""
+        self._playbacks: dict[str, _PlaybackState] = {}
 
         self._discard_turn = False
         """捨棄請求打在進行中的 turn 上：voice loop 在 turn 收尾後
@@ -994,8 +998,10 @@ class StreamService:
             session: dict[str, Any] = {
                 "sid": sid,
                 "source": _PushSource(self._loop, STT_SAMPLE_RATE),
-                "out": queue.Queue(maxsize=256),
+                "out": asyncio.Queue(maxsize=256),
                 "token": CancellationToken(),
+                "control_tasks": set(),
+                "disconnected_event": asyncio.Event(),
             }
             self._voice = session
             asyncio.run_coroutine_threadsafe(self._voice_loop(session), self._loop)
@@ -1030,10 +1036,11 @@ class StreamService:
             lambda: (self._discard_input_on_loop(), done.set())
         )
         done.wait(timeout=2.0)
-        with contextlib.suppress(queue.Full):
-            session["out"].put_nowait(
-                json_frame(FRAME_EVENT, {"event": "input_discarded"})
-            )
+        self._loop.call_soon_threadsafe(
+            self._voice_emit_control,
+            session,
+            json_frame(FRAME_EVENT, {"event": "input_discarded"}),
+        )
         self._log({"type": "discard"})
         return True
 
@@ -1056,6 +1063,10 @@ class StreamService:
         session = self._voice
         if session is None:
             return
+        session["disconnected"] = True
+        self._loop.call_soon_threadsafe(session["disconnected_event"].set)
+        for task in session["control_tasks"]:
+            self._loop.call_soon_threadsafe(task.cancel)
         session["source"].close()
         self._loop.call_soon_threadsafe(
             session["token"].cancel, CancelReason.SUPERSEDED
@@ -1073,12 +1084,11 @@ class StreamService:
         from ..core.turn_detector import DurationInterruptionDetector
 
         stage = self._stt
-        out: queue.Queue = session["out"]
+        out: asyncio.Queue = session["out"]
         token: CancellationToken = session["token"]
 
         def emit(payload: bytes) -> None:
-            with contextlib.suppress(queue.Full):
-                out.put_nowait(payload)
+            self._voice_emit_control(session, payload)
 
         # 自動 barge-in：機器人講話中偵測到持續語音 → 中止。
         # 判定器與 turn 判定分離（§7.5），門檻在 TurnPolicy。
@@ -1128,7 +1138,28 @@ class StreamService:
                 history = self._history()
                 pre_len = len(history) if history is not None else 0
                 self._discard_turn = False
-                await self._run(utterance, emit, origin="voice")
+                async def send(payload: bytes) -> None:
+                    is_abort = bool(payload) and payload[0] == FRAME_AUDIO_ABORT
+                    if token.is_cancelled and not is_abort:
+                        return
+                    put_task = asyncio.create_task(out.put(payload))
+                    disconnect_task = asyncio.create_task(session["disconnected_event"].wait())
+                    cancel_task = None if is_abort else asyncio.create_task(token.wait())
+                    waits = {put_task, disconnect_task}
+                    if cancel_task is not None:
+                        waits.add(cancel_task)
+                    try:
+                        done, _ = await asyncio.wait(
+                            waits, return_when=asyncio.FIRST_COMPLETED
+                        )
+                        if put_task in done:
+                            put_task.result()
+                    finally:
+                        for task in waits:
+                            if not task.done():
+                                task.cancel()
+
+                await self._run(utterance, send, origin="voice")
 
                 if self._discard_turn:
                     # 捨棄打在這一輪上：把 commit 進歷史的內容拿掉——
@@ -1139,17 +1170,16 @@ class StreamService:
                     self._save_active_session()
                     self._log({"type": "turn_discarded"})
 
-                # turn 結束補一個 padding frame：tunnel 代理（cloudflared）會
-                # 緩衝小尾巴，最後一段音訊可能卡在代理層直到下一輪資料把它
-                # 擠出去——「最後一段等下次輸入才播」就是這個。前端會忽略它。
-                emit(json_frame(FRAME_EVENT, {"event": "flush", "pad": "." * 16384}))
         except Exception as exc:  # noqa: BLE001
-            emit(json_frame(FRAME_ERROR, {"error": f"{type(exc).__name__}: {exc}"}))
+            if not session.get("disconnected"):
+                emit(json_frame(FRAME_ERROR, {"error": f"{type(exc).__name__}: {exc}"}))
         finally:
             stage.on_voice_event = None
             stage.on_partial = None
-            with contextlib.suppress(queue.Full):
-                out.put_nowait(None)
+            for task in session["control_tasks"]:
+                task.cancel()
+            if not session.get("disconnected"):
+                await out.put(None)
             if self._voice is session:
                 self._voice = None
 
@@ -1158,15 +1188,81 @@ class StreamService:
         session = self._voice
         if session is None or session["sid"] != sid:
             return
-        out: queue.Queue = session["out"]
-        while True:
-            try:
-                item = out.get(timeout=60.0)
-            except queue.Empty:
-                continue  # 沒動靜就繼續等——長靜音是正常狀態
-            if item is None:
-                return
-            yield item
+        out: asyncio.Queue = session["out"]
+        ended = False
+        try:
+            while True:
+                future = asyncio.run_coroutine_threadsafe(out.get(), self._loop)
+                while True:
+                    try:
+                        item = future.result(timeout=60.0)
+                        break
+                    except TimeoutError:
+                        continue  # 沿用同一 waiter，避免 timeout 邊界丟掉 frame
+                if item is None:
+                    ended = True
+                    return
+                yield item
+        finally:
+            # 產生器因 HTTP 斷線被關閉時，不可留下 producer 永久等 queue。
+            if not ended:
+                self._loop.call_soon_threadsafe(self._voice_stream_disconnected, sid)
+
+    def _voice_stream_disconnected(self, sid: str) -> None:
+        session = self._voice
+        if session is None or session["sid"] != sid:
+            return
+        session["disconnected"] = True
+        session["disconnected_event"].set()
+        for task in session["control_tasks"]:
+            task.cancel()
+        session["token"].cancel(CancelReason.SUPERSEDED, "voice output disconnected")
+        if self._runner is not None and self._runner.is_speaking:
+            self._runner.interrupt(CancelReason.SUPERSEDED)
+
+    def _voice_emit_control(self, session: dict[str, Any], payload: bytes) -> None:
+        """由 loop 排入低頻控制 frame；音訊經 async sink 做嚴格背壓。"""
+        if session.get("disconnected"):
+            return
+        tasks: set[asyncio.Task] = session["control_tasks"]
+        if len(tasks) >= 32:
+            session["token"].cancel(CancelReason.SUPERSEDED, "voice output backpressure")
+            if self._runner is not None:
+                self._runner.interrupt(CancelReason.SUPERSEDED)
+            return
+        task = asyncio.create_task(session["out"].put(payload))
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    def report_playback(self, report: dict[str, Any]) -> bool:
+        """驗證 generation 後，在 loop 上套用瀏覽器的播放回報。"""
+        generation = str(report.get("generation") or "")
+        state = self._playbacks.get(generation)
+        if state is None or str(report.get("turn_id") or "") != state.turn_id:
+            return False
+        future = asyncio.run_coroutine_threadsafe(
+            self._apply_playback_report_on_loop(state, report), self._loop
+        )
+        try:
+            return bool(future.result(timeout=2.0))
+        except (TimeoutError, RuntimeError):
+            future.cancel()
+            return False
+
+    async def _apply_playback_report_on_loop(
+        self, state: _PlaybackState, report: dict[str, Any]
+    ) -> bool:
+        accepted = await state.apply_report(report)
+        if (
+            accepted
+            and report.get("status") == "aborted"
+            and self._runner is not None
+            and self._runner._current_turn_id == state.turn_id
+        ):
+            # ACK 與 /api/interrupt 可能同時抵達；先到的 ACK 也必須保留
+            # barge-in 取消語意，避免 turn 被錯標成 upstream failure。
+            self._runner.interrupt(CancelReason.BARGE_IN)
+        return accepted
 
     # --- 執行 ---
 
@@ -1197,14 +1293,18 @@ class StreamService:
         turn_id = utterance.turn_id
         t0 = time.perf_counter()
 
-        # 掛在 runner 的 sink 上會讓 PipelineRunner 負責 drain 與播放進度，
-        # 但這裡的「播放」在瀏覽器端，伺服器無從得知進度。
-        # 所以自己收 chunk，並把 spoken 的判定留給前端回報（Phase 5 再處理）。
-        sink = _EmitSink(emit, t0)
+        # 播放完成由瀏覽器依 generation 回報；runner drain 期間保留插話守衛。
+        playback = _PlaybackState(turn_id, uuid.uuid4().hex, self._loop)
+        self._playbacks[playback.generation] = playback
+        sink = _EmitSink(emit, t0, playback, flush_after_end=(origin == "voice"))
         runner.sink = sink
         runner.think_stage = _EmitThink(self._think, emit, t0)
 
-        result = await runner.run_turn(utterance)
+        try:
+            result = await runner.run_turn(utterance)
+        except BaseException:
+            self._playbacks.pop(playback.generation, None)
+            raise
 
         trace = self.tracer.get(turn_id)
         segments = trace.segments_ms() if trace else {}
@@ -1223,13 +1323,19 @@ class StreamService:
             "chunks": trace.chunk_count if trace else 0,
             "split_reasons": dict(trace.split_reasons) if trace else {},
             "audio_seconds": round(sink.written_duration_s, 2),
+            "playback": playback.status,
+            "played_seconds": round(sink.played_duration_s, 3),
+            "generation": playback.generation,
             "memory_injected": getattr(self._think, "last_injected_memory", None),
             "tool_calls": list(getattr(self._think, "last_tool_calls", []) or []),
             "gap_filler": self.gap_filler.last_emitted,
             "styles": list(getattr(runner.think_stage, "styles", []) or []),
             "report": self.tracer.report(turn_id),
         }
-        emit(json_frame(FRAME_META, meta))
+        try:
+            await _emit(emit, json_frame(FRAME_META, meta))
+        finally:
+            self._playbacks.pop(playback.generation, None)
         self._log({"type": "turn", "input": utterance.text, **meta})
         for call in meta["tool_calls"]:
             self._tool_counts[call["name"]] = self._tool_counts.get(call["name"], 0) + 1
@@ -1314,7 +1420,8 @@ class _EmitThink:
                 style = _style_info(sentence)
                 if style is not None:
                     self.styles.append({"index": sentence.index, **style})
-                self._emit(
+                await _emit(
+                    self._emit,
                     json_frame(
                         FRAME_TEXT,
                         {
@@ -1333,18 +1440,117 @@ class _EmitThink:
         await self._inner.commit(turn_id, spoken_text, generated_text)
 
 
+async def _emit(emit: Callable[[bytes], Any], payload: bytes) -> None:
+    result = emit(payload)
+    if inspect.isawaitable(result):
+        await result
+
+
+class _PlaybackState:
+    """單一 turn 的播放 ACK 狀態；只在服務 event loop 上更新。"""
+
+    def __init__(self, turn_id: str, generation: str, loop: asyncio.AbstractEventLoop):
+        self.turn_id = turn_id
+        self.generation = generation
+        self.loop = loop
+        self._event = asyncio.Event()
+        self._written = 0.0
+        self._played = 0.0
+        self._chunks: list[float] = []
+        self._ended = False
+        self.status = "pending"
+        self._abort_frame_sent = False
+
+    def add_chunk(self, duration: float) -> int:
+        index = len(self._chunks)
+        self._chunks.append(max(0.0, duration))
+        self._written += max(0.0, duration)
+        return index
+
+    async def apply_report(self, report: dict[str, Any]) -> bool:
+        if report.get("generation") != self.generation or report.get("turn_id") != self.turn_id:
+            return False
+        if self.status in {"complete", "aborted", "timeout"}:
+            return False
+        try:
+            played = float(report.get("played_s", 0.0))
+        except (TypeError, ValueError):
+            return False
+        if not 0 <= played <= self._written + 0.05:
+            return False
+        self._played = max(self._played, min(played, self._written))
+        status = report.get("status")
+        if status == "aborted":
+            self.status = "aborted"
+            self._event.set()
+        elif status == "complete" and self._ended and self._played >= self._written - 0.05:
+            self.status = "complete"
+            self._event.set()
+        return True
+
+    async def drain(
+        self,
+        emit: Callable[[bytes], Any],
+        timeout_s: float,
+        flush_payload: bytes | None = None,
+    ) -> None:
+        self._ended = True
+        if self.status == "pending":
+            self.status = "waiting"
+        await _emit(emit, json_frame(FRAME_AUDIO_END, {
+            "generation": self.generation,
+            "turn_id": self.turn_id,
+            "chunks": len(self._chunks),
+            "duration_s": self._written,
+        }))
+        if flush_payload is not None:
+            # 先把 END 與 padding 一起送過 tunnel，前端收到 END 後才能回 ACK。
+            await _emit(emit, flush_payload)
+        try:
+            await asyncio.wait_for(self._event.wait(), timeout=timeout_s)
+        except asyncio.TimeoutError as exc:
+            self.status = "timeout"
+            raise TimeoutError("瀏覽器播放回報逾時") from exc
+        if self.status == "aborted":
+            raise CancelledError(CancelReason.BARGE_IN, "瀏覽器已停止播放")
+
+    def abort(self, emit: Callable[[bytes], Any] | None = None) -> None:
+        if self.status == "complete" or self._abort_frame_sent:
+            return
+        if self.status != "timeout":
+            self.status = "aborted"
+            self._event.set()
+        if emit is not None:
+            self._abort_frame_sent = True
+            # stop() 是同步 AudioSink 契約；async voice outbox 透過 task 排隊。
+            result = emit(json_frame(FRAME_AUDIO_ABORT, {
+                "generation": self.generation,
+                "turn_id": self.turn_id,
+            }))
+            if inspect.isawaitable(result):
+                asyncio.create_task(result)
+
+    @property
+    def played_duration_s(self) -> float:
+        return self._played
+
+
 class _EmitSink:
     """把音訊直接送進 HTTP response 的 sink。
 
-    ``played_duration_s`` 回傳「已送出」而非「已播出」——真正的播放進度在
-    瀏覽器端，伺服器不知道。這代表 **barge-in 的 spoken_text 判定在
-    Web 前端會偏樂觀**（算成整段都聽到了）。要精確得讓前端回報播放位置，
-    留給 Phase 5 一起處理。
+    每段帶 generation 與序號；drain 先送 generation_end，再等瀏覽器回報實播
+    位置。逾時或中止會讓管線明確失敗，spoken_text 只按 ACK 的秒數計算。
     """
 
-    def __init__(self, emit: Callable[[bytes], None], t0: float) -> None:
+    def __init__(
+        self, emit: Callable[[bytes], Any], t0: float, playback: _PlaybackState,
+        drain_timeout_s: float = 8.0, flush_after_end: bool = False,
+    ) -> None:
         self._emit = emit
         self._t0 = t0
+        self._playback = playback
+        self._drain_timeout_s = drain_timeout_s
+        self._flush_after_end = flush_after_end
         self.written_duration_s = 0.0
         self._stopped = False
         self._seen_sentences: set[int] = set()
@@ -1352,18 +1558,40 @@ class _EmitSink:
     async def write(self, chunk: AudioChunk) -> None:
         if self._stopped:
             return
+        index = self._playback.add_chunk(chunk.duration_s)
         self.written_duration_s += chunk.duration_s
-        self._emit(frame(FRAME_AUDIO, pcm_to_wav(chunk)))
+        if index == 0:
+            await _emit(self._emit, json_frame(FRAME_AUDIO_BEGIN, {
+                "generation": self._playback.generation,
+                "turn_id": self._playback.turn_id,
+            }))
+        prefix = struct.pack(
+            ">16sId",
+            bytes.fromhex(self._playback.generation),
+            index,
+            chunk.duration_s,
+        )
+        await _emit(self._emit, frame(FRAME_AUDIO, prefix + pcm_to_wav(chunk)))
 
     def stop(self) -> None:
         self._stopped = True
+        self._playback.abort(self._emit)
 
     async def drain(self) -> None:
-        return
+        timeout_s = max(
+            self._drain_timeout_s,
+            (self.written_duration_s - self.played_duration_s) * 1.5 + 2.0,
+        )
+        flush = (
+            json_frame(FRAME_EVENT, {"event": "flush", "pad": "." * 16384})
+            if self._flush_after_end
+            else None
+        )
+        await self._playback.drain(self._emit, timeout_s, flush)
 
     @property
     def played_duration_s(self) -> float:
-        return self.written_duration_s
+        return self._playback.played_duration_s
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -1419,6 +1647,16 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
+        if self.path == "/api/playback/report":
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                report = json.loads(self.rfile.read(length) or b"{}")
+            except json.JSONDecodeError:
+                self._json(400, {"ok": False, "error": "invalid json"})
+                return
+            ok = self.service.report_playback(report)
+            self._json(200 if ok else 409, {"ok": ok})
+            return
         if self.path == "/api/interrupt":
             self._json(200, {"interrupted": self.service.interrupt()})
             return

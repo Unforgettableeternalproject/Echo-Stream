@@ -19,6 +19,7 @@ import pytest
 from echo_stream.contracts.types import AudioChunk
 from echo_stream.web.server import (
     FRAME_AUDIO,
+    FRAME_AUDIO_END,
     FRAME_META,
     FRAME_TEXT,
     StreamService,
@@ -101,7 +102,43 @@ def post(url: str, payload: dict) -> bytes:
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=60) as r:
+        if url.endswith("/api/say"):
+            return read_response_ack(r, url.rsplit("/api/say", 1)[0])
         return r.read()
+
+
+def read_response_ack(response, base: str) -> bytes:
+    """讀串流時收到 AUDIO_END 就 ACK，避免測試 client 等 EOF 形成死鎖。"""
+    data = bytearray()
+    pending = bytearray()
+    while True:
+        block = response.read1(65536)
+        if not block:
+            break
+        data.extend(block)
+        pending.extend(block)
+        while len(pending) >= 5:
+            size = struct.unpack(">I", pending[1:5])[0]
+            if len(pending) < size + 5:
+                break
+            kind = pending[0]
+            payload = bytes(pending[5 : 5 + size])
+            del pending[: 5 + size]
+            if kind == FRAME_AUDIO_END:
+                end = json.loads(payload)
+                ack = urllib.request.Request(
+                    base + "/api/playback/report",
+                    data=json.dumps({
+                        "generation": end["generation"],
+                        "turn_id": end["turn_id"],
+                        "played_s": end["duration_s"],
+                        "status": "complete",
+                    }).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(ack, timeout=5) as ack_response:
+                    assert json.loads(ack_response.read())["ok"]
+    return bytes(data)
 
 
 def test_首頁能開(server):
@@ -150,7 +187,7 @@ def test_音訊是獨立可播的_wav(server):
 
     assert audio
     for wav in audio:
-        assert wav[:4] == b"RIFF"
+        assert wav[28:32] == b"RIFF"
 
 
 def test_meta_含延遲報告(server):
@@ -255,7 +292,7 @@ def test_語音_session_端到端(server):
     def read_stream():
         req = urllib.request.Request(f"{base}/api/voice/stream?sid={sid}")
         with urllib.request.urlopen(req, timeout=60) as r:
-            collected["raw"] = r.read()
+            collected["raw"] = read_response_ack(r, base)
 
     reader = threading.Thread(target=read_stream, daemon=True)
     reader.start()

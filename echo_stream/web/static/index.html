@@ -326,7 +326,8 @@
 </div>
 
 <script>
-const FRAME = { AUDIO: 1, META: 2, ERROR: 3, TEXT: 4, UTTER: 5, EVENT: 6 };
+const FRAME = { AUDIO: 1, META: 2, ERROR: 3, TEXT: 4, UTTER: 5, EVENT: 6,
+  AUDIO_END: 7, AUDIO_ABORT: 8, AUDIO_BEGIN: 9 };
 const BUDGET = { stt: 700, memory: 300, llm_first_sentence: 800, tts_first_chunk: 1800, ttfa: 3500 };
 const LABEL = {
   stt: "STT 最終轉錄", memory: "Memory retrieve", tool: "工具呼叫",
@@ -348,26 +349,132 @@ let ctx = null, nextAt = 0, sources = [], busy = false, t0 = 0;
 // playGen 是世代守衛：插話/停止後，還在解碼路上的舊段不得再排程。
 let playChain = Promise.resolve();
 let playGen = 0;
+const playbacks = new Map();
+let playbackTimer = null;
 
-function playChunk(bytes) {
+function reportPlayback(state, status = "progress") {
+  if (!state || state.status === "aborted" || state.status === "complete") return;
+  const now = ctx ? ctx.currentTime : 0;
+  let played = 0;
+  for (const item of state.chunks) {
+    if (item.ended) played += item.duration;
+    else if (item.startedAt != null) played += Math.max(0, Math.min(item.duration, now - item.startedAt));
+  }
+  if (status === "complete") played = state.duration;
+  if (status === "aborted") state.status = "aborted";
+  fetch("/api/playback/report", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ generation: state.generation, turn_id: state.turnId, played_s: played, status }),
+    keepalive: true,
+  }).catch(() => {});
+  if (status === "complete" || status === "aborted") {
+    playbacks.delete(state.generation);
+    if (playbacks.size === 0 && playbackTimer != null) {
+      clearInterval(playbackTimer);
+      playbackTimer = null;
+    }
+  }
+}
+
+function ensurePlaybackReporter() {
+  if (playbackTimer == null) playbackTimer = setInterval(() => {
+    for (const state of playbacks.values()) reportPlayback(state);
+  }, 250);
+}
+
+function playChunk(generation, index, duration, bytes) {
   if (!ctx) return;
   const gen = playGen;
+  const state = playbacks.get(generation);
+  if (!state || state.status === "aborted") return;
+  const record = { duration, startedAt: null, ended: false };
+  state.chunks[index] = record;
+  state.duration += duration;
+  ensurePlaybackReporter();
   playChain = playChain.then(async () => {
-    if (gen !== playGen) return;  // 這段所屬的回合已被停掉
+    if (gen !== playGen || state.status === "aborted") return;  // 這段所屬的回合已被停掉
     const buf = await ctx.decodeAudioData(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
-    if (gen !== playGen) return;  // 解碼期間被停掉
+    if (gen !== playGen || state.status === "aborted") return;  // 解碼期間被停掉
     const src = ctx.createBufferSource();
+    record.source = src;
     src.buffer = buf;
-    src.connect(ctx.destination);
+    // 段間淡入淡出（~6ms）：每段是一次獨立合成，波形在接縫處不連續，
+    // 直接對接會有爆音/喀嚓聲。6ms 短到聽不出音量凹陷，但足以消掉不連續點
+    const g = ctx.createGain();
+    src.connect(g);
+    g.connect(ctx.destination);
     const at = Math.max(ctx.currentTime + 0.02, nextAt);
+    record.startedAt = at;
+    record.endAt = at + buf.duration;
+    const fade = Math.min(0.006, buf.duration / 4);
+    g.gain.setValueAtTime(0, at);
+    g.gain.linearRampToValueAtTime(1, at + fade);
+    g.gain.setValueAtTime(1, at + buf.duration - fade);
+    g.gain.linearRampToValueAtTime(0, at + buf.duration);
     src.start(at);
     nextAt = at + buf.duration;
     sources.push(src);
-    src.onended = () => { sources = sources.filter(s => s !== src); };
+    src.onended = () => {
+      sources = sources.filter(s => s !== src);
+      if (state.status === "aborted") return;
+      record.ended = true;
+      state.endedChunks = state.chunks.filter(x => x && x.ended).length;
+      if (state.endReceived && state.endedChunks >= state.expectedChunks) reportPlayback(state, "complete");
+    };
   }).catch(() => {});
 }
 
+function beginPlayback(info) {
+  playbacks.set(info.generation, {
+    generation: info.generation, turnId: info.turn_id, chunks: [], duration: 0,
+    endReceived: false, endedChunks: 0, expectedChunks: null, status: "playing",
+  });
+  ensurePlaybackReporter();
+}
+
+function endPlayback(info) {
+  let state = playbacks.get(info.generation);
+  if (!state) {
+    state = { generation: info.generation, turnId: info.turn_id, chunks: [], duration: 0,
+      endReceived: false, endedChunks: 0, expectedChunks: null, status: "playing" };
+    playbacks.set(info.generation, state);
+  }
+  state.turnId = info.turn_id;
+  state.endReceived = true;
+  state.expectedChunks = info.chunks;
+  state.duration = info.duration_s;
+  if (state.expectedChunks === 0) reportPlayback(state, "complete");
+  else if (state.endedChunks >= state.expectedChunks) reportPlayback(state, "complete");
+}
+
+function abortPlayback(generation) {
+  const state = playbacks.get(generation);
+  if (!state) return;
+  state.status = "aborted";
+  playbacks.delete(generation);
+  for (const item of state.chunks) {
+    if (item && item.source) { try { item.source.stop(); } catch (e) {} }
+  }
+  recomputeNextAt();
+  if (playbacks.size === 0 && playbackTimer != null) {
+    clearInterval(playbackTimer);
+    playbackTimer = null;
+  }
+}
+
+function recomputeNextAt() {
+  if (!ctx) { nextAt = 0; return; }
+  let tail = ctx.currentTime;
+  for (const state of playbacks.values()) {
+    for (const item of state.chunks) {
+      if (item && !item.ended && item.endAt != null) tail = Math.max(tail, item.endAt);
+    }
+  }
+  nextAt = tail;
+}
+
 function stopAudio() {
+  for (const state of playbacks.values()) reportPlayback(state, "aborted");
   playGen++;  // 作廢還在解碼路上的段
   sources.forEach(s => { try { s.stop(); } catch (e) {} });
   sources = [];
@@ -544,8 +651,19 @@ function setPhase(p) {
 function handleFrame(kind, payload) {
   const text = () => JSON.parse(new TextDecoder().decode(payload));
   if (kind === FRAME.AUDIO) {
-    playChunk(payload);
+    if (payload.length < 28) return;
+    const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+    const generation = Array.from(payload.slice(0, 16), b => b.toString(16).padStart(2, "0")).join("");
+    const index = view.getUint32(16);
+    const duration = view.getFloat64(20);
+    playChunk(generation, index, duration, payload.slice(28));
     if (phase === "think" || phase === "synth") setPhase("play");
+  } else if (kind === FRAME.AUDIO_BEGIN) {
+    beginPlayback(text());
+  } else if (kind === FRAME.AUDIO_END) {
+    endPlayback(text());
+  } else if (kind === FRAME.AUDIO_ABORT) {
+    abortPlayback(text().generation);
   } else if (kind === FRAME.TEXT) {
     addSentence(text());
     if (phase === "think") setPhase("synth");
