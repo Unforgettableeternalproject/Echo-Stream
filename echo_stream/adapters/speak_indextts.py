@@ -55,7 +55,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import config
-from ..contracts.cancellation import CancellationToken, CancelledError
+from ..contracts.cancellation import CancellationToken, CancelledError, CancelReason
 from ..contracts.style import EMOTION_DIMENSIONS, SpeechStyle
 from ..contracts.types import TTS_SAMPLE_RATE, AudioChunk, Sentence
 from ..core.channel import StreamChannel
@@ -256,6 +256,7 @@ class IndexTTS2SpeakStage:
         tts_repo: str | Path | None = None,
         device: str | None = None,
         use_fp16: bool | None = None,
+        use_accel: bool | None = None,
         queue_size: int | None = None,
         sentence_buffer: int = 2,
         sample_rate: int = DEFAULT_SAMPLE_RATE,
@@ -275,6 +276,13 @@ class IndexTTS2SpeakStage:
         self.device = device or config.get("ECHO_STREAM_TTS_DEVICE", "cuda")
         self.use_fp16 = (
             use_fp16 if use_fp16 is not None else config.get_bool("ECHO_STREAM_TTS_FP16", True)
+        )
+        # IndexTTS2Backend 的 use_accel 預設為 False；保留該預設，避免整合層
+        # 未經實機驗收就改變推理路徑。需要加速時可由參數或環境設定明確開啟。
+        self.use_accel = (
+            use_accel
+            if use_accel is not None
+            else config.get_bool("ECHO_STREAM_TTS_USE_ACCEL", False)
         )
         self.queue_size = queue_size or int(config.get("ECHO_STREAM_TTS_QUEUE", "2"))
         self.sentence_buffer = sentence_buffer
@@ -308,6 +316,8 @@ class IndexTTS2SpeakStage:
         self._output_dir = Path(output_dir) if output_dir else None
         self._tempdir: tempfile.TemporaryDirectory | None = None
         self._prepared = False
+        self._synthesis_lock = asyncio.Lock()
+        """持有模型存取權直到 executor worker 真正結束，不隨呼叫端取消提早釋放。"""
 
     # --- 生命週期 ---
 
@@ -385,16 +395,19 @@ class IndexTTS2SpeakStage:
             paths=paths,
             device=self.device,
             use_fp16=self.use_fp16,
+            use_accel=self.use_accel,
             emotion_vector=self.emotion_vector,
         )
 
     async def aclose(self) -> None:
-        backend = self._backend
-        if backend is not None:
-            unload = getattr(backend, "unload", None)
-            if callable(unload):
-                with contextlib.suppress(Exception):
-                    unload()
+        # worker 對模型的同步存取尚未結束前，不卸載 backend。
+        async with self._synthesis_lock:
+            backend = self._backend
+            if backend is not None:
+                unload = getattr(backend, "unload", None)
+                if callable(unload):
+                    with contextlib.suppress(Exception):
+                        await asyncio.get_running_loop().run_in_executor(None, unload)
         if self._tempdir is not None:
             with contextlib.suppress(Exception):
                 self._tempdir.cleanup()
@@ -408,23 +421,29 @@ class IndexTTS2SpeakStage:
     ) -> AsyncIterator[AudioChunk]:
         await self.prepare()
         loop = asyncio.get_running_loop()
+        stream_token = token.child()
 
         # 句子緩衝：讓 SentenceSplitter 在 TTS 合成期間能繼續跑，
         # 否則兩層就變成序列相加而不是重疊
         sentence_ch: StreamChannel[Sentence] = StreamChannel(
-            maxsize=self.sentence_buffer, token=token
+            maxsize=self.sentence_buffer, token=stream_token
         )
         audio_ch: StreamChannel[AudioChunk] = StreamChannel(
-            maxsize=self.queue_size, token=token
+            maxsize=self.queue_size, token=stream_token
         )
 
-        feeder = asyncio.ensure_future(self._feed(sentences, sentence_ch, token))
-        producer = asyncio.ensure_future(self._produce(sentence_ch, audio_ch, loop, token))
+        feeder = asyncio.ensure_future(self._feed(sentences, sentence_ch, stream_token))
+        producer = asyncio.ensure_future(
+            self._produce(sentence_ch, audio_ch, loop, stream_token)
+        )
 
         try:
             async for chunk in audio_ch:
                 yield chunk
         finally:
+            # aclose/task.cancel 也必須解除 executor callback 的背壓；子 token
+            # 不會反向取消其他 stage 共用的 turn token。
+            stream_token.cancel(CancelReason.SHUTDOWN, "TTS stream closed")
             for task in (feeder, producer):
                 if not task.done():
                     task.cancel()
@@ -432,6 +451,7 @@ class IndexTTS2SpeakStage:
             for task in (feeder, producer):
                 with contextlib.suppress(Exception, asyncio.CancelledError):
                     await task
+            stream_token.detach()
 
     async def _feed(
         self,
@@ -461,15 +481,43 @@ class IndexTTS2SpeakStage:
         try:
             async for sentence in sentence_ch:
                 token.raise_if_cancelled()
-                await loop.run_in_executor(
-                    None, self._synthesize_one, sentence, audio_ch, loop, token
+                worker = asyncio.create_task(
+                    self._synthesize_exclusive(sentence, audio_ch, loop, token)
                 )
+                # shield 讓 producer 可在取消時立即退出；worker 自己持有鎖，
+                # 直到同步 generate 真正結束，因此後續 turn 不會重入模型。
+                worker.add_done_callback(self._consume_task_result)
+                await asyncio.shield(worker)
         except CancelledError:
             pass
         except Exception as exc:  # noqa: BLE001
             audio_ch.fail(exc)
             return
         audio_ch.close()
+
+    async def _synthesize_exclusive(
+        self,
+        sentence: Sentence,
+        audio_ch: StreamChannel[AudioChunk],
+        loop: asyncio.AbstractEventLoop,
+        token: CancellationToken,
+    ) -> None:
+        async with self._synthesis_lock:
+            # 已在等待模型所有權的工作可能已過期；此處檢查可阻止它進 generate。
+            token.raise_if_cancelled()
+            worker = loop.run_in_executor(
+                None, self._synthesize_one, sentence, audio_ch, loop, token
+            )
+            # shield 避免 task.cancel 把 asyncio 包裝 future 標成取消；鎖只會在
+            # executor future 完成後離開，callback 需要的 event loop 仍可正常運作。
+            await asyncio.shield(worker)
+
+    @staticmethod
+    def _consume_task_result(task: asyncio.Task) -> None:
+        """取回呼叫端取消後仍在背景完成的 worker task 例外。"""
+        if not task.cancelled():
+            with contextlib.suppress(Exception):
+                task.exception()
 
     def _synthesize_one(
         self,
