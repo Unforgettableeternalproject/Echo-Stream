@@ -944,7 +944,7 @@ async function loadConfig() {
       $("cfg-gap-enabled").checked = !!c.gap_filler.enabled;
       if (c.gap_filler.start_delay_s != null) $("cfg-gap-delay").value = c.gap_filler.start_delay_s;
       const pools = c.gap_filler.phrases || {};
-      $("cfg-gap-hint").textContent = "語音庫" + (c.gap_filler.ready ? "就緒" : "未建") + "：" +
+      $("cfg-gap-hint").textContent = "即時合成（STT 完成後的空窗）：" +
         Object.entries(pools).map(([k, v]) => `${k} ×${v.length}`).join("　") +
         "（文案在 echo_stream.toml）";
     }
