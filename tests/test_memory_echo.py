@@ -335,3 +335,29 @@ async def test_execute_tool_綁session_擋白名單_截結果(fake_tools, monkey
     adapter.set_session("s2")
     await adapter.execute_tool("force_remember", {"content": "x"})
     assert fake_tools[-1][0] == "s2", "換會話後 executor 重建"
+
+
+async def test_aclose_等排隊中的寫入跑完才關閉executor():
+    import asyncio
+    import threading
+
+    adapter = EchoMemoryAdapter(engine=_Engine(_Ctx()))
+    release = threading.Event()
+    done: list[str] = []
+
+    def _slow_store():
+        release.wait(timeout=5)
+        done.append("store")
+
+    loop = asyncio.get_running_loop()
+    pending = loop.run_in_executor(adapter._executor, _slow_store)
+    closing = asyncio.create_task(adapter.aclose())
+    await asyncio.sleep(0.05)
+    assert not closing.done()  # 寫入還沒完成，不能先關
+    release.set()
+    await closing
+    await pending
+    assert done == ["store"]
+    with pytest.raises(RuntimeError):
+        adapter._executor.submit(lambda: None)
+    await adapter.aclose()  # 重複呼叫安全

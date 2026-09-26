@@ -544,6 +544,13 @@ class StreamService:
                 with_timeout.result(timeout=30)
             except Exception:  # noqa: BLE001
                 pass
+        if self._memory is not None and hasattr(self._memory, "aclose"):
+            # 放在 runner 之後：turn 收尾的 store 可能還在排隊，要讓它寫完
+            closing = asyncio.run_coroutine_threadsafe(self._memory.aclose(), self._loop)
+            try:
+                closing.result(timeout=30)
+            except Exception:  # noqa: BLE001
+                pass
         self._loop.call_soon_threadsafe(self._loop.stop)
 
     # --- 插話 ---
