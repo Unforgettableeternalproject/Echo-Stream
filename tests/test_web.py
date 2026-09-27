@@ -806,3 +806,92 @@ def test_emotion_presets_找不到_TTS_repo_退回內建表(tmp_path, monkeypatc
     last = [r for r in records if r.get("type") == "emotion_presets"][-1]
     assert last["source"] == "builtin"
     assert "找不到" in last["reason"]
+
+
+# --- 播放逾時診斷寫進 turn meta ---
+
+
+def test_播放回報逾時時_turn_meta_帶_playback_diag(server, monkeypatch):
+    """前端回報缺最後一段（不送 complete）→ drain 逾時 → meta 與 session log
+    都看得到缺席 chunk 的 index、後端記錄的時長與前端 issues。"""
+    from echo_stream.web import server as server_mod
+
+    base, service = server
+    original = server_mod._PlaybackState.drain
+
+    async def fast_drain(self, emit, timeout_s, flush_payload=None):
+        return await original(self, emit, 0.3, flush_payload)
+
+    monkeypatch.setattr(server_mod._PlaybackState, "drain", fast_drain)
+
+    req = urllib.request.Request(
+        f"{base}/api/say",
+        data=json.dumps({"text": "你好"}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    durations: dict[int, float] = {}
+    data = bytearray()
+    with urllib.request.urlopen(req, timeout=60) as r:
+        pending = bytearray()
+        while True:
+            block = r.read1(65536)
+            if not block:
+                break
+            data.extend(block)
+            pending.extend(block)
+            while len(pending) >= 5:
+                size = struct.unpack(">I", pending[1:5])[0]
+                if len(pending) < size + 5:
+                    break
+                kind = pending[0]
+                payload = bytes(pending[5 : 5 + size])
+                del pending[: 5 + size]
+                if kind == FRAME_AUDIO:
+                    _, index, duration = struct.unpack(">16sId", payload[:28])
+                    durations[index] = duration
+                elif kind == FRAME_AUDIO_END:
+                    end = json.loads(payload)
+                    last = end["chunks"] - 1
+                    report = {
+                        "generation": end["generation"],
+                        "turn_id": end["turn_id"],
+                        "played_s": sum(d for i, d in durations.items() if i != last),
+                        "status": "progress",
+                        "diag": {
+                            "ended_chunks": last, "expected_chunks": end["chunks"],
+                            "received_chunks": end["chunks"], "missing_count": 1,
+                            "issue_count": 1,
+                            "missing": [{"index": last, "stage": "failed"}],
+                            "issues": [f"failed_at_decoding #{last}: EncodingError"],
+                        },
+                    }
+                    ack = urllib.request.Request(
+                        base + "/api/playback/report",
+                        data=json.dumps(report).encode(),
+                        headers={"Content-Type": "application/json"},
+                    )
+                    with urllib.request.urlopen(ack, timeout=5) as ack_response:
+                        assert json.loads(ack_response.read())["ok"]
+
+    meta = json.loads(
+        next(p for k, p in parse_frames(bytes(data)) if k == FRAME_META)
+    )
+    assert meta["playback"] == "timeout"
+    diag = meta["playback_diag"]
+    last = len(durations) - 1
+    assert diag["timeout_s"] == 0.3
+    assert diag["chunks"] == len(durations)
+    assert diag["missing"] == [
+        {"index": last, "stage": "failed", "duration_s": round(durations[last], 3)}
+    ]
+    assert diag["issues"] == [f"failed_at_decoding #{last}: EncodingError"]
+    assert diag["written_s"] - diag["played_s"] == pytest.approx(durations[last], abs=0.01)
+    assert diag["last_report_age_s"] is not None
+
+    turns = [
+        json.loads(line)
+        for line in service.log_path.read_text(encoding="utf-8").splitlines()
+        if '"type": "turn"' in line
+    ]
+    assert turns[-1]["playback_diag"]["missing"][0]["index"] == last

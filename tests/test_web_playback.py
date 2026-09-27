@@ -167,3 +167,105 @@ def test_bounded_voice_queue_滿時等待而不丟音訊_frame():
         assert await out.get() == b"occupy"
 
     asyncio.run(scenario())
+
+
+# --- 播放逾時診斷（純觀察，不改判定）---
+
+
+def _diag_report(generation, turn_id, played, status="progress", **diag):
+    return {
+        "generation": generation, "turn_id": turn_id,
+        "played_s": played, "status": status, "diag": diag,
+    }
+
+
+def test_播放診斷只保存不改變回報判定():
+    async def scenario():
+        gen = "d" * 32
+        state = _PlaybackState("turn-d", gen, asyncio.get_running_loop())
+        for _ in range(3):
+            state.add_chunk(1.0)
+        # 超量與超長輸入會被截斷；diag 本身不影響回報被接受
+        assert await state.apply_report(_diag_report(
+            gen, "turn-d", 2.0,
+            ended_chunks=2, expected_chunks=None, received_chunks=3,
+            missing_count=1, issue_count=15,
+            missing=[{"index": 2, "stage": "decoding"}] + [{"index": i} for i in range(20)],
+            issues=["x" * 500] * 15,
+        ))
+        diag = state._client_diag
+        assert diag["missing"][0] == {"index": 2, "stage": "decoding"}
+        assert len(diag["missing"]) == 10
+        assert len(diag["issues"]) == 10
+        assert all(len(x) == 200 for x in diag["issues"])
+        assert state.status == "pending"
+
+        # 格式錯的 diag 當作沒送：回報照常接受、先前保存的診斷保留
+        assert await state.apply_report({
+            "generation": gen, "turn_id": "turn-d", "played_s": 2.5,
+            "status": "progress", "diag": "garbage",
+        })
+        assert state._client_diag is diag
+        assert state.played_duration_s == 2.5
+
+        # complete 判定仍只看 played 與 ended，diag 說缺席也不擋
+        drain = asyncio.create_task(state.drain(lambda _p: None, timeout_s=1.0))
+        await asyncio.sleep(0)
+        assert await state.apply_report(_diag_report(
+            gen, "turn-d", 3.0, status="complete",
+            ended_chunks=2, expected_chunks=3, missing=[{"index": 2, "stage": "scheduled"}],
+        ))
+        await asyncio.wait_for(drain, timeout=0.5)
+        assert state.status == "complete"
+        assert state.timeout_diag is None
+
+    asyncio.run(scenario())
+
+
+def test_播放逾時時快照缺席_chunk_與前端_issues():
+    async def scenario():
+        gen = "f" * 32
+        state = _PlaybackState("turn-f", gen, asyncio.get_running_loop())
+        for duration in (2.0, 1.5, 4.25):
+            state.add_chunk(duration)
+        assert await state.apply_report(_diag_report(
+            gen, "turn-f", 3.5,
+            ended_chunks=2, expected_chunks=3, received_chunks=3,
+            missing_count=1, issue_count=1,
+            missing=[{"index": 2, "stage": "failed"}],
+            issues=["failed_at_decoding #2 4.25s: EncodingError"],
+        ))
+        with pytest.raises(TimeoutError, match="逾時"):
+            await state.drain(lambda _p: None, timeout_s=0.05)
+
+        diag = state.timeout_diag
+        assert diag["timeout_s"] == 0.05
+        assert diag["written_s"] == 7.75
+        assert diag["played_s"] == 3.5
+        assert diag["chunks"] == 3
+        assert diag["reports"] == 1
+        assert diag["last_report_age_s"] >= 0.04
+        assert diag["client"] == {
+            "ended_chunks": 2, "expected_chunks": 3, "received_chunks": 3,
+            "missing_count": 1, "issue_count": 1,
+        }
+        assert diag["missing"] == [{"index": 2, "stage": "failed", "duration_s": 4.25}]
+        assert diag["issues"] == ["failed_at_decoding #2 4.25s: EncodingError"]
+
+    asyncio.run(scenario())
+
+
+def test_舊前端沒有_diag_逾時快照仍輸出後端側數字():
+    async def scenario():
+        gen = "0" * 32
+        state = _PlaybackState("turn-0", gen, asyncio.get_running_loop())
+        state.add_chunk(1.0)
+        with pytest.raises(TimeoutError):
+            await state.drain(lambda _p: None, timeout_s=0.01)
+        diag = state.timeout_diag
+        assert diag["client"] is None
+        assert diag["missing"] == [] and diag["issues"] == []
+        assert diag["reports"] == 0 and diag["last_report_age_s"] is None
+        assert diag["written_s"] == 1.0 and diag["played_s"] == 0.0
+
+    asyncio.run(scenario())

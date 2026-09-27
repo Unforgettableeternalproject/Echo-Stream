@@ -13,6 +13,7 @@ async function main() {
   const sandbox = {
     pendingDecodes,
     startedSources,
+    console: quietConsole(),
     fetch: async () => ({ ok: true }),
     setInterval: () => 1,
     clearInterval: () => {},
@@ -65,6 +66,19 @@ async function main() {
 
   await testBackendStopReportsFinalPosition();
   await testAckRetry();
+  await testDecodeFailureDiagnostics();
+}
+
+// 收集 warn / error 而不輸出，讓測試能斷言診斷有被記錄
+function quietConsole() {
+  const entries = [];
+  return {
+    entries,
+    log() {},
+    info() {},
+    warn(...args) { entries.push({ level: "warn", args }); },
+    error(...args) { entries.push({ level: "error", args }); },
+  };
 }
 
 // 建立獨立 sandbox：可控的 fetch 回應與計時器，不依賴真實網路。
@@ -73,9 +87,12 @@ function makeSandbox(html, fetchImpl) {
   const end = html.indexOf("// ── Frame 解析", start);
   const timers = [];
   const calls = [];
+  const logs = quietConsole();
   const sandbox = {
     calls,
     timers,
+    logs,
+    console: logs,
     fetch: (url, init) => {
       calls.push({ url, body: JSON.parse(init.body) });
       return fetchImpl(calls.length);
@@ -173,6 +190,63 @@ async function testAckRetry() {
   await flush();
   if (rejected.calls.length !== 1) throw new Error("後端 409 拒絕後仍重試");
   console.log("完成 ACK：失敗有限次重試、成功才清理、409 不重試");
+}
+
+async function testDecodeFailureDiagnostics() {
+  const html = fs.readFileSync("echo_stream/web/static/index.html", "utf8");
+  const sb = makeSandbox(html, async () => ({ ok: true, status: 200 }));
+  // 第 1 段解碼失敗；舊版的 .catch(() => {}) 會把它吞掉、完全看不出缺哪段
+  vm.runInContext(
+    "ctx.decodeAudioData = async (buf) => {" +
+      "  if (new Uint8Array(buf)[0] === 2) throw new Error('EncodingError: 壞掉的 WAV');" +
+      "  return { duration: 2 };" +
+      "};" +
+      "beginPlayback({generation:'g4', turn_id:'t4'});" +
+      "playChunk('g4', 0, 2, new Uint8Array([1]));" +
+      "playChunk('g4', 1, 1.5, new Uint8Array([2]));" +
+      "playChunk('g4', 2, 3, new Uint8Array([3]));",
+    sb,
+  );
+  await vm.runInContext("playChain", sb);
+  await flush();
+  const state = vm.runInContext("playbacks.get('g4')", sb);
+  if (!state || state.issues.length !== 1 || !state.issues[0].includes("failed_at_decoding #1")) {
+    throw new Error(`解碼失敗沒有記進 issues: ${JSON.stringify(state && state.issues)}`);
+  }
+  const logged = sb.logs.entries.find(e => e.level === "error");
+  if (!logged || logged.args[2].index !== 1 || logged.args[2].generation !== "g4"
+      || !String(logged.args[2].error).includes("EncodingError")) {
+    throw new Error(`解碼失敗沒有 console.error: ${JSON.stringify(sb.logs.entries)}`);
+  }
+  // 失敗不能斷掉播放鏈：後一段仍要排程
+  if (state.chunks[2].stage !== "scheduled") throw new Error("解碼失敗後播放鏈中斷");
+
+  // 第 0 段播完；END 到了但第 1 段永遠不會 onended → 不得誤判完成
+  vm.runInContext(
+    "playbacks.get('g4').chunks[0].source.onended();" +
+      "endPlayback({generation:'g4', turn_id:'t4', chunks:3, duration_s:6.5});" +
+      "reportPlayback(playbacks.get('g4'));",
+    sb,
+  );
+  await flush();
+  if (sb.calls.some(c => c.body.status === "complete")) throw new Error("缺段仍送出 complete");
+  const progress = sb.calls.filter(c => c.body.status === "progress").pop();
+  if (!progress || !progress.body.diag) throw new Error("進度回報沒有帶 diag");
+  const diag = progress.body.diag;
+  const missing = diag.missing.map(m => `${m.index}:${m.stage}`).join(",");
+  if (diag.ended_chunks !== 1 || diag.expected_chunks !== 3 || diag.missing_count !== 2
+      || missing !== "1:failed,2:scheduled" || diag.issues.length !== 1 || diag.issue_count !== 1) {
+    throw new Error(`進度回報 diag 錯誤: ${JSON.stringify(diag)}`);
+  }
+
+  // 最終 ACK（這裡由後端停止觸發）同樣帶出缺席 index
+  vm.runInContext("abortPlayback({generation:'g4', turn_id:'t4'});", sb);
+  await flush();
+  const final = sb.calls.find(c => c.body.status === "aborted");
+  if (!final || !final.body.diag || !final.body.diag.missing.some(m => m.index === 1)) {
+    throw new Error(`最終 ACK 沒有帶出缺席 index: ${JSON.stringify(final && final.body)}`);
+  }
+  console.log("解碼失敗：issues / console 有記錄，回報帶出缺席 chunk，播放鏈不中斷");
 }
 
 main().catch(error => {

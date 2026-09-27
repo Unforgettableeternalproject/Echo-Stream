@@ -354,6 +354,50 @@ const pendingAcks = new Map();       // 已送出最終回報、等後端確認�
 const closedGenerations = new Set(); // 已結束的 generation：遲到的 BEGIN/AUDIO/END 一律忽略
 const ACK_RETRY_DELAYS_MS = [300, 1000, 2500];
 let playbackTimer = null;
+// 播放診斷上限：回報帶的缺席清單 / issues 筆數與單筆長度（後端另有同樣的截斷）
+const DIAG_MAX_MISSING = 10;
+const DIAG_MAX_ISSUES = 10;
+const DIAG_ISSUE_CHARS = 200;
+const DIAG_KEEP_ISSUES = 30;
+
+// chunk 靜默缺席的原因一律記下：console 看得到，也累積在該 generation 的 state，
+// 隨進度回報 / 最終 ACK 帶給後端。純觀察，不影響完成判定。
+function notePlaybackIssue(state, generation, kind, index, duration, err) {
+  const detail = err == null ? "" : (err && err.message) || String(err);
+  const info = { generation, index, duration, kind, error: detail || undefined };
+  // 記錄本身絕不能拋錯：它跑在 playChain 的 catch 裡，一拋整條播放鏈就斷了
+  try {
+    if (err != null) console.error("[playback]", kind, info);
+    else console.warn("[playback]", kind, info);
+  } catch (e) { /* 沒有 console 也照常累積 */ }
+  if (!state || !state.issues) return;
+  if (state.issues.length >= DIAG_KEEP_ISSUES) { state.issueCount++; return; }
+  const text = `${kind} #${index} ${Number(duration).toFixed(2)}s${detail ? ": " + detail : ""}`;
+  state.issues.push(text.slice(0, DIAG_ISSUE_CHARS));
+  state.issueCount++;
+}
+
+// 這個 generation 的診斷快照：哪些 chunk 還沒 onended、各自卡在哪個階段
+function playbackDiag(state) {
+  const total = state.expectedChunks != null ? state.expectedChunks : state.chunks.length;
+  const missing = [];
+  let missingCount = 0;
+  for (let i = 0; i < total; i++) {
+    const item = state.chunks[i];
+    if (item && item.ended) continue;
+    missingCount++;
+    if (missing.length < DIAG_MAX_MISSING) missing.push({ index: i, stage: item ? item.stage : "absent" });
+  }
+  return {
+    ended_chunks: state.endedChunks,
+    expected_chunks: state.expectedChunks,
+    received_chunks: state.chunks.filter(Boolean).length,
+    missing_count: missingCount,
+    missing,
+    issues: (state.issues || []).slice(0, DIAG_MAX_ISSUES),
+    issue_count: state.issueCount || 0,
+  };
+}
 
 // 依 AudioContext 時鐘算出這個 generation 實際播了幾秒
 function playedSeconds(state) {
@@ -384,7 +428,7 @@ function reportPlayback(state) {
   if (!state || state.status !== "playing") return;
   fetch("/api/playback/report", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ generation: state.generation, turn_id: state.turnId, played_s: playedSeconds(state), status: "progress" }),
+    body: JSON.stringify({ generation: state.generation, turn_id: state.turnId, played_s: playedSeconds(state), status: "progress", diag: playbackDiag(state) }),
     keepalive: true,
   }).catch(() => {});
 }
@@ -398,7 +442,7 @@ function finishPlayback(state, status, played) {
   closeGeneration(state.generation);
   stopReporterIfIdle();
   pendingAcks.set(state.generation, state);
-  const body = JSON.stringify({ generation: state.generation, turn_id: state.turnId, played_s: played, status });
+  const body = JSON.stringify({ generation: state.generation, turn_id: state.turnId, played_s: played, status, diag: playbackDiag(state) });
   let attempt = 0;
   const send = () => fetch("/api/playback/report", {
     method: "POST", headers: { "Content-Type": "application/json" }, body, keepalive: true,
@@ -420,18 +464,34 @@ function ensurePlaybackReporter() {
 }
 
 function playChunk(generation, index, duration, bytes) {
-  if (!ctx) return;
   const gen = playGen;
   const state = playbacks.get(generation);
-  if (!state || state.status !== "playing") return;
-  const record = { duration, startedAt: null, ended: false };
+  if (!ctx) { notePlaybackIssue(state, generation, "no_audio_context", index, duration); return; }
+  if (!state || state.status !== "playing") {
+    const kind = state ? `state_${state.status}`
+      : closedGenerations.has(generation) ? "closed_generation" : "no_state";
+    notePlaybackIssue(state, generation, kind, index, duration);
+    return;
+  }
+  // stage：queued → decoding → decoded → scheduled → ended（或 skipped / failed）
+  const record = { duration, startedAt: null, ended: false, stage: "queued" };
   state.chunks[index] = record;
   state.duration += duration;
   ensurePlaybackReporter();
   playChain = playChain.then(async () => {
-    if (gen !== playGen || state.status !== "playing") return;  // 這段所屬的回合已被停掉
+    if (gen !== playGen || state.status !== "playing") {  // 這段所屬的回合已被停掉
+      record.stage = "skipped";
+      notePlaybackIssue(state, generation, "stale_before_decode", index, duration);
+      return;
+    }
+    record.stage = "decoding";
     const buf = await ctx.decodeAudioData(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
-    if (gen !== playGen || state.status !== "playing") return;  // 解碼期間被停掉
+    record.stage = "decoded";
+    if (gen !== playGen || state.status !== "playing") {  // 解碼期間被停掉
+      record.stage = "skipped";
+      notePlaybackIssue(state, generation, "stale_after_decode", index, duration);
+      return;
+    }
     const src = ctx.createBufferSource();
     record.source = src;
     src.buffer = buf;
@@ -449,21 +509,29 @@ function playChunk(generation, index, duration, bytes) {
     g.gain.setValueAtTime(1, at + buf.duration - fade);
     g.gain.linearRampToValueAtTime(0, at + buf.duration);
     src.start(at);
+    record.stage = "scheduled";
     nextAt = at + buf.duration;
     sources.push(src);
     src.onended = () => {
       sources = sources.filter(s => s !== src);
       if (state.status !== "playing") return;
       record.ended = true;
+      record.stage = "ended";
       state.endedChunks = state.chunks.filter(x => x && x.ended).length;
       if (state.endReceived && state.endedChunks >= state.expectedChunks) finishPlayback(state, "complete", state.duration);
     };
-  }).catch(() => {});
+  }).catch(err => {
+    // 解碼或排程失敗：這段永遠不會 onended，記下卡在哪個階段
+    const stage = record.stage;
+    record.stage = "failed";
+    notePlaybackIssue(state, generation, `failed_at_${stage}`, index, duration, err);
+  });
 }
 
 function newPlaybackState(generation, turnId) {
   return { generation, turnId, chunks: [], duration: 0,
-    endReceived: false, endedChunks: 0, expectedChunks: null, status: "playing" };
+    endReceived: false, endedChunks: 0, expectedChunks: null, status: "playing",
+    issues: [], issueCount: 0 };
 }
 
 function beginPlayback(info) {

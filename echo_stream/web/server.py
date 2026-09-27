@@ -1388,6 +1388,8 @@ class StreamService:
             "playback": playback.status,
             "played_seconds": round(sink.played_duration_s, 3),
             "generation": playback.generation,
+            # 只有播放回報逾時才有值：缺席 chunk、前端 issues、最後回報距今秒數
+            "playback_diag": playback.timeout_diag,
             "memory_injected": getattr(self._think, "last_injected_memory", None),
             "tool_calls": list(getattr(self._think, "last_tool_calls", []) or []),
             "gap_filler": self.gap_filler.last_emitted,
@@ -1527,6 +1529,13 @@ class _PlaybackState:
         self._final_event = asyncio.Event()
         self._awaiting_final = False
         """後端已送出停止、正在等前端回報最終實播位置。"""
+        # ── 診斷（純觀察，不參與任何狀態判定）──
+        self._client_diag: dict[str, Any] | None = None
+        """前端最後一次回報附帶的 diag（缺席 chunk、issues），已截斷。"""
+        self._report_count = 0
+        self._last_report_at: float | None = None
+        self.timeout_diag: dict[str, Any] | None = None
+        """drain 逾時當下的快照；turn meta 以 ``playback_diag`` 輸出。"""
 
     def add_chunk(self, duration: float) -> int:
         index = len(self._chunks)
@@ -1537,6 +1546,12 @@ class _PlaybackState:
     async def apply_report(self, report: dict[str, Any]) -> bool:
         if report.get("generation") != self.generation or report.get("turn_id") != self.turn_id:
             return False
+        # 診斷只保存、不影響下方任何判定；舊前端沒有 diag 欄位時照常
+        self._report_count += 1
+        self._last_report_at = time.monotonic()
+        diag = _sanitize_client_diag(report.get("diag"))
+        if diag is not None:
+            self._client_diag = diag
         status = report.get("status")
         if self._final_status is not None:
             # 前端確認成功前會重送同一份最終回報：同狀態冪等成功、其餘一律拒絕
@@ -1590,6 +1605,7 @@ class _PlaybackState:
             await asyncio.wait_for(self._event.wait(), timeout=timeout_s)
         except asyncio.TimeoutError as exc:
             self.status = "timeout"
+            self.timeout_diag = self._build_timeout_diag(timeout_s)
             raise TimeoutError("瀏覽器播放回報逾時") from exc
         if self.status == "aborted":
             raise CancelledError(CancelReason.BARGE_IN, "瀏覽器已停止播放")
@@ -1627,6 +1643,91 @@ class _PlaybackState:
     @property
     def played_duration_s(self) -> float:
         return self._played
+
+    def _build_timeout_diag(self, timeout_s: float) -> dict[str, Any]:
+        """逾時當下組出可寫進 session log 的診斷；缺席 chunk 補上後端記錄的時長。"""
+        client = self._client_diag or {}
+        missing = []
+        for item in client.get("missing", []):
+            index = item["index"]
+            duration = self._chunks[index] if 0 <= index < len(self._chunks) else None
+            missing.append({
+                "index": index,
+                "stage": item.get("stage"),
+                "duration_s": round(duration, 3) if duration is not None else None,
+            })
+        age = (
+            round(time.monotonic() - self._last_report_at, 3)
+            if self._last_report_at is not None
+            else None
+        )
+        return {
+            "timeout_s": round(timeout_s, 3),
+            "written_s": round(self._written, 3),
+            "played_s": round(self._played, 3),
+            "chunks": len(self._chunks),
+            "reports": self._report_count,
+            "last_report_age_s": age,
+            "client": {
+                key: client.get(key)
+                for key in (
+                    "ended_chunks", "expected_chunks", "received_chunks",
+                    "missing_count", "issue_count",
+                )
+            } if self._client_diag is not None else None,
+            "missing": missing,
+            "issues": list(client.get("issues", [])),
+        }
+
+
+_DIAG_MAX_MISSING = 10
+_DIAG_MAX_ISSUES = 10
+_DIAG_MAX_ISSUE_CHARS = 200
+
+
+def _sanitize_client_diag(raw: Any) -> dict[str, Any] | None:
+    """清洗前端送來的播放診斷：只留已知欄位、限制數量與字串長度。
+
+    格式不對就回 None（當作沒送）——診斷不能讓回報本身失敗。
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    def _int(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)) and value >= 0:
+            return int(value)
+        return None
+
+    missing: list[dict[str, Any]] = []
+    raw_missing = raw.get("missing")
+    if isinstance(raw_missing, list):
+        for item in raw_missing[:_DIAG_MAX_MISSING]:
+            if isinstance(item, dict):
+                index = _int(item.get("index"))
+                stage = item.get("stage")
+            else:
+                index, stage = _int(item), None
+            if index is None:
+                continue
+            missing.append({
+                "index": index,
+                "stage": str(stage)[:32] if stage is not None else None,
+            })
+    issues: list[str] = []
+    raw_issues = raw.get("issues")
+    if isinstance(raw_issues, list):
+        issues = [str(x)[:_DIAG_MAX_ISSUE_CHARS] for x in raw_issues[:_DIAG_MAX_ISSUES]]
+    return {
+        "ended_chunks": _int(raw.get("ended_chunks")),
+        "expected_chunks": _int(raw.get("expected_chunks")),
+        "received_chunks": _int(raw.get("received_chunks")),
+        "missing_count": _int(raw.get("missing_count")),
+        "issue_count": _int(raw.get("issue_count")),
+        "missing": missing,
+        "issues": issues,
+    }
 
 
 class _EmitSink:
