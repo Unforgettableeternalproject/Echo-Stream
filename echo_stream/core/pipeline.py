@@ -206,6 +206,11 @@ class PipelineRunner:
             self._current_token = None
             self._current_turn_id = None
 
+        # 被停掉的 sink 可能還有「最後實播位置」在回報路上（例如瀏覽器端）：
+        # 先等它確認，再推算 spoken_text——commit 不能早於這一步
+        if phase is not TurnPhase.DONE:
+            await self._confirm_sink_stopped()
+
         generated_text = "".join(
             sentences[i].text for i in sorted(sentences) if sentences[i].text
         )
@@ -233,6 +238,19 @@ class PipelineRunner:
         )
 
     # --- 內部 ---
+
+    async def _confirm_sink_stopped(self) -> None:
+        """停止後等 sink 確認最終播放量。
+
+        選用 hook：sink 有 ``confirm_stopped()`` 才呼叫，時限由 sink 自己負責
+        （逾時就沿用最後已知的 ``played_duration_s``）。沒有此方法的 sink 視為
+        停止當下就已確定。
+        """
+        confirm = getattr(self.sink, "confirm_stopped", None)
+        if confirm is None:
+            return
+        with contextlib.suppress(Exception):
+            await confirm()
 
     async def _drain_or_cancel(self, token: CancellationToken) -> None:
         """等 sink 播完，但保持可被插話中斷。"""

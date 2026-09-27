@@ -33,6 +33,7 @@ HTTP server 是多執行緒的（``ThreadingHTTPServer``），管線是 asyncio 
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import inspect
 import io
@@ -304,6 +305,10 @@ class StreamService:
         self._voice: dict[str, Any] | None = None
         """當前的語音 session（單使用者，一次一個）。"""
         self._playbacks: dict[str, _PlaybackState] = {}
+        self._finished_playbacks: collections.OrderedDict[str, _PlaybackState] = (
+            collections.OrderedDict()
+        )
+        """已結算的 generation（有上限）：讓前端重送的最終 ACK 能冪等回成功。"""
 
         self._discard_turn = False
         """捨棄請求打在進行中的 turn 上：voice loop 在 turn 收尾後
@@ -773,6 +778,9 @@ class StreamService:
     # 與 apply_config 同一條規矩。store 的檔案讀寫也統一在 loop 執行緒，
     # SessionStore 不是 thread-safe 的，兩條執行緒同時碰 index 會互咬。
 
+    playback_stop_confirm_s: float = 1.0
+    """後端發起停止後，等前端回報最終實播位置的上限；逾時沿用最後已知值。"""
+
     def _history(self) -> list[dict[str, str]] | None:
         return getattr(self._think, "history", None)
 
@@ -1002,6 +1010,9 @@ class StreamService:
                 "token": CancellationToken(),
                 "control_tasks": set(),
                 "disconnected_event": asyncio.Event(),
+                # 停止/中止 frame 的優先通道：不能排在已塞滿的音訊佇列後面
+                "urgent": collections.deque(),
+                "urgent_event": asyncio.Event(),
             }
             self._voice = session
             asyncio.run_coroutine_threadsafe(self._voice_loop(session), self._loop)
@@ -1139,15 +1150,20 @@ class StreamService:
                 pre_len = len(history) if history is not None else 0
                 self._discard_turn = False
                 async def send(payload: bytes) -> None:
-                    is_abort = bool(payload) and payload[0] == FRAME_AUDIO_ABORT
-                    if token.is_cancelled and not is_abort:
+                    if payload and payload[0] == FRAME_AUDIO_ABORT:
+                        self._voice_send_urgent(session, payload)
+                        return
+                    # 插話取消的是 turn token（不是 session token）：兩者都要監聽，
+                    # 否則佇列塞滿時插話成功、管線卻仍卡在 put 上
+                    runner = self._runner
+                    turn_token = runner._current_token if runner is not None else None
+                    if token.is_cancelled or (turn_token is not None and turn_token.is_cancelled):
                         return
                     put_task = asyncio.create_task(out.put(payload))
                     disconnect_task = asyncio.create_task(session["disconnected_event"].wait())
-                    cancel_task = None if is_abort else asyncio.create_task(token.wait())
-                    waits = {put_task, disconnect_task}
-                    if cancel_task is not None:
-                        waits.add(cancel_task)
+                    waits = {put_task, disconnect_task, asyncio.create_task(token.wait())}
+                    if turn_token is not None:
+                        waits.add(asyncio.create_task(turn_token.wait()))
                     try:
                         done, _ = await asyncio.wait(
                             waits, return_when=asyncio.FIRST_COMPLETED
@@ -1188,11 +1204,10 @@ class StreamService:
         session = self._voice
         if session is None or session["sid"] != sid:
             return
-        out: asyncio.Queue = session["out"]
         ended = False
         try:
             while True:
-                future = asyncio.run_coroutine_threadsafe(out.get(), self._loop)
+                future = asyncio.run_coroutine_threadsafe(self._voice_next(session), self._loop)
                 while True:
                     try:
                         item = future.result(timeout=60.0)
@@ -1207,6 +1222,36 @@ class StreamService:
             # 產生器因 HTTP 斷線被關閉時，不可留下 producer 永久等 queue。
             if not ended:
                 self._loop.call_soon_threadsafe(self._voice_stream_disconnected, sid)
+
+    def _voice_send_urgent(self, session: dict[str, Any], payload: bytes) -> None:
+        """把停止類 frame 放進優先通道。**只在 loop 執行緒呼叫。**"""
+        if session.get("disconnected"):
+            return
+        session["urgent"].append(payload)
+        session["urgent_event"].set()
+
+    async def _voice_next(self, session: dict[str, Any]) -> bytes | None:
+        """取下一個要送出的 frame：優先通道先於一般佇列。"""
+        out: asyncio.Queue = session["out"]
+        urgent: collections.deque = session["urgent"]
+        wake: asyncio.Event = session["urgent_event"]
+        while True:
+            if urgent:
+                return urgent.popleft()
+            if not out.empty():
+                return out.get_nowait()
+            wake.clear()
+            get_task = asyncio.ensure_future(out.get())
+            wake_task = asyncio.ensure_future(wake.wait())
+            try:
+                await asyncio.wait({get_task, wake_task}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                wake_task.cancel()
+                if not get_task.done():
+                    # Queue.get 在拿到 item 前被取消不會吃掉資料
+                    get_task.cancel()
+            if get_task.done() and not get_task.cancelled():
+                return get_task.result()
 
     def _voice_stream_disconnected(self, sid: str) -> None:
         session = self._voice
@@ -1237,7 +1282,8 @@ class StreamService:
     def report_playback(self, report: dict[str, Any]) -> bool:
         """驗證 generation 後，在 loop 上套用瀏覽器的播放回報。"""
         generation = str(report.get("generation") or "")
-        state = self._playbacks.get(generation)
+        # 已結算的 generation 仍可比對：重送的最終 ACK 由 apply_report 冪等處理
+        state = self._playbacks.get(generation) or self._finished_playbacks.get(generation)
         if state is None or str(report.get("turn_id") or "") != state.turn_id:
             return False
         future = asyncio.run_coroutine_threadsafe(
@@ -1263,6 +1309,14 @@ class StreamService:
             # barge-in 取消語意，避免 turn 被錯標成 upstream failure。
             self._runner.interrupt(CancelReason.BARGE_IN)
         return accepted
+
+    def _retire_playback(self, playback: _PlaybackState) -> None:
+        """回合結算後移出進行中表，保留有限筆供重送 ACK 冪等比對。"""
+        self._playbacks.pop(playback.generation, None)
+        finished = self._finished_playbacks
+        finished[playback.generation] = playback
+        while len(finished) > 64:
+            finished.popitem(last=False)
 
     # --- 執行 ---
 
@@ -1296,14 +1350,18 @@ class StreamService:
         # 播放完成由瀏覽器依 generation 回報；runner drain 期間保留插話守衛。
         playback = _PlaybackState(turn_id, uuid.uuid4().hex, self._loop)
         self._playbacks[playback.generation] = playback
-        sink = _EmitSink(emit, t0, playback, flush_after_end=(origin == "voice"))
+        sink = _EmitSink(
+            emit, t0, playback,
+            flush_after_end=(origin == "voice"),
+            stop_confirm_timeout_s=self.playback_stop_confirm_s,
+        )
         runner.sink = sink
         runner.think_stage = _EmitThink(self._think, emit, t0)
 
         try:
             result = await runner.run_turn(utterance)
         except BaseException:
-            self._playbacks.pop(playback.generation, None)
+            self._retire_playback(playback)
             raise
 
         trace = self.tracer.get(turn_id)
@@ -1335,7 +1393,7 @@ class StreamService:
         try:
             await _emit(emit, json_frame(FRAME_META, meta))
         finally:
-            self._playbacks.pop(playback.generation, None)
+            self._retire_playback(playback)
         self._log({"type": "turn", "input": utterance.text, **meta})
         for call in meta["tool_calls"]:
             self._tool_counts[call["name"]] = self._tool_counts.get(call["name"], 0) + 1
@@ -1460,6 +1518,11 @@ class _PlaybackState:
         self._ended = False
         self.status = "pending"
         self._abort_frame_sent = False
+        self._final_status: str | None = None
+        """已接受的最終回報（complete / aborted）；之後同狀態的重送冪等成功。"""
+        self._final_event = asyncio.Event()
+        self._awaiting_final = False
+        """後端已送出停止、正在等前端回報最終實播位置。"""
 
     def add_chunk(self, duration: float) -> int:
         index = len(self._chunks)
@@ -1470,7 +1533,11 @@ class _PlaybackState:
     async def apply_report(self, report: dict[str, Any]) -> bool:
         if report.get("generation") != self.generation or report.get("turn_id") != self.turn_id:
             return False
-        if self.status in {"complete", "aborted", "timeout"}:
+        status = report.get("status")
+        if self._final_status is not None:
+            # 前端確認成功前會重送同一份最終回報：同狀態冪等成功、其餘一律拒絕
+            return status == self._final_status
+        if self.status in {"complete", "aborted", "timeout"} and not self._awaiting_final:
             return False
         try:
             played = float(report.get("played_s", 0.0))
@@ -1479,12 +1546,21 @@ class _PlaybackState:
         if not 0 <= played <= self._written + 0.05:
             return False
         self._played = max(self._played, min(played, self._written))
-        status = report.get("status")
+        if self._awaiting_final:
+            # 後端已停止：這份是前端停下時的最後位置，結算要等它（或逾時）
+            if status in {"aborted", "complete"}:
+                self._final_status = status
+                self._final_event.set()
+            return True
         if status == "aborted":
             self.status = "aborted"
+            self._final_status = "aborted"
+            self._final_event.set()
             self._event.set()
         elif status == "complete" and self._ended and self._played >= self._written - 0.05:
             self.status = "complete"
+            self._final_status = "complete"
+            self._final_event.set()
             self._event.set()
         return True
 
@@ -1518,6 +1594,9 @@ class _PlaybackState:
         if self.status == "complete" or self._abort_frame_sent:
             return
         if self.status != "timeout":
+            if emit is not None and self._chunks and self._final_status is None:
+                # 後端發起的停止：前端還沒回報停在哪裡，結算前要等它確認
+                self._awaiting_final = True
             self.status = "aborted"
             self._event.set()
         if emit is not None:
@@ -1529,6 +1608,17 @@ class _PlaybackState:
             }))
             if inspect.isawaitable(result):
                 asyncio.create_task(result)
+
+    async def wait_final(self, timeout_s: float) -> None:
+        """等前端回報停止時的最終實播位置；逾時沿用最後已知值，之後不再改寫。"""
+        if not self._awaiting_final:
+            return
+        try:
+            await asyncio.wait_for(self._final_event.wait(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            self._awaiting_final = False
 
     @property
     def played_duration_s(self) -> float:
@@ -1545,12 +1635,14 @@ class _EmitSink:
     def __init__(
         self, emit: Callable[[bytes], Any], t0: float, playback: _PlaybackState,
         drain_timeout_s: float = 8.0, flush_after_end: bool = False,
+        stop_confirm_timeout_s: float = 1.0,
     ) -> None:
         self._emit = emit
         self._t0 = t0
         self._playback = playback
         self._drain_timeout_s = drain_timeout_s
         self._flush_after_end = flush_after_end
+        self._stop_confirm_timeout_s = stop_confirm_timeout_s
         self.written_duration_s = 0.0
         self._stopped = False
         self._seen_sentences: set[int] = set()
@@ -1588,6 +1680,11 @@ class _EmitSink:
             else None
         )
         await self._playback.drain(self._emit, timeout_s, flush)
+
+    async def confirm_stopped(self) -> None:
+        """停止後等前端確認最終實播量（有時限）；PipelineRunner 在推算
+        spoken_text 前呼叫，commit 因此不會早於播放量確認。"""
+        await self._playback.wait_final(self._stop_confirm_timeout_s)
 
     @property
     def played_duration_s(self) -> float:

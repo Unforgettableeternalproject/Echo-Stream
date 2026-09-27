@@ -349,31 +349,68 @@ let ctx = null, nextAt = 0, sources = [], busy = false, t0 = 0;
 // playGen 是世代守衛：插話/停止後，還在解碼路上的舊段不得再排程。
 let playChain = Promise.resolve();
 let playGen = 0;
-const playbacks = new Map();
+const playbacks = new Map();         // 播放中的 generation
+const pendingAcks = new Map();       // 已送出最終回報、等後端確認的 generation
+const closedGenerations = new Set(); // 已結束的 generation：遲到的 BEGIN/AUDIO/END 一律忽略
+const ACK_RETRY_DELAYS_MS = [300, 1000, 2500];
 let playbackTimer = null;
 
-function reportPlayback(state, status = "progress") {
-  if (!state || state.status === "aborted" || state.status === "complete") return;
+// 依 AudioContext 時鐘算出這個 generation 實際播了幾秒
+function playedSeconds(state) {
   const now = ctx ? ctx.currentTime : 0;
   let played = 0;
   for (const item of state.chunks) {
+    if (!item) continue;
     if (item.ended) played += item.duration;
     else if (item.startedAt != null) played += Math.max(0, Math.min(item.duration, now - item.startedAt));
   }
-  if (status === "complete") played = state.duration;
-  if (status === "aborted") state.status = "aborted";
+  return played;
+}
+
+function closeGeneration(generation) {
+  closedGenerations.add(generation);
+  if (closedGenerations.size > 64) closedGenerations.delete(closedGenerations.values().next().value);
+}
+
+function stopReporterIfIdle() {
+  if (playbacks.size === 0 && playbackTimer != null) {
+    clearInterval(playbackTimer);
+    playbackTimer = null;
+  }
+}
+
+// 進度回報：丟了就算了，下一個 tick 會帶更新的秒數
+function reportPlayback(state) {
+  if (!state || state.status !== "playing") return;
   fetch("/api/playback/report", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ generation: state.generation, turn_id: state.turnId, played_s: played, status }),
+    body: JSON.stringify({ generation: state.generation, turn_id: state.turnId, played_s: playedSeconds(state), status: "progress" }),
     keepalive: true,
   }).catch(() => {});
-  if (status === "complete" || status === "aborted") {
-    playbacks.delete(state.generation);
-    if (playbacks.size === 0 && playbackTimer != null) {
-      clearInterval(playbackTimer);
-      playbackTimer = null;
-    }
-  }
+}
+
+// 最終回報（complete / aborted）：後端靠它結算 spoken_text，所以要確認送達。
+// 網路錯誤或 5xx 有限次重試；後端 2xx（含冪等的重複 ACK）或 4xx 明確拒絕才清理狀態。
+function finishPlayback(state, status, played) {
+  if (state.status !== "playing") return;
+  state.status = status;
+  playbacks.delete(state.generation);
+  closeGeneration(state.generation);
+  stopReporterIfIdle();
+  pendingAcks.set(state.generation, state);
+  const body = JSON.stringify({ generation: state.generation, turn_id: state.turnId, played_s: played, status });
+  let attempt = 0;
+  const send = () => fetch("/api/playback/report", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body, keepalive: true,
+  }).then(res => res.ok || (res.status >= 400 && res.status < 500), () => false)
+    .then(settled => {
+      if (settled || attempt >= ACK_RETRY_DELAYS_MS.length) {
+        pendingAcks.delete(state.generation);
+        return;
+      }
+      setTimeout(send, ACK_RETRY_DELAYS_MS[attempt++]);
+    });
+  send();
 }
 
 function ensurePlaybackReporter() {
@@ -386,15 +423,15 @@ function playChunk(generation, index, duration, bytes) {
   if (!ctx) return;
   const gen = playGen;
   const state = playbacks.get(generation);
-  if (!state || state.status === "aborted") return;
+  if (!state || state.status !== "playing") return;
   const record = { duration, startedAt: null, ended: false };
   state.chunks[index] = record;
   state.duration += duration;
   ensurePlaybackReporter();
   playChain = playChain.then(async () => {
-    if (gen !== playGen || state.status === "aborted") return;  // 這段所屬的回合已被停掉
+    if (gen !== playGen || state.status !== "playing") return;  // 這段所屬的回合已被停掉
     const buf = await ctx.decodeAudioData(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
-    if (gen !== playGen || state.status === "aborted") return;  // 解碼期間被停掉
+    if (gen !== playGen || state.status !== "playing") return;  // 解碼期間被停掉
     const src = ctx.createBufferSource();
     record.source = src;
     src.buffer = buf;
@@ -416,50 +453,59 @@ function playChunk(generation, index, duration, bytes) {
     sources.push(src);
     src.onended = () => {
       sources = sources.filter(s => s !== src);
-      if (state.status === "aborted") return;
+      if (state.status !== "playing") return;
       record.ended = true;
       state.endedChunks = state.chunks.filter(x => x && x.ended).length;
-      if (state.endReceived && state.endedChunks >= state.expectedChunks) reportPlayback(state, "complete");
+      if (state.endReceived && state.endedChunks >= state.expectedChunks) finishPlayback(state, "complete", state.duration);
     };
   }).catch(() => {});
 }
 
+function newPlaybackState(generation, turnId) {
+  return { generation, turnId, chunks: [], duration: 0,
+    endReceived: false, endedChunks: 0, expectedChunks: null, status: "playing" };
+}
+
 function beginPlayback(info) {
-  playbacks.set(info.generation, {
-    generation: info.generation, turnId: info.turn_id, chunks: [], duration: 0,
-    endReceived: false, endedChunks: 0, expectedChunks: null, status: "playing",
-  });
+  if (closedGenerations.has(info.generation) || playbacks.has(info.generation)) return;
+  playbacks.set(info.generation, newPlaybackState(info.generation, info.turn_id));
   ensurePlaybackReporter();
 }
 
 function endPlayback(info) {
+  if (closedGenerations.has(info.generation)) return;
   let state = playbacks.get(info.generation);
   if (!state) {
-    state = { generation: info.generation, turnId: info.turn_id, chunks: [], duration: 0,
-      endReceived: false, endedChunks: 0, expectedChunks: null, status: "playing" };
+    state = newPlaybackState(info.generation, info.turn_id);
     playbacks.set(info.generation, state);
   }
   state.turnId = info.turn_id;
   state.endReceived = true;
   state.expectedChunks = info.chunks;
   state.duration = info.duration_s;
-  if (state.expectedChunks === 0) reportPlayback(state, "complete");
-  else if (state.endedChunks >= state.expectedChunks) reportPlayback(state, "complete");
+  if (state.expectedChunks === 0 || state.endedChunks >= state.expectedChunks) {
+    finishPlayback(state, "complete", state.duration);
+  }
 }
 
-function abortPlayback(generation) {
+// 後端發起的停止：先依時鐘算出停在哪裡並回報（後端等這份確認才結算），再停音源
+function abortPlayback(info) {
+  const generation = typeof info === "string" ? info : info.generation;
   const state = playbacks.get(generation);
-  if (!state) return;
-  state.status = "aborted";
-  playbacks.delete(generation);
+  if (!state) {
+    // 中止走優先通道、可能比 BEGIN 先到：前端根本還沒播，直接回報 0 秒，
+    // 並把 generation 關掉，之後遲到的音訊 frame 不會再開始播放
+    if (typeof info !== "string" && info.turn_id
+        && !closedGenerations.has(generation) && !pendingAcks.has(generation)) {
+      finishPlayback(newPlaybackState(generation, info.turn_id), "aborted", 0);
+    }
+    return;
+  }
+  finishPlayback(state, "aborted", playedSeconds(state));
   for (const item of state.chunks) {
     if (item && item.source) { try { item.source.stop(); } catch (e) {} }
   }
   recomputeNextAt();
-  if (playbacks.size === 0 && playbackTimer != null) {
-    clearInterval(playbackTimer);
-    playbackTimer = null;
-  }
 }
 
 function recomputeNextAt() {
@@ -474,7 +520,7 @@ function recomputeNextAt() {
 }
 
 function stopAudio() {
-  for (const state of playbacks.values()) reportPlayback(state, "aborted");
+  for (const state of [...playbacks.values()]) finishPlayback(state, "aborted", playedSeconds(state));
   playGen++;  // 作廢還在解碼路上的段
   sources.forEach(s => { try { s.stop(); } catch (e) {} });
   sources = [];
@@ -663,7 +709,7 @@ function handleFrame(kind, payload) {
   } else if (kind === FRAME.AUDIO_END) {
     endPlayback(text());
   } else if (kind === FRAME.AUDIO_ABORT) {
-    abortPlayback(text().generation);
+    abortPlayback(text());
   } else if (kind === FRAME.TEXT) {
     addSentence(text());
     if (phase === "think") setPhase("synth");
