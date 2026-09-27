@@ -415,6 +415,10 @@ class StreamService:
         fake TTS 也試著讀（只要 echo_tts repo 在）——讀不到就用內建退路，不擋。
         """
         try:
+            # echo_tts 要到 runner.prepare() → _build_backend() 才進 sys.path，
+            # 這裡比它早跑，所以先自己把 TTS repo 放進去；找不到 repo 會拋
+            # FileNotFoundError，照樣落到下面的內建退路
+            config.ensure_importable(config.subsystem_path("TTS"))
             from ..adapters.speak_indextts import load_emotion_presets
 
             presets, aliases = load_emotion_presets()

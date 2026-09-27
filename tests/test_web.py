@@ -737,3 +737,72 @@ def test_dream_排程器與手動共用執行路徑(server):
 
 async def _call_start(service, memory):
     service._start_dream_scheduler(memory)
+
+
+# --- emotion preset 載入順序 ---
+
+
+def test_emotion_presets_在_runner_prepare_之前也能從_echo_tts_載入(
+    tmp_path, monkeypatch
+):
+    """_load_emotion_presets 比 runner.prepare() 早跑；echo_tts 只有在
+    ensure_importable(TTS repo) 之後才 import 得到，這裡必須自己先放進 sys.path。"""
+    import sys
+
+    from echo_stream import config
+    from echo_stream.core import emotion
+
+    repo = tmp_path / "fake_tts_repo"
+    pkg = repo / "echo_tts" / "config"
+    pkg.mkdir(parents=True)
+    (repo / "echo_tts" / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "emotion_presets.py").write_text(
+        "def load_presets(path=None):\n"
+        "    return {'假開心': {'vector': [0.7, 0, 0, 0, 0, 0, 0, 0]}}\n"
+        "def get_preset_vector(entry):\n"
+        "    return entry['vector']\n",
+        encoding="utf-8",
+    )
+    # 隔離：真 echo_tts 若已被其他測試 import 或放進 sys.path，要先拿掉
+    monkeypatch.setattr(sys, "path", [p for p in sys.path if "SeparateTTS" not in p])
+    for name in [m for m in sys.modules if m == "echo_tts" or m.startswith("echo_tts.")]:
+        monkeypatch.delitem(sys.modules, name)
+    monkeypatch.setattr(
+        config, "subsystem_path", lambda kind: repo if kind == "TTS" else None
+    )
+    with pytest.raises(ImportError):
+        __import__("echo_tts")  # 前提：ensure_importable 之前確實 import 不到
+
+    service = StreamService(use_real_tts=False, use_real_llm=False, log_dir=tmp_path)
+    try:
+        service._load_emotion_presets()
+        records = [
+            json.loads(line)
+            for line in service.log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        preset_logs = [r for r in records if r.get("type") == "emotion_presets"]
+        assert preset_logs[-1]["source"] == "echo_tts", preset_logs
+        assert "假開心" in emotion.EMOTION_PRESETS
+    finally:
+        emotion.reset_presets()
+        for name in [m for m in sys.modules if m == "echo_tts" or m.startswith("echo_tts.")]:
+            sys.modules.pop(name, None)
+
+
+def test_emotion_presets_找不到_TTS_repo_退回內建表(tmp_path, monkeypatch):
+    from echo_stream import config
+
+    def _missing(kind):
+        raise FileNotFoundError(f"找不到 {kind} 子系統")
+
+    monkeypatch.setattr(config, "subsystem_path", _missing)
+    service = StreamService(use_real_tts=False, use_real_llm=False, log_dir=tmp_path)
+    service._load_emotion_presets()
+    records = [
+        json.loads(line)
+        for line in service.log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    last = [r for r in records if r.get("type") == "emotion_presets"][-1]
+    assert last["source"] == "builtin"
+    assert "找不到" in last["reason"]

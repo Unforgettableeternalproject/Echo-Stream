@@ -24,6 +24,17 @@ def _isolate_defaults(monkeypatch, tmp_path):
     defaults.load_defaults.cache_clear()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_emotion_presets():
+    """StreamService.prepare() 會把 echo_tts 的 preset 表註冊進全域
+    EMOTION_PRESETS（TTS repo 在同層時就讀得到）；每個測試結束都退回內建表，
+    避免測試結果依賴執行順序。"""
+    yield
+    from echo_stream.core import emotion
+
+    emotion.reset_presets()
+
+
 class FakeTTSBackend:
     """模擬 ``IndexTTS2Backend`` 的同步 push callback 行為。
 
