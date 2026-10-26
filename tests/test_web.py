@@ -19,6 +19,7 @@ import pytest
 from echo_stream.contracts.types import AudioChunk
 from echo_stream.web.server import (
     FRAME_AUDIO,
+    FRAME_AUDIO_END,
     FRAME_META,
     FRAME_TEXT,
     StreamService,
@@ -66,9 +67,9 @@ def test_pcm_轉成可播的_wav():
 
 
 @pytest.fixture
-def server():
-    """起一個跑 fake 管線的 server。"""
-    service = StreamService(use_real_tts=False, use_real_llm=False)
+def server(tmp_path):
+    """起一個跑 fake 管線的 server。log 走 tmp_path，不污染 outputs/web_logs。"""
+    service = StreamService(use_real_tts=False, use_real_llm=False, log_dir=tmp_path)
     service.prepare()
 
     handler = type("H", (_Handler,), {"service": service})
@@ -101,7 +102,43 @@ def post(url: str, payload: dict) -> bytes:
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=60) as r:
+        if url.endswith("/api/say"):
+            return read_response_ack(r, url.rsplit("/api/say", 1)[0])
         return r.read()
+
+
+def read_response_ack(response, base: str) -> bytes:
+    """讀串流時收到 AUDIO_END 就 ACK，避免測試 client 等 EOF 形成死鎖。"""
+    data = bytearray()
+    pending = bytearray()
+    while True:
+        block = response.read1(65536)
+        if not block:
+            break
+        data.extend(block)
+        pending.extend(block)
+        while len(pending) >= 5:
+            size = struct.unpack(">I", pending[1:5])[0]
+            if len(pending) < size + 5:
+                break
+            kind = pending[0]
+            payload = bytes(pending[5 : 5 + size])
+            del pending[: 5 + size]
+            if kind == FRAME_AUDIO_END:
+                end = json.loads(payload)
+                ack = urllib.request.Request(
+                    base + "/api/playback/report",
+                    data=json.dumps({
+                        "generation": end["generation"],
+                        "turn_id": end["turn_id"],
+                        "played_s": end["duration_s"],
+                        "status": "complete",
+                    }).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(ack, timeout=5) as ack_response:
+                    assert json.loads(ack_response.read())["ok"]
+    return bytes(data)
 
 
 def test_首頁能開(server):
@@ -150,7 +187,7 @@ def test_音訊是獨立可播的_wav(server):
 
     assert audio
     for wav in audio:
-        assert wav[:4] == b"RIFF"
+        assert wav[28:32] == b"RIFF"
 
 
 def test_meta_含延遲報告(server):
@@ -255,7 +292,7 @@ def test_語音_session_端到端(server):
     def read_stream():
         req = urllib.request.Request(f"{base}/api/voice/stream?sid={sid}")
         with urllib.request.urlopen(req, timeout=60) as r:
-            collected["raw"] = r.read()
+            collected["raw"] = read_response_ack(r, base)
 
     reader = threading.Thread(target=read_stream, daemon=True)
     reader.start()
@@ -328,7 +365,7 @@ def test_config_GET_回報現值(server):
     with urllib.request.urlopen(f"{base}/api/config", timeout=10) as r:
         cfg = json.loads(r.read())
     assert cfg["split"]["first_min"] == service.split_policy.first_min_weight
-    assert "presets" in cfg and "開心" in cfg["presets"]
+    assert "presets" in cfg and "happy" in cfg["presets"]
     assert cfg["turn"]["silence_threshold_s"] is not None
     assert cfg["turn"]["min_confidence"] is not None
 
@@ -405,9 +442,11 @@ class StubStore:
 
 
 @pytest.fixture
-def session_server():
+def session_server(tmp_path):
     """帶 StubStore 的 fake 管線 server。"""
-    service = StreamService(use_real_tts=False, use_real_llm=False, store=StubStore())
+    service = StreamService(
+        use_real_tts=False, use_real_llm=False, store=StubStore(), log_dir=tmp_path
+    )
     service.prepare()
 
     handler = type("H", (_Handler,), {"service": service})
@@ -546,6 +585,11 @@ class StubMemory:
     async def pending_dream_count(self):
         return 7
 
+    profile_text = ""
+
+    async def profile(self):
+        return self.profile_text
+
 
 def _wait_for(cond, timeout=5.0):
     deadline = time.time() + timeout
@@ -654,6 +698,20 @@ def test_dream_背景執行並回報(server):
     assert status["last_report"]["triggered_by"] == "manual"
 
 
+def test_dream_後刷新profile並掛到think(server):
+    base, service = server
+    memory = StubMemory()
+    memory.profile_text = "- 討厭香菜：使用者不吃香菜"
+    service._memory = memory
+    assert getattr(service._think, "profile", "") == ""
+    res = json.loads(post(f"{base}/api/memory/dream", {}))
+    assert res["ok"] is True
+    assert _wait_for(lambda: getattr(service._think, "profile", "") != "")
+    assert service._think.profile == "- 討厭香菜：使用者不吃香菜"
+    status = _get_json(f"{base}/api/memory/dream")
+    assert status["profile"] == "- 討厭香菜：使用者不吃香菜"
+
+
 def test_dream_排程器與手動共用執行路徑(server):
     base, service = server
     memory = StubMemory()
@@ -679,3 +737,161 @@ def test_dream_排程器與手動共用執行路徑(server):
 
 async def _call_start(service, memory):
     service._start_dream_scheduler(memory)
+
+
+# --- emotion preset 載入順序 ---
+
+
+def test_emotion_presets_在_runner_prepare_之前也能從_echo_tts_載入(
+    tmp_path, monkeypatch
+):
+    """_load_emotion_presets 比 runner.prepare() 早跑；echo_tts 只有在
+    ensure_importable(TTS repo) 之後才 import 得到，這裡必須自己先放進 sys.path。"""
+    import sys
+
+    from echo_stream import config
+    from echo_stream.core import emotion
+
+    repo = tmp_path / "fake_tts_repo"
+    pkg = repo / "echo_tts" / "config"
+    pkg.mkdir(parents=True)
+    (repo / "echo_tts" / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "emotion_presets.py").write_text(
+        "def load_presets(path=None):\n"
+        "    return {'假開心': {'vector': [0.7, 0, 0, 0, 0, 0, 0, 0]}}\n"
+        "def get_preset_vector(entry):\n"
+        "    return entry['vector']\n",
+        encoding="utf-8",
+    )
+    # 隔離：真 echo_tts 若已被其他測試 import 或放進 sys.path，要先拿掉
+    monkeypatch.setattr(sys, "path", [p for p in sys.path if "SeparateTTS" not in p])
+    for name in [m for m in sys.modules if m == "echo_tts" or m.startswith("echo_tts.")]:
+        monkeypatch.delitem(sys.modules, name)
+    monkeypatch.setattr(
+        config, "subsystem_path", lambda kind: repo if kind == "TTS" else None
+    )
+    with pytest.raises(ImportError):
+        __import__("echo_tts")  # 前提：ensure_importable 之前確實 import 不到
+
+    service = StreamService(use_real_tts=False, use_real_llm=False, log_dir=tmp_path)
+    try:
+        service._load_emotion_presets()
+        records = [
+            json.loads(line)
+            for line in service.log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        preset_logs = [r for r in records if r.get("type") == "emotion_presets"]
+        assert preset_logs[-1]["source"] == "echo_tts", preset_logs
+        assert "假開心" in emotion.EMOTION_PRESETS
+    finally:
+        emotion.reset_presets()
+        for name in [m for m in sys.modules if m == "echo_tts" or m.startswith("echo_tts.")]:
+            sys.modules.pop(name, None)
+
+
+def test_emotion_presets_找不到_TTS_repo_退回內建表(tmp_path, monkeypatch):
+    from echo_stream import config
+
+    def _missing(kind):
+        raise FileNotFoundError(f"找不到 {kind} 子系統")
+
+    monkeypatch.setattr(config, "subsystem_path", _missing)
+    service = StreamService(use_real_tts=False, use_real_llm=False, log_dir=tmp_path)
+    service._load_emotion_presets()
+    records = [
+        json.loads(line)
+        for line in service.log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    last = [r for r in records if r.get("type") == "emotion_presets"][-1]
+    assert last["source"] == "builtin"
+    assert "找不到" in last["reason"]
+
+
+# --- 播放逾時診斷寫進 turn meta ---
+
+
+def test_播放回報逾時時_turn_meta_帶_playback_diag(server, monkeypatch):
+    """前端回報缺最後一段（不送 complete）→ drain 逾時 → meta 與 session log
+    都看得到缺席 chunk 的 index、後端記錄的時長與前端 issues。"""
+    from echo_stream.web import server as server_mod
+
+    base, service = server
+    original = server_mod._PlaybackState.drain
+
+    async def fast_drain(self, emit, timeout_s, flush_payload=None):
+        return await original(self, emit, 0.3, flush_payload)
+
+    monkeypatch.setattr(server_mod._PlaybackState, "drain", fast_drain)
+
+    req = urllib.request.Request(
+        f"{base}/api/say",
+        data=json.dumps({"text": "你好"}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    durations: dict[int, float] = {}
+    data = bytearray()
+    with urllib.request.urlopen(req, timeout=60) as r:
+        pending = bytearray()
+        while True:
+            block = r.read1(65536)
+            if not block:
+                break
+            data.extend(block)
+            pending.extend(block)
+            while len(pending) >= 5:
+                size = struct.unpack(">I", pending[1:5])[0]
+                if len(pending) < size + 5:
+                    break
+                kind = pending[0]
+                payload = bytes(pending[5 : 5 + size])
+                del pending[: 5 + size]
+                if kind == FRAME_AUDIO:
+                    _, index, duration = struct.unpack(">16sId", payload[:28])
+                    durations[index] = duration
+                elif kind == FRAME_AUDIO_END:
+                    end = json.loads(payload)
+                    last = end["chunks"] - 1
+                    report = {
+                        "generation": end["generation"],
+                        "turn_id": end["turn_id"],
+                        "played_s": sum(d for i, d in durations.items() if i != last),
+                        "status": "progress",
+                        "diag": {
+                            "ended_chunks": last, "expected_chunks": end["chunks"],
+                            "received_chunks": end["chunks"], "missing_count": 1,
+                            "issue_count": 1,
+                            "missing": [{"index": last, "stage": "failed"}],
+                            "issues": [f"failed_at_decoding #{last}: EncodingError"],
+                        },
+                    }
+                    ack = urllib.request.Request(
+                        base + "/api/playback/report",
+                        data=json.dumps(report).encode(),
+                        headers={"Content-Type": "application/json"},
+                    )
+                    with urllib.request.urlopen(ack, timeout=5) as ack_response:
+                        assert json.loads(ack_response.read())["ok"]
+
+    meta = json.loads(
+        next(p for k, p in parse_frames(bytes(data)) if k == FRAME_META)
+    )
+    assert meta["playback"] == "timeout"
+    diag = meta["playback_diag"]
+    last = len(durations) - 1
+    assert diag["timeout_s"] == 0.3
+    assert diag["chunks"] == len(durations)
+    assert diag["missing"] == [
+        {"index": last, "stage": "failed", "duration_s": round(durations[last], 3)}
+    ]
+    assert diag["issues"] == [f"failed_at_decoding #{last}: EncodingError"]
+    assert diag["written_s"] - diag["played_s"] == pytest.approx(durations[last], abs=0.01)
+    assert diag["last_report_age_s"] is not None
+
+    turns = [
+        json.loads(line)
+        for line in service.log_path.read_text(encoding="utf-8").splitlines()
+        if '"type": "turn"' in line
+    ]
+    assert turns[-1]["playback_diag"]["missing"][0]["index"] == last

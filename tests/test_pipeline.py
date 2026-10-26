@@ -104,6 +104,60 @@ async def test_run_session_跑多輪():
 # --- barge-in ---
 
 
+async def test_播放確認逾時不得回報完成():
+    runner, _, sink, _ = build_runner()
+
+    async def fail_drain():
+        raise TimeoutError("播放端未確認完成")
+
+    sink.drain = fail_drain
+    result = await runner.run_turn(Utterance(text="你好"))
+    assert result.phase is TurnPhase.FAILED
+    assert "TimeoutError" in result.error
+    assert not runner.is_speaking
+
+
+def test_墊片尚未播完時回答播放量不為負數():
+    runner, _, _, _ = build_runner()
+    spoken, duration = runner._resolve_spoken({}, [(0, 1.0)], 1.0, gap_duration=0.5)
+    assert spoken == ""
+    assert duration == 0.0
+
+
+async def test_播放完成同時插話仍記為取消():
+    runner, _, sink, _ = build_runner()
+
+    async def interrupt_on_drain():
+        runner.interrupt(CancelReason.BARGE_IN)
+
+    sink.drain = interrupt_on_drain
+    result = await runner.run_turn(Utterance(text="你好"))
+    assert result.phase is TurnPhase.CANCELLED
+    assert result.cancel_reason == CancelReason.BARGE_IN.value
+
+
+async def test_插話等待播放清理完成才結束():
+    runner, _, sink, _ = build_runner()
+    entered = asyncio.Event()
+    cleaned = asyncio.Event()
+
+    async def wait_for_playback():
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0)
+            cleaned.set()
+
+    sink.drain = wait_for_playback
+    task = asyncio.create_task(runner.run_turn(Utterance(text="你好")))
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    runner.interrupt(CancelReason.BARGE_IN)
+    result = await asyncio.wait_for(task, timeout=2)
+    assert result.phase is TurnPhase.CANCELLED
+    assert cleaned.is_set()
+
+
 async def test_插話中止_phase_變成_cancelled():
     runner, _, _, _ = build_runner(realtime=True, rtf=0.05)
 

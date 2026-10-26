@@ -17,6 +17,7 @@ import pytest
 from echo_stream.adapters.speak_indextts import IndexTTS2SpeakStage, tensor_to_pcm16
 from echo_stream.contracts.cancellation import CancellationToken, CancelReason
 from echo_stream.contracts.types import Sentence
+from echo_stream.core.gap_filler import GapFiller, GapFillerPolicy
 from tests.conftest import FakeTTSBackend as FakeBackend
 from tests.conftest import sentence_stream
 
@@ -180,6 +181,194 @@ async def test_取消能穿透到執行緒中的推理():
     assert not backend.completed, "generate 應該被 callback 拋出的例外中止，而不是跑完"
 
 
+async def test_取消時模型所有權保留到同步worker退出_並避免風格交錯():
+    """取消消費端後立即返回，但同 backend 的下一句要等舊 generate 真正退出。"""
+    from echo_stream.contracts.style import SpeechStyle
+
+    first_started = threading.Event()
+    release_first = threading.Event()
+
+    class HeldBackend(FakeBackend):
+        def __init__(self):
+            super().__init__(segments_per_sentence=1)
+            self.active = 0
+            self.max_active = 0
+            self.styles = []
+            self.exited = threading.Event()
+
+        def generate(self, text, output_path, on_segment_audio=None, **kwargs):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self.calls.append(text)
+            self.styles.append(tuple(self.emotion_vector or []))
+            try:
+                if text == "嗯…":
+                    first_started.set()
+                    release_first.wait(2)
+                if on_segment_audio is not None:
+                    on_segment_audio(np.zeros(128, dtype="float32"), 0, 1)
+            finally:
+                self.active -= 1
+                if text == "嗯…":
+                    self.exited.set()
+
+    backend = HeldBackend()
+    stage = IndexTTS2SpeakStage(backend=backend, queue_size=1)
+
+    class Sink:
+        async def write(self, chunk):
+            raise AssertionError("取消中的墊片不應寫入音訊")
+
+    gap = GapFiller(
+        GapFillerPolicy(enabled=True, start_delay_s=0, phrases={"zh": ["嗯…"]})
+    )
+    gap.attach(stage, lambda: SpeechStyle(emotion={"happy": 1.0}))
+    gap.start(Sink(), "gap-turn", CancellationToken(), language="zh")
+    assert await asyncio.to_thread(first_started.wait, 1)
+
+    # stop 不等 thread；取消 token 後 callback 在下一個輸出點退出。
+    await asyncio.wait_for(gap.stop(), timeout=0.2)
+    formal = asyncio.create_task(
+        _collect(stage.stream(sentence_stream(["正式回答。"]), CancellationToken()))
+    )
+    await asyncio.sleep(0.05)
+    assert backend.calls == ["嗯…"], "正式回答須等墊片 worker 退出"
+
+    release_first.set()
+    chunks = await asyncio.wait_for(formal, timeout=2)
+    assert chunks
+    assert backend.exited.is_set()
+    assert backend.calls == ["嗯…", "正式回答。"]
+    assert backend.max_active == 1
+    assert backend.styles[0][0] > 0, "墊片使用自己的風格"
+    assert backend.styles[1] == (), "正式回答還原中性預設，不繼承墊片風格"
+
+
+async def test_已過期墊片排在模型鎖後時不進入generate():
+    from echo_stream.contracts.style import SpeechStyle
+
+    first_started = threading.Event()
+    release_first = threading.Event()
+    gap_waiting_for_owner = threading.Event()
+
+    class HeldBackend(FakeBackend):
+        def generate(self, text, output_path, on_segment_audio=None, **kwargs):
+            self.calls.append(text)
+            if text == "正式回答。":
+                first_started.set()
+                release_first.wait(2)
+            if on_segment_audio is not None:
+                on_segment_audio(np.zeros(128, dtype="float32"), 0, 1)
+
+    class TrackedStage(IndexTTS2SpeakStage):
+        async def _synthesize_exclusive(self, sentence, audio_ch, loop, token):
+            if sentence.turn_id.startswith("gap-"):
+                gap_waiting_for_owner.set()
+            await super()._synthesize_exclusive(sentence, audio_ch, loop, token)
+
+    backend = HeldBackend()
+    stage = TrackedStage(backend=backend, queue_size=1)
+    formal = asyncio.create_task(
+        _collect(stage.stream(sentence_stream(["正式回答。"]), CancellationToken()))
+    )
+    assert await asyncio.to_thread(first_started.wait, 1)
+
+    class Sink:
+        async def write(self, chunk):
+            raise AssertionError("過期墊片不能排進 sink")
+
+    gap = GapFiller(GapFillerPolicy(enabled=True, start_delay_s=0, phrases={"zh": ["嗯…"]}))
+    gap.attach(stage, lambda: SpeechStyle(emotion={"happy": 1.0}))
+    gap.start(Sink(), "gap-turn", CancellationToken(), language="zh")
+    assert await asyncio.to_thread(gap_waiting_for_owner.wait, 1)
+    await asyncio.wait_for(gap.stop(), timeout=0.2)
+
+    release_first.set()
+    assert await asyncio.wait_for(formal, timeout=2)
+    await asyncio.sleep(0.05)
+    assert backend.calls == ["正式回答。"], "已過期墊片不得進入 generate()"
+
+
+async def _collect(stream):
+    return [chunk async for chunk in stream]
+
+
+async def test_佇列滿時aclose取消阻塞callback並讓同步worker退出(monkeypatch):
+    third_put = threading.Event()
+    worker_exited = threading.Event()
+
+    from echo_stream.core.channel import StreamChannel
+
+    original_put = StreamChannel.put_threadsafe
+
+    def track_third_put(channel, item, loop):
+        if item.chunk_index == 2:
+            third_put.set()
+        original_put(channel, item, loop)
+
+    monkeypatch.setattr(StreamChannel, "put_threadsafe", track_third_put)
+
+    class FullQueueBackend(FakeBackend):
+        def generate(self, text, output_path, on_segment_audio=None, **kwargs):
+            try:
+                on_segment_audio(np.zeros(128, dtype="float32"), 0, 3)
+                on_segment_audio(np.zeros(128, dtype="float32"), 1, 3)
+                on_segment_audio(np.zeros(128, dtype="float32"), 2, 3)
+            finally:
+                worker_exited.set()
+
+    stage = IndexTTS2SpeakStage(backend=FullQueueBackend(), queue_size=1)
+    token = CancellationToken()
+    stream = stage.stream(sentence_stream(["一句。"]), token)
+    await stream.__anext__()  # 第二段填滿 queue，第三段會卡在 callback
+    assert await asyncio.to_thread(third_put.wait, 1)
+    assert not worker_exited.is_set(), "第三個 callback 應因 queue full 阻塞 worker"
+    await stream.aclose()
+    assert not token.is_cancelled, "關閉單一 stream 不得取消共用 turn token"
+    assert await asyncio.to_thread(worker_exited.wait, 1), "滿佇列 callback 不得留下 worker"
+
+
+def test_build_backend明確傳遞可配置的use_accel(monkeypatch):
+    import sys
+    import types
+
+    captured = {}
+
+    class BackendFactory:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    backend_module = types.ModuleType("echo_tts.runtime.indextts_backend")
+    backend_module.IndexTTS2Backend = BackendFactory
+    generate_module = types.ModuleType("echo_tts.runtime.indextts_generate")
+    generate_module.default_generation_paths = lambda repo: "fake-paths"
+    for name in ("echo_tts", "echo_tts.runtime"):
+        package = types.ModuleType(name)
+        package.__path__ = []
+        monkeypatch.setitem(sys.modules, name, package)
+    monkeypatch.setitem(sys.modules, "echo_tts.runtime.indextts_backend", backend_module)
+    monkeypatch.setitem(sys.modules, "echo_tts.runtime.indextts_generate", generate_module)
+    monkeypatch.setattr(
+        "echo_stream.adapters.speak_indextts.config.ensure_importable", lambda repo: None
+    )
+    monkeypatch.setattr(
+        "echo_stream.adapters.speak_indextts.config.subsystem_path", lambda kind: "fake-repo"
+    )
+    monkeypatch.delenv("ECHO_STREAM_TTS_USE_ACCEL", raising=False)
+    # 隔離開發機的 .env——config.get 在環境變數缺席時會退回讀它
+    monkeypatch.setattr(
+        "echo_stream.adapters.speak_indextts.config._dotenv_values", lambda: {}
+    )
+
+    stage = IndexTTS2SpeakStage(use_accel=True)
+    stage._build_backend()
+    assert captured["use_accel"] is True
+
+    captured.clear()
+    IndexTTS2SpeakStage()._build_backend()
+    assert captured["use_accel"] is False, "保留預設關閉，須由部署設定明確開啟"
+
+
 # --- 錯誤傳播 ---
 
 
@@ -309,3 +498,31 @@ def test_sanitize_把列表破折號換成頓點():
     assert sanitize_for_tts("小說 - 死亡擱淺") == "小說，死亡擱淺"
     # 連字號緊貼單字（well-known、2-3）不受影響
     assert sanitize_for_tts("a well-known game") == "a well-known game"
+
+
+# --- 暫存目錄清掃 ---
+
+
+def test_sweep_刪空目錄與過期目錄_留新的非空目錄(tmp_path):
+    import os
+    import time
+
+    from echo_stream.adapters.speak_indextts import TEMP_PREFIX, sweep_stale_tempdirs
+
+    empty = tmp_path / f"{TEMP_PREFIX}empty"
+    empty.mkdir()
+    stale = tmp_path / f"{TEMP_PREFIX}stale"
+    stale.mkdir()
+    (stale / "x.wav").write_bytes(b"0")
+    old = time.time() - 3 * 24 * 3600
+    os.utime(stale, (old, old))
+    fresh = tmp_path / f"{TEMP_PREFIX}fresh"
+    fresh.mkdir()
+    (fresh / "y.wav").write_bytes(b"0")
+    other = tmp_path / "unrelated"
+    other.mkdir()
+
+    assert sweep_stale_tempdirs(tmp_path) == 2
+    assert not empty.exists() and not stale.exists()
+    assert fresh.exists() and other.exists()
+    assert sweep_stale_tempdirs(tmp_path) == 0

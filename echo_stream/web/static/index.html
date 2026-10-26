@@ -64,6 +64,8 @@
   header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 4px; }
   h1 { font-size: 20px; margin: 0; letter-spacing: .5px; }
   .sub { color: var(--dim); font-size: 12px; }
+  .emo { color: var(--accent); font-size: 11px; margin-right: 4px; }
+  .emo.carried { opacity: 0.45; }
   .badge {
     font-size: 11px; padding: 2px 8px; border-radius: 10px;
     border: 1px solid var(--line); color: var(--dim);
@@ -211,8 +213,8 @@
       </div>
       <div class="field">
         <label for="cfg-intensity">情緒強度</label>
-        <input type="range" id="cfg-intensity" min="0" max="1" step="0.05" value="0.6">
-        <span class="val" id="cfg-intensity-val">0.60</span>
+        <input type="range" id="cfg-intensity" min="0" max="1" step="0.05" value="0.5">
+        <span class="val" id="cfg-intensity-val">0.50</span>
       </div>
       <div class="field">
         <label for="cfg-preset">情緒 preset</label>
@@ -278,6 +280,18 @@
         <label for="cfg-markers">逐句情緒標記（[開心] 等）</label>
       </div>
 
+      <h3>墊片音（Gap Filler）</h3>
+      <div class="check">
+        <input type="checkbox" id="cfg-gap-enabled">
+        <label for="cfg-gap-enabled">STT 完成後先出一聲「嗯…」（一輪最多一聲）</label>
+      </div>
+      <div class="field">
+        <label for="cfg-gap-delay">起播延遲 s</label>
+        <input type="number" id="cfg-gap-delay" min="0" max="3" step="0.1">
+        <span class="val"></span>
+      </div>
+      <div class="hint" id="cfg-gap-hint"></div>
+
       <h3>記憶（Echo Memory）</h3>
       <div id="cfg-mem-section">
         <div class="check">
@@ -301,6 +315,7 @@
         </div>
       </div>
       <div class="hint" id="cfg-mem-hint" style="display:none"></div>
+      <div class="hint" id="cfg-tool-stats"></div>
 
       <div class="apply-row">
         <button id="cfg-apply">套用</button>
@@ -311,12 +326,14 @@
 </div>
 
 <script>
-const FRAME = { AUDIO: 1, META: 2, ERROR: 3, TEXT: 4, UTTER: 5, EVENT: 6 };
+const FRAME = { AUDIO: 1, META: 2, ERROR: 3, TEXT: 4, UTTER: 5, EVENT: 6,
+  AUDIO_END: 7, AUDIO_ABORT: 8, AUDIO_BEGIN: 9 };
 const BUDGET = { stt: 700, memory: 300, llm_first_sentence: 800, tts_first_chunk: 1800, ttfa: 3500 };
 const LABEL = {
-  stt: "STT 最終轉錄", memory: "Memory retrieve",
+  stt: "STT 最終轉錄", memory: "Memory retrieve", tool: "工具呼叫",
   llm_first_token: "LLM 首 token", llm_first_sentence: "LLM 首句",
   tts_first_chunk: "TTS 首段", ttfa: "TTFA", total: "總時長",
+  perceived_ttfa: "感知 TTFA", gap_audio: "墊片音",
 };
 
 const $ = id => document.getElementById(id);
@@ -332,26 +349,246 @@ let ctx = null, nextAt = 0, sources = [], busy = false, t0 = 0;
 // playGen 是世代守衛：插話/停止後，還在解碼路上的舊段不得再排程。
 let playChain = Promise.resolve();
 let playGen = 0;
+const playbacks = new Map();         // 播放中的 generation
+const pendingAcks = new Map();       // 已送出最終回報、等後端確認的 generation
+const closedGenerations = new Set(); // 已結束的 generation：遲到的 BEGIN/AUDIO/END 一律忽略
+const ACK_RETRY_DELAYS_MS = [300, 1000, 2500];
+let playbackTimer = null;
+// 播放診斷上限：回報帶的缺席清單 / issues 筆數與單筆長度（後端另有同樣的截斷）
+const DIAG_MAX_MISSING = 10;
+const DIAG_MAX_ISSUES = 10;
+const DIAG_ISSUE_CHARS = 200;
+const DIAG_KEEP_ISSUES = 30;
 
-function playChunk(bytes) {
-  if (!ctx) return;
-  const gen = playGen;
-  playChain = playChain.then(async () => {
-    if (gen !== playGen) return;  // 這段所屬的回合已被停掉
-    const buf = await ctx.decodeAudioData(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
-    if (gen !== playGen) return;  // 解碼期間被停掉
-    const src = ctx.createBufferSource();
-    src.buffer = buf;
-    src.connect(ctx.destination);
-    const at = Math.max(ctx.currentTime + 0.02, nextAt);
-    src.start(at);
-    nextAt = at + buf.duration;
-    sources.push(src);
-    src.onended = () => { sources = sources.filter(s => s !== src); };
+// chunk 靜默缺席的原因一律記下：console 看得到，也累積在該 generation 的 state，
+// 隨進度回報 / 最終 ACK 帶給後端。純觀察，不影響完成判定。
+function notePlaybackIssue(state, generation, kind, index, duration, err) {
+  const detail = err == null ? "" : (err && err.message) || String(err);
+  const info = { generation, index, duration, kind, error: detail || undefined };
+  // 記錄本身絕不能拋錯：它跑在 playChain 的 catch 裡，一拋整條播放鏈就斷了
+  try {
+    if (err != null) console.error("[playback]", kind, info);
+    else console.warn("[playback]", kind, info);
+  } catch (e) { /* 沒有 console 也照常累積 */ }
+  if (!state || !state.issues) return;
+  if (state.issues.length >= DIAG_KEEP_ISSUES) { state.issueCount++; return; }
+  const text = `${kind} #${index} ${Number(duration).toFixed(2)}s${detail ? ": " + detail : ""}`;
+  state.issues.push(text.slice(0, DIAG_ISSUE_CHARS));
+  state.issueCount++;
+}
+
+// 這個 generation 的診斷快照：哪些 chunk 還沒 onended、各自卡在哪個階段
+function playbackDiag(state) {
+  const total = state.expectedChunks != null ? state.expectedChunks : state.chunks.length;
+  const missing = [];
+  let missingCount = 0;
+  for (let i = 0; i < total; i++) {
+    const item = state.chunks[i];
+    if (item && item.ended) continue;
+    missingCount++;
+    if (missing.length < DIAG_MAX_MISSING) missing.push({ index: i, stage: item ? item.stage : "absent" });
+  }
+  return {
+    ended_chunks: state.endedChunks,
+    expected_chunks: state.expectedChunks,
+    received_chunks: state.chunks.filter(Boolean).length,
+    missing_count: missingCount,
+    missing,
+    issues: (state.issues || []).slice(0, DIAG_MAX_ISSUES),
+    issue_count: state.issueCount || 0,
+  };
+}
+
+// 依 AudioContext 時鐘算出這個 generation 實際播了幾秒
+function playedSeconds(state) {
+  const now = ctx ? ctx.currentTime : 0;
+  let played = 0;
+  for (const item of state.chunks) {
+    if (!item) continue;
+    if (item.ended) played += item.duration;
+    else if (item.startedAt != null) played += Math.max(0, Math.min(item.duration, now - item.startedAt));
+  }
+  return played;
+}
+
+function closeGeneration(generation) {
+  closedGenerations.add(generation);
+  if (closedGenerations.size > 64) closedGenerations.delete(closedGenerations.values().next().value);
+}
+
+function stopReporterIfIdle() {
+  if (playbacks.size === 0 && playbackTimer != null) {
+    clearInterval(playbackTimer);
+    playbackTimer = null;
+  }
+}
+
+// 進度回報：丟了就算了，下一個 tick 會帶更新的秒數
+function reportPlayback(state) {
+  if (!state || state.status !== "playing") return;
+  fetch("/api/playback/report", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ generation: state.generation, turn_id: state.turnId, played_s: playedSeconds(state), status: "progress", diag: playbackDiag(state) }),
+    keepalive: true,
   }).catch(() => {});
 }
 
+// 最終回報（complete / aborted）：後端靠它結算 spoken_text，所以要確認送達。
+// 網路錯誤或 5xx 有限次重試；後端 2xx（含冪等的重複 ACK）或 4xx 明確拒絕才清理狀態。
+function finishPlayback(state, status, played) {
+  if (state.status !== "playing") return;
+  state.status = status;
+  playbacks.delete(state.generation);
+  closeGeneration(state.generation);
+  stopReporterIfIdle();
+  pendingAcks.set(state.generation, state);
+  const body = JSON.stringify({ generation: state.generation, turn_id: state.turnId, played_s: played, status, diag: playbackDiag(state) });
+  let attempt = 0;
+  const send = () => fetch("/api/playback/report", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body, keepalive: true,
+  }).then(res => res.ok || (res.status >= 400 && res.status < 500), () => false)
+    .then(settled => {
+      if (settled || attempt >= ACK_RETRY_DELAYS_MS.length) {
+        pendingAcks.delete(state.generation);
+        return;
+      }
+      setTimeout(send, ACK_RETRY_DELAYS_MS[attempt++]);
+    });
+  send();
+}
+
+function ensurePlaybackReporter() {
+  if (playbackTimer == null) playbackTimer = setInterval(() => {
+    for (const state of playbacks.values()) reportPlayback(state);
+  }, 250);
+}
+
+function playChunk(generation, index, duration, bytes) {
+  const gen = playGen;
+  const state = playbacks.get(generation);
+  if (!ctx) { notePlaybackIssue(state, generation, "no_audio_context", index, duration); return; }
+  if (!state || state.status !== "playing") {
+    const kind = state ? `state_${state.status}`
+      : closedGenerations.has(generation) ? "closed_generation" : "no_state";
+    notePlaybackIssue(state, generation, kind, index, duration);
+    return;
+  }
+  // stage：queued → decoding → decoded → scheduled → ended（或 skipped / failed）
+  const record = { duration, startedAt: null, ended: false, stage: "queued" };
+  state.chunks[index] = record;
+  state.duration += duration;
+  ensurePlaybackReporter();
+  playChain = playChain.then(async () => {
+    if (gen !== playGen || state.status !== "playing") {  // 這段所屬的回合已被停掉
+      record.stage = "skipped";
+      notePlaybackIssue(state, generation, "stale_before_decode", index, duration);
+      return;
+    }
+    record.stage = "decoding";
+    const buf = await ctx.decodeAudioData(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+    record.stage = "decoded";
+    if (gen !== playGen || state.status !== "playing") {  // 解碼期間被停掉
+      record.stage = "skipped";
+      notePlaybackIssue(state, generation, "stale_after_decode", index, duration);
+      return;
+    }
+    const src = ctx.createBufferSource();
+    record.source = src;
+    src.buffer = buf;
+    // 段間淡入淡出（~6ms）：每段是一次獨立合成，波形在接縫處不連續，
+    // 直接對接會有爆音/喀嚓聲。6ms 短到聽不出音量凹陷，但足以消掉不連續點
+    const g = ctx.createGain();
+    src.connect(g);
+    g.connect(ctx.destination);
+    const at = Math.max(ctx.currentTime + 0.02, nextAt);
+    record.startedAt = at;
+    record.endAt = at + buf.duration;
+    const fade = Math.min(0.006, buf.duration / 4);
+    g.gain.setValueAtTime(0, at);
+    g.gain.linearRampToValueAtTime(1, at + fade);
+    g.gain.setValueAtTime(1, at + buf.duration - fade);
+    g.gain.linearRampToValueAtTime(0, at + buf.duration);
+    src.start(at);
+    record.stage = "scheduled";
+    nextAt = at + buf.duration;
+    sources.push(src);
+    src.onended = () => {
+      sources = sources.filter(s => s !== src);
+      if (state.status !== "playing") return;
+      record.ended = true;
+      record.stage = "ended";
+      state.endedChunks = state.chunks.filter(x => x && x.ended).length;
+      if (state.endReceived && state.endedChunks >= state.expectedChunks) finishPlayback(state, "complete", state.duration);
+    };
+  }).catch(err => {
+    // 解碼或排程失敗：這段永遠不會 onended，記下卡在哪個階段
+    const stage = record.stage;
+    record.stage = "failed";
+    notePlaybackIssue(state, generation, `failed_at_${stage}`, index, duration, err);
+  });
+}
+
+function newPlaybackState(generation, turnId) {
+  return { generation, turnId, chunks: [], duration: 0,
+    endReceived: false, endedChunks: 0, expectedChunks: null, status: "playing",
+    issues: [], issueCount: 0 };
+}
+
+function beginPlayback(info) {
+  if (closedGenerations.has(info.generation) || playbacks.has(info.generation)) return;
+  playbacks.set(info.generation, newPlaybackState(info.generation, info.turn_id));
+  ensurePlaybackReporter();
+}
+
+function endPlayback(info) {
+  if (closedGenerations.has(info.generation)) return;
+  let state = playbacks.get(info.generation);
+  if (!state) {
+    state = newPlaybackState(info.generation, info.turn_id);
+    playbacks.set(info.generation, state);
+  }
+  state.turnId = info.turn_id;
+  state.endReceived = true;
+  state.expectedChunks = info.chunks;
+  state.duration = info.duration_s;
+  if (state.expectedChunks === 0 || state.endedChunks >= state.expectedChunks) {
+    finishPlayback(state, "complete", state.duration);
+  }
+}
+
+// 後端發起的停止：先依時鐘算出停在哪裡並回報（後端等這份確認才結算），再停音源
+function abortPlayback(info) {
+  const generation = typeof info === "string" ? info : info.generation;
+  const state = playbacks.get(generation);
+  if (!state) {
+    // 中止走優先通道、可能比 BEGIN 先到：前端根本還沒播，直接回報 0 秒，
+    // 並把 generation 關掉，之後遲到的音訊 frame 不會再開始播放
+    if (typeof info !== "string" && info.turn_id
+        && !closedGenerations.has(generation) && !pendingAcks.has(generation)) {
+      finishPlayback(newPlaybackState(generation, info.turn_id), "aborted", 0);
+    }
+    return;
+  }
+  finishPlayback(state, "aborted", playedSeconds(state));
+  for (const item of state.chunks) {
+    if (item && item.source) { try { item.source.stop(); } catch (e) {} }
+  }
+  recomputeNextAt();
+}
+
+function recomputeNextAt() {
+  if (!ctx) { nextAt = 0; return; }
+  let tail = ctx.currentTime;
+  for (const state of playbacks.values()) {
+    for (const item of state.chunks) {
+      if (item && !item.ended && item.endAt != null) tail = Math.max(tail, item.endAt);
+    }
+  }
+  nextAt = tail;
+}
+
 function stopAudio() {
+  for (const state of [...playbacks.values()]) finishPlayback(state, "aborted", playedSeconds(state));
   playGen++;  // 作廢還在解碼路上的段
   sources.forEach(s => { try { s.stop(); } catch (e) {} });
   sources = [];
@@ -389,9 +626,13 @@ function addSentence(s) {
   const label = (s.is_first ? "" : "+") + Math.round(delta) + "ms";
   const el = document.createElement("div");
   el.className = "sent" + (s.is_first ? " first" : "");
+  const st = s.style;
+  const tag = st && st.marker
+    ? `<span class="emo${st.carried ? " carried" : ""}" title="${escapeHtml(JSON.stringify(st.emotion))} · 強度 ${st.intensity}">[${escapeHtml(st.marker)}]</span>`
+    : "";
   el.innerHTML = `<span class="idx">${s.index}</span>
                   <span class="ms" title="累計 ${Math.round(s.ms)}ms">${label}</span>
-                  <span>${s.text.replace(/</g, "&lt;")}</span>`;
+                  <span>${tag}${s.text.replace(/</g, "&lt;")}</span>`;
   box.appendChild(el);
 }
 
@@ -404,7 +645,7 @@ function verdict(key, value) {
 
 function renderReport(meta) {
   const seg = meta.segments_ms || {};
-  const rows = ["stt", "memory", "llm_first_token", "llm_first_sentence", "tts_first_chunk"]
+  const rows = ["stt", "memory", "tool", "llm_first_token", "llm_first_sentence", "tts_first_chunk"]
     .filter(k => seg[k] != null)
     .map(k => `<tr><td>${LABEL[k]}</td>
                    <td class="num">${Math.round(seg[k])}ms</td>
@@ -427,6 +668,12 @@ function renderReport(meta) {
           <td class="num"><b>${ttfa != null ? Math.round(ttfa) + "ms" : "—"}</b></td>
           <td class="num muted">${BUDGET.ttfa}ms</td>
           <td>${verdict("ttfa", ttfa)}</td></tr>
+      ${seg.gap_audio != null ? `
+      <tr><td><b>${LABEL.perceived_ttfa}</b></td>
+          <td class="num"><b>${Math.round(seg.perceived_ttfa)}ms</b></td>
+          <td class="num muted">${BUDGET.ttfa}ms</td>
+          <td>${verdict("ttfa", seg.perceived_ttfa)}
+              <span class="muted">${meta.gap_filler ? "「" + escapeHtml(meta.gap_filler) + "」" : ""}</span></td></tr>` : ""}
       <tr><td class="muted">${LABEL.total}</td>
           <td class="num muted">${seg.total != null ? Math.round(seg.total) + "ms" : "—"}</td>
           <td colspan="2"></td></tr>
@@ -440,7 +687,51 @@ function renderReport(meta) {
       <summary class="muted" style="font-size:12px;cursor:pointer">🧠 本輪注入的記憶</summary>
       <pre style="font-size:11px;white-space:pre-wrap;margin:6px 0 0">${
         escapeHtml(meta.memory_injected)}</pre>
-    </details>` : ""}`;
+    </details>` : ""}
+    ${(meta.tool_calls || []).map(renderToolCall).join("")}`;
+  addToolMarkers(meta.tool_calls || []);
+}
+
+const TOOL_ICON = { deep_recall: "🔍", force_remember: "📌", adjust_importance: "⚖️", trigger_dream: "💤" };
+
+function renderToolCall(c) {
+  const icon = TOOL_ICON[c.name] || "🔧";
+  return `<details style="margin-top:6px">
+      <summary class="muted" style="font-size:12px;cursor:pointer">${icon} ${c.name}
+        ${c.ok ? "" : '<span class="bad">失敗</span>'} · ${Math.round(c.duration_ms)}ms</summary>
+      <pre style="font-size:11px;white-space:pre-wrap;margin:6px 0 0">${
+        escapeHtml(JSON.stringify(c.args))}
+→ ${escapeHtml(c.result_summary || "")}</pre>
+    </details>`;
+}
+
+// 句子串底下掛一列小標記：這輪她查了什麼。點開看參數與結果摘要。
+function addToolMarkers(calls) {
+  if (!calls.length) return;
+  const box = $("sentences");
+  const el = document.createElement("div");
+  el.className = "sent tools";
+  el.innerHTML = `<span class="idx">🔧</span><span class="ms"></span><span>` +
+    calls.map(c => `<details style="display:inline-block;margin-right:8px">
+        <summary style="cursor:pointer;list-style:none">${TOOL_ICON[c.name] || "🔧"} ${c.name}</summary>
+        <pre style="font-size:11px;white-space:pre-wrap;margin:4px 0 0">${
+          escapeHtml(JSON.stringify(c.args))}
+→ ${escapeHtml(c.result_summary || "")}</pre>
+      </details>`).join("") + `</span>`;
+  box.appendChild(el);
+  calls.forEach(c => { toolTally[c.name] = (toolTally[c.name] || 0) + 1; });
+  renderToolStats();
+}
+
+let toolTally = {};
+let toolsEnabled = [];
+function renderToolStats() {
+  const el = $("cfg-tool-stats");
+  if (!el) return;
+  if (!toolsEnabled.length) { el.textContent = "工具：未開放"; return; }
+  const counts = toolsEnabled.map(n =>
+    `${TOOL_ICON[n] || "🔧"} ${n} ×${toolTally[n] || 0}`).join("　");
+  el.textContent = "工具（本次 serve 累計）：" + counts;
 }
 
 function escapeHtml(s) {
@@ -474,8 +765,19 @@ function setPhase(p) {
 function handleFrame(kind, payload) {
   const text = () => JSON.parse(new TextDecoder().decode(payload));
   if (kind === FRAME.AUDIO) {
-    playChunk(payload);
+    if (payload.length < 28) return;
+    const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+    const generation = Array.from(payload.slice(0, 16), b => b.toString(16).padStart(2, "0")).join("");
+    const index = view.getUint32(16);
+    const duration = view.getFloat64(20);
+    playChunk(generation, index, duration, payload.slice(28));
     if (phase === "think" || phase === "synth") setPhase("play");
+  } else if (kind === FRAME.AUDIO_BEGIN) {
+    beginPlayback(text());
+  } else if (kind === FRAME.AUDIO_END) {
+    endPlayback(text());
+  } else if (kind === FRAME.AUDIO_ABORT) {
+    abortPlayback(text());
   } else if (kind === FRAME.TEXT) {
     addSentence(text());
     if (phase === "think") setPhase("synth");
@@ -854,7 +1156,7 @@ async function loadConfig() {
     cfgPresets = c.presets || {};
     const sel = $("cfg-preset");
     sel.innerHTML = '<option value="">（角色檔預設）</option>' +
-      Object.keys(cfgPresets).map(n => `<option value="${n}">${n}</option>`).join("");
+      Object.keys(cfgPresets).map(n => `<option value="${n}">${(c.preset_labels || {})[n] || n}</option>`).join("");
     $("cfg-speed").value = c.tts.speed;
     $("cfg-speed-val").textContent = (+c.tts.speed).toFixed(2) + "×";
     $("cfg-intensity").value = c.tts.intensity;
@@ -870,12 +1172,23 @@ async function loadConfig() {
     if (c.turn.min_confidence != null) $("cfg-conf").value = c.turn.min_confidence;
     if (c.llm.reasoning_effort) $("cfg-effort").value = c.llm.reasoning_effort;
     $("cfg-markers").checked = !!c.llm.emotion_markers;
+    if (c.gap_filler) {
+      $("cfg-gap-enabled").checked = !!c.gap_filler.enabled;
+      if (c.gap_filler.start_delay_s != null) $("cfg-gap-delay").value = c.gap_filler.start_delay_s;
+      const pools = c.gap_filler.phrases || {};
+      $("cfg-gap-hint").textContent = "即時合成（STT 完成後的空窗）：" +
+        Object.entries(pools).map(([k, v]) => `${k} ×${v.length}`).join("　") +
+        "（文案在 echo_stream.toml）";
+    }
     cfgMemoryAvailable = !!(c.memory && c.memory.available);
     if (cfgMemoryAvailable) {
       $("cfg-mem-enabled").checked = !!c.memory.enabled;
       if (c.memory.top_k != null) $("cfg-mem-topk").value = c.memory.top_k;
       if (c.memory.max_chars != null) $("cfg-mem-chars").value = c.memory.max_chars;
       if (c.memory.min_match != null) $("cfg-mem-match").value = c.memory.min_match;
+      toolsEnabled = c.memory.tools || [];
+      toolTally = Object.assign({}, c.memory.tool_calls_total || {});
+      renderToolStats();
     } else {
       $("cfg-mem-section").style.display = "none";
       const hint = $("cfg-mem-hint");
@@ -916,6 +1229,10 @@ async function applyConfig() {
     llm: {
       reasoning_effort: $("cfg-effort").value,
       emotion_markers: $("cfg-markers").checked,
+    },
+    gap_filler: {
+      enabled: $("cfg-gap-enabled").checked,
+      start_delay_s: +$("cfg-gap-delay").value,
     },
   };
   if (cfgMemoryAvailable) {

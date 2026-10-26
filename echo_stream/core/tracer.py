@@ -70,6 +70,10 @@ MARK_MEMORY_DONE = "memory_done"
 """Memory retrieve 起訖。§7.4 定案與 LLM prefill 平行，
 所以 memory_done 晚於 think_first_token 是**正常的**，不是異常。"""
 
+MARK_TOOL_START = "tool_start"
+MARK_TOOL_DONE = "tool_done"
+"""工具呼叫（記憶 deep_recall / force_remember）的區間。多次往返只記第一次開始、
+最後一次結束——報告要的是「這輪被工具吃掉多久」。"""
 MARK_THINK_FIRST_TOKEN = "think_first_token"
 """LLM 吐出第一個 token。"""
 
@@ -77,6 +81,8 @@ MARK_THINK_FIRST_SENTENCE = "think_first_sentence"
 """SentenceSplitter 切出第一句。"""
 
 MARK_THINK_DONE = "think_done"
+MARK_GAP_FIRST_AUDIO = "gap_first_audio"
+"""墊片音（GapFiller）第一段寫進 sink 的時刻。感知 TTFA = min(這個, speak_first_chunk)。"""
 MARK_SPEAK_FIRST_CHUNK = "speak_first_chunk"
 """第一段音訊就緒。**TTFA 的終點。**"""
 
@@ -146,11 +152,21 @@ class TurnTrace:
         """Time To First Audio。這是唯一真正決定體感的數字。"""
         return self.rel_ms(MARK_SPEAK_FIRST_CHUNK)
 
+    def perceived_ttfa_ms(self) -> float | None:
+        """使用者第一次聽到任何聲音——墊片音或真音訊，哪個先算哪個。
+        與 ``ttfa`` 並列，不取代：TTFA 量的是管線、這個量的是體感。"""
+        candidates = [
+            v for v in (self.rel_ms(MARK_GAP_FIRST_AUDIO), self.rel_ms(MARK_SPEAK_FIRST_CHUNK))
+            if v is not None
+        ]
+        return min(candidates) if candidates else None
+
     def segments_ms(self) -> dict[str, float | None]:
         """拆解成設計文件 §5 的五個欄位。"""
         return {
             "stt": self.span_ms(MARK_SPEECH_END, MARK_INPUT_FINAL),
             "memory": self.span_ms(MARK_MEMORY_START, MARK_MEMORY_DONE),
+            "tool": self.span_ms(MARK_TOOL_START, MARK_TOOL_DONE),
             "llm_first_token": self.span_ms(MARK_INPUT_FINAL, MARK_THINK_FIRST_TOKEN),
             "llm_first_sentence": self.span_ms(
                 MARK_INPUT_FINAL, MARK_THINK_FIRST_SENTENCE
@@ -159,6 +175,8 @@ class TurnTrace:
                 MARK_THINK_FIRST_SENTENCE, MARK_SPEAK_FIRST_CHUNK
             ),
             "ttfa": self.ttfa_ms,
+            "gap_audio": self.rel_ms(MARK_GAP_FIRST_AUDIO),
+            "perceived_ttfa": self.perceived_ttfa_ms(),
             "total": self.rel_ms(MARK_TURN_END),
         }
 
@@ -208,13 +226,18 @@ class LatencyTracer:
     def get(self, turn_id: str) -> TurnTrace | None:
         return self._traces.get(turn_id)
 
-    def mark(self, turn_id: str, name: str, at: float | None = None) -> None:
+    def mark(
+        self, turn_id: str, name: str, at: float | None = None, *, overwrite: bool = False
+    ) -> None:
         """打點。**同一個名稱只記第一次**——``think_first_token`` 這類
-        「首次」語意的打點，重複呼叫必須不覆蓋。"""
+        「首次」語意的打點，重複呼叫必須不覆蓋。
+
+        ``overwrite=True`` 給「最後一次」語意的打點用（``tool_done``：
+        多次工具往返要記最後一次結束）。"""
         trace = self._traces.get(turn_id)
         if trace is None:
             trace = self.start(turn_id)
-        if name in trace.marks:
+        if name in trace.marks and not overwrite:
             return
         trace.marks[name] = at if at is not None else time.perf_counter()
 
@@ -279,6 +302,7 @@ class LatencyTracer:
         rows = [
             ("STT 最終轉錄", "stt", "stt"),
             ("Memory retrieve", "memory", "memory"),
+            ("工具呼叫", "tool", None),
             ("LLM 首 token", "llm_first_token", None),
             ("LLM 首句", "llm_first_sentence", "llm_first_sentence"),
             ("TTS 首段", "tts_first_chunk", "tts_first_chunk"),
@@ -297,6 +321,11 @@ class LatencyTracer:
             f"  {'TTFA':<18}{_fmt_ms(segs['ttfa']):>10}{_fmt_ms(BUDGET_MS['ttfa']):>10}"
             f"   {_verdict(segs['ttfa'], BUDGET_MS['ttfa'])}"
         )
+        if segs.get("gap_audio") is not None:
+            lines.append(
+                f"  {'感知 TTFA':<18}{_fmt_ms(segs['perceived_ttfa']):>10}{'':>10}"
+                f"   墊片音 @ {_fmt_ms(segs['gap_audio'])}"
+            )
         lines.append(f"  {'總時長':<18}{_fmt_ms(segs['total']):>10}")
         lines.append(
             f"  句數 {trace.sentence_count} / 音訊段 {trace.chunk_count}"

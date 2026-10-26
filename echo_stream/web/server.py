@@ -33,10 +33,11 @@ HTTP server 是多執行緒的（``ThreadingHTTPServer``），管線是 asyncio 
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
+import inspect
 import io
 import json
-import queue
 import struct
 import sys
 import threading
@@ -48,12 +49,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from .. import config
-from ..contracts.cancellation import CancellationToken, CancelReason
+from .. import config, defaults
+from ..contracts.cancellation import CancellationToken, CancelledError, CancelReason
 from ..contracts.style import EMOTION_DIMENSIONS, SpeechStyle
 from ..contracts.types import STT_SAMPLE_RATE, AudioChunk, Utterance
+from ..core import emotion
 from ..core.dream_scheduler import DreamPolicy, DreamScheduler
 from ..core.emotion import EMOTION_PRESETS
+from ..core.gap_filler import GapFiller, GapFillerPolicy
 from ..core.pipeline import PipelineRunner
 from ..core.splitter import SplitPolicy
 from ..core.tracer import LatencyTracer
@@ -70,6 +73,9 @@ FRAME_UTTER = 0x05
 
 FRAME_EVENT = 0x06
 """狀態事件：VAD speech/silence、barge_in。前端據此顯示聆聽狀態、停播。"""
+FRAME_AUDIO_END = 0x07
+FRAME_AUDIO_ABORT = 0x08
+FRAME_AUDIO_BEGIN = 0x09
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -163,6 +169,66 @@ class _FakeWebTranscriber:
         return TranscriptionResult(text=f"（fake 轉錄：收到 {seconds:.1f}s 語音）")
 
 
+def _split_policy_from_defaults() -> SplitPolicy:
+    sec = defaults.section("split")
+    mapping = {
+        "first_min": "first_min_weight",
+        "first_max": "first_max_weight",
+        "min": "min_weight",
+        "max": "max_weight",
+    }
+    kwargs = {attr: float(sec[key]) for key, attr in mapping.items() if key in sec}
+    return SplitPolicy(**kwargs)
+
+
+def _gap_policy_from_defaults() -> GapFillerPolicy:
+    sec = defaults.section("gap_filler")
+    policy = GapFillerPolicy()
+    if "enabled" in sec:
+        policy.enabled = bool(sec["enabled"])
+    if "start_delay_s" in sec:
+        policy.start_delay_s = max(0.0, float(sec["start_delay_s"]))
+    phrases = sec.get("phrases")
+    if isinstance(phrases, dict) and phrases:
+        policy.phrases = _phrase_pools(phrases)
+    elif isinstance(phrases, list) and phrases:  # 舊寫法：單一列表 = 預設語言
+        policy.phrases = {policy.default_language: [str(t) for t in phrases if str(t).strip()]}
+    if "default_language" in sec:
+        policy.default_language = str(sec["default_language"])
+    return policy
+
+
+def _phrase_pools(raw: dict[str, Any]) -> dict[str, list[str]]:
+    pools: dict[str, list[str]] = {}
+    for lang, items in raw.items():
+        if isinstance(items, list):
+            texts = [str(t) for t in items if str(t).strip()]
+            if texts:
+                pools[str(lang).lower()] = texts
+    return pools
+
+
+def _startup_config_from_defaults() -> dict[str, Any]:
+    """把 echo_stream.toml 的 tts / turn / llm / memory 段轉成 apply_config 的 body。
+
+    split 與 gap_filler 在建構時就用掉了（policy 物件），不在這裡。
+    tts 只有 ``override = true`` 才套——否則角色檔的預設風格就被蓋掉了。
+    """
+    body: dict[str, Any] = {}
+    tts = defaults.section("tts")
+    if tts.get("override"):
+        body["tts"] = {
+            "speed": tts.get("speed", 1.0),
+            "intensity": tts.get("intensity", 0.5),
+            "emotion": tts.get("emotion") or {},
+        }
+    for name in ("turn", "llm", "memory"):
+        sec = defaults.section(name)
+        if sec:
+            body[name] = sec
+    return body
+
+
 class StreamService:
     """持有管線與常駐 event loop。"""
 
@@ -177,6 +243,7 @@ class StreamService:
         system_prompt: str = "",
         trace_path: str | None = None,
         store: Any | None = None,
+        log_dir: str | Path | None = None,
     ) -> None:
         self.use_real_tts = use_real_tts
         self.use_real_llm = use_real_llm
@@ -185,6 +252,8 @@ class StreamService:
 
         self._memory = None
         """EchoMemoryAdapter。旁路——建不起來只停用記憶，不擋管線。"""
+        self._tool_counts: dict[str, int] = {}
+        """本次 serve 期間各工具被呼叫的次數——面板累計顯示用。"""
         self._memory_enabled = True
         """面板開關。關掉 = 不 retrieve、不注入、不 store；
         adapter 與 engine 留著（重載要數十秒），開回來立即生效。"""
@@ -194,8 +263,10 @@ class StreamService:
         """自動 dream 的觸發策略（累積 + 閒置 / daydream）。記憶建好才啟動。"""
         self.memory_error: str | None = None
         self.memory_warm_seconds: float | None = None
-        self.split_policy = split_policy or SplitPolicy()
+        self.split_policy = split_policy or _split_policy_from_defaults()
         self.system_prompt = system_prompt
+        self.gap_filler = GapFiller(_gap_policy_from_defaults())
+        """墊片音（D 段）。語音庫在 _build 末尾合成；改 TTS 風格後重建。"""
 
         self._store = store
         """SessionControl 的 SessionStore。``None`` 時在 prepare 建立；
@@ -207,8 +278,10 @@ class StreamService:
 
         # 每次啟動自動開一個 session log（JSONL，逐 turn 一筆）——
         # 測試結果要能事後分析，不能只活在瀏覽器畫面上。
+        # log_dir 可注入：測試要走 tmp_path，不然每跑一次 pytest 就在
+        # outputs/web_logs 噴一批垃圾（艾斯維爾 2026-08-22 抱怨過）。
         session_tag = time.strftime("%Y%m%d_%H%M%S")
-        log_dir = Path(__file__).parents[2] / "outputs" / "web_logs"
+        log_dir = Path(log_dir) if log_dir else Path(__file__).parents[2] / "outputs" / "web_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         self.log_path: Path = log_dir / f"session_{session_tag}.jsonl"
         if trace_path is None:
@@ -231,6 +304,11 @@ class StreamService:
 
         self._voice: dict[str, Any] | None = None
         """當前的語音 session（單使用者，一次一個）。"""
+        self._playbacks: dict[str, _PlaybackState] = {}
+        self._finished_playbacks: collections.OrderedDict[str, _PlaybackState] = (
+            collections.OrderedDict()
+        )
+        """已結算的 generation（有上限）：讓前端重送的最終 ACK 能冪等回成功。"""
 
         self._discard_turn = False
         """捨棄請求打在進行中的 turn 上：voice loop 在 turn 收尾後
@@ -291,6 +369,7 @@ class StreamService:
             self._speak = IndexTTS2SpeakStage()
         else:
             self._speak = FakeSpeakStage()
+        self._load_emotion_presets()
 
         if self.use_real_llm:
             from ..adapters.think_llm import LLMThinkStage
@@ -313,8 +392,43 @@ class StreamService:
             think_stage=self._think,
             speak_stage=self._speak,
             tracer=self.tracer,
+            gap_filler=self.gap_filler,
         )
         await self._runner.prepare()
+
+        # echo_stream.toml 的預設值走與面板完全相同的套用路徑——
+        # 一份邏輯、一種結果，面板打開就看得到檔案裡的值
+        startup = _startup_config_from_defaults()
+        if startup:
+            await self._apply_config(startup)
+        # 墊片音改即時合成（STT 完成後的 LLM 空窗才合成這一輪那一句），
+        # 不再預建語音庫——啟動不必多等 ~40s（艾斯維爾 2026-08-24）。
+        # style_getter 每次取當下的 default_style，面板改了下一聲直接生效
+        self.gap_filler.attach(
+            self._speak, lambda: getattr(self._think, "default_style", None)
+        )
+
+    def _load_emotion_presets(self) -> None:
+        """把 echo_tts 的 emotion_presets.yaml 注入 core 當 preset 表。
+
+        一份定義兩邊共用：LLM 標記、面板下拉、TTS 本身都看同一張表。
+        fake TTS 也試著讀（只要 echo_tts repo 在）——讀不到就用內建退路，不擋。
+        """
+        try:
+            # echo_tts 要到 runner.prepare() → _build_backend() 才進 sys.path，
+            # 這裡比它早跑，所以先自己把 TTS repo 放進去；找不到 repo 會拋
+            # FileNotFoundError，照樣落到下面的內建退路
+            config.ensure_importable(config.subsystem_path("TTS"))
+            from ..adapters.speak_indextts import load_emotion_presets
+
+            presets, aliases = load_emotion_presets()
+        except Exception as exc:  # noqa: BLE001 - 沒 echo_tts 就用內建表
+            self._log({"type": "emotion_presets", "source": "builtin", "reason": str(exc)[:120]})
+            return
+        emotion.register_presets(presets, aliases)
+        self._log(
+            {"type": "emotion_presets", "source": "echo_tts", "presets": list(presets)}
+        )
 
     async def _build_memory(self) -> None:
         """建立並暖機記憶層。旁路——失敗記在 memory_error，不擋管線。
@@ -343,13 +457,55 @@ class StreamService:
             query = getattr(backend, "query", None)
             if callable(query):
                 memory.set_llm_fn(
-                    lambda prompt: (query(prompt) or {}).get("text", "")
+                    lambda prompt: (query(prompt) or {}).get("text", ""),
+                    # 每輪 salience 評估：五維打分不需要推理，壓到最低、限制輸出長度。
+                    # 跑在背景 executor，與下一輪串流並行打同一顆 backend（query 無狀態）。
+                    assess_llm_fn=lambda prompt: (
+                        query(prompt, reasoning_effort="low", max_tokens=200) or {}
+                    ).get("text", ""),
                 )
             self._think.memory = memory
             self._memory = memory
+            self._attach_tools(memory)
+            await self._refresh_profile()
             self._start_dream_scheduler(memory)
         except Exception as exc:  # noqa: BLE001
             self.memory_error = f"{type(exc).__name__}: {exc}"
+
+    async def _refresh_profile(self) -> None:
+        """把使用者 profile 掛到 think stage 的 system prompt。暖機與 dream 後各一次。"""
+        if self._memory is None or not hasattr(self._memory, "profile"):
+            return
+        try:
+            text = await self._memory.profile()
+        except Exception as exc:  # noqa: BLE001 - 旁路
+            logger_warn = f"{type(exc).__name__}: {exc}"
+            self._log({"type": "profile", "error": logger_warn})
+            return
+        if text != getattr(self._think, "profile", ""):
+            self._think.profile = text
+            self._log({"type": "profile", "chars": len(text), "text": text})
+
+    def _attach_tools(self, memory: Any) -> None:
+        """把記憶工具（deep_recall / force_remember）掛上 think stage。
+
+        schema 與 executor 都來自 adapter；think stage 只認「工具列表 + 一個
+        async callable」，不知道背後是 echo_memory。filler 文案走設定，
+        但**不得含可被推翻的記憶斷言**（見 think_llm 模組 docstring）。
+        """
+        defs = memory.tool_definitions()
+        if not defs:
+            self._think.tools = []
+            self._think.tool_executor = None
+            return
+        self._think.tools = defs
+        self._think.tool_executor = memory.execute_tool
+        filler = config.get("ECHO_STREAM_TOOL_FILLER")
+        if filler is not None and filler.strip().lower() in ("off", "none", ""):
+            self._think.tool_filler = None
+        elif filler:
+            self._think.tool_filler = filler
+        self._log({"type": "tools", "enabled": [d["function"]["name"] for d in defs]})
 
     def _start_dream_scheduler(self, memory: Any) -> None:
         """門檻走 .env：ECHO_STREAM_DREAM_{IDLE_MINUTES,MIN_PENDING,DAYDREAM_PENDING}。"""
@@ -377,6 +533,13 @@ class StreamService:
             )
             try:
                 with_timeout.result(timeout=30)
+            except Exception:  # noqa: BLE001
+                pass
+        if self._memory is not None and hasattr(self._memory, "aclose"):
+            # 放在 runner 之後：turn 收尾的 store 可能還在排隊，要讓它寫完
+            closing = asyncio.run_coroutine_threadsafe(self._memory.aclose(), self._loop)
+            try:
+                closing.result(timeout=30)
             except Exception:  # noqa: BLE001
                 pass
         self._loop.call_soon_threadsafe(self._loop.stop)
@@ -416,12 +579,15 @@ class StreamService:
         return {
             "tts": {
                 "speed": style.speed if style else 1.0,
-                "intensity": style.intensity if style else 0.6,
+                "intensity": style.intensity if style else 0.5,
                 "emotion": style.normalized_emotion() if style else
                            {dim: 0.0 for dim in EMOTION_DIMENSIONS},
                 "override": style is not None,
             },
             "presets": EMOTION_PRESETS,
+            "preset_labels": dict(
+                zip(EMOTION_PRESETS, emotion.preset_labels(), strict=False)
+            ) if len(emotion.preset_labels()) == len(EMOTION_PRESETS) else {},
             "split": {
                 "first_min": self.split_policy.first_min_weight,
                 "first_max": self.split_policy.first_max_weight,
@@ -440,6 +606,13 @@ class StreamService:
             "llm": {
                 "reasoning_effort": getattr(backend, "reasoning_effort", None),
                 "emotion_markers": getattr(self._think, "emotion_markers", False),
+                "tool_filler": getattr(self._think, "tool_filler", None) or "",
+            },
+            "gap_filler": {
+                "enabled": self.gap_filler.policy.enabled,
+                "start_delay_s": self.gap_filler.policy.start_delay_s,
+                "phrases": {k: list(v) for k, v in self.gap_filler.policy.phrases.items()},
+                "default_language": self.gap_filler.policy.default_language,
             },
             "memory": {
                 "available": self._memory is not None,
@@ -448,6 +621,10 @@ class StreamService:
                 "top_k": getattr(self._memory, "top_k", None),
                 "max_chars": getattr(self._memory, "max_chars", None),
                 "min_match": getattr(self._memory, "min_match", None),
+                "tools": [
+                    d["function"]["name"] for d in getattr(self._think, "tools", []) or []
+                ],
+                "tool_calls_total": dict(self._tool_counts),
             },
         }
 
@@ -477,7 +654,7 @@ class StreamService:
             }
             style = SpeechStyle(
                 emotion=emotion,
-                intensity=float(tts.get("intensity", 0.6)),
+                intensity=float(tts.get("intensity", 0.5)),
                 speed=float(tts.get("speed", 1.0)),
             )
             if style.is_neutral and style.speed == 1.0:
@@ -543,6 +720,8 @@ class StreamService:
                 self._memory_enabled = enabled
                 if hasattr(self._think, "memory"):
                     self._think.memory = self._memory if enabled else None
+                    # 工具跟著記憶開關走——記憶關了還讓模型 deep_recall 沒道理
+                    self._think.tools = self._memory.tool_definitions() if enabled else []
                 changed["enabled"] = enabled
             if "top_k" in memory:
                 self._memory.top_k = max(1, int(memory["top_k"]))
@@ -567,8 +746,30 @@ class StreamService:
                 if backend is not None and hasattr(backend, "reasoning_effort"):
                     backend.reasoning_effort = str(llm["reasoning_effort"])
                     changed["reasoning_effort"] = str(llm["reasoning_effort"])
+            if "tool_filler" in llm and hasattr(self._think, "tool_filler"):
+                text = str(llm["tool_filler"] or "").strip()
+                self._think.tool_filler = text or None
+                changed["tool_filler"] = text
             if changed:
                 applied["llm"] = changed
+
+        gap = body.get("gap_filler")
+        if isinstance(gap, dict):
+            changed = {}
+            policy = self.gap_filler.policy
+            if "enabled" in gap:
+                policy.enabled = bool(gap["enabled"])
+                changed["enabled"] = policy.enabled
+            if "start_delay_s" in gap:
+                policy.start_delay_s = max(0.0, float(gap["start_delay_s"]))
+                changed["start_delay_s"] = policy.start_delay_s
+            if "phrases" in gap and isinstance(gap["phrases"], dict):
+                pools = _phrase_pools(gap["phrases"])
+                if pools:
+                    policy.phrases = pools
+                    changed["phrases"] = {k: list(v) for k, v in pools.items()}
+            if changed:
+                applied["gap_filler"] = changed
 
         # 寫進 session log——事後分析時才知道「當時的參數是什麼」
         self._log({"type": "config", **applied})
@@ -580,6 +781,9 @@ class StreamService:
     # 所以所有會話操作一律經 run_coroutine_threadsafe 到 loop 執行緒，
     # 與 apply_config 同一條規矩。store 的檔案讀寫也統一在 loop 執行緒，
     # SessionStore 不是 thread-safe 的，兩條執行緒同時碰 index 會互咬。
+
+    playback_stop_confirm_s: float = 1.0
+    """後端發起停止後，等前端回報最終實播位置的上限；逾時沿用最後已知值。"""
 
     def _history(self) -> list[dict[str, str]] | None:
         return getattr(self._think, "history", None)
@@ -769,6 +973,8 @@ class StreamService:
             self._dream_running = False
         self.dream_report = report
         self._log({"type": "dream", "triggered_by": triggered_by, "report": report})
+        # 蒸餾可能長出新的 subject=user concept——刷新常駐 profile
+        await self._refresh_profile()
 
     def memory_dream_status(self) -> dict[str, Any]:
         status: dict[str, Any] = {
@@ -778,6 +984,7 @@ class StreamService:
         }
         if self._dream_scheduler is not None:
             status["scheduler"] = self._dream_scheduler.status()
+        status["profile"] = getattr(self._think, "profile", "")
         return status
 
     # --- 記錄 ---
@@ -803,8 +1010,13 @@ class StreamService:
             session: dict[str, Any] = {
                 "sid": sid,
                 "source": _PushSource(self._loop, STT_SAMPLE_RATE),
-                "out": queue.Queue(maxsize=256),
+                "out": asyncio.Queue(maxsize=256),
                 "token": CancellationToken(),
+                "control_tasks": set(),
+                "disconnected_event": asyncio.Event(),
+                # 停止/中止 frame 的優先通道：不能排在已塞滿的音訊佇列後面
+                "urgent": collections.deque(),
+                "urgent_event": asyncio.Event(),
             }
             self._voice = session
             asyncio.run_coroutine_threadsafe(self._voice_loop(session), self._loop)
@@ -839,10 +1051,11 @@ class StreamService:
             lambda: (self._discard_input_on_loop(), done.set())
         )
         done.wait(timeout=2.0)
-        with contextlib.suppress(queue.Full):
-            session["out"].put_nowait(
-                json_frame(FRAME_EVENT, {"event": "input_discarded"})
-            )
+        self._loop.call_soon_threadsafe(
+            self._voice_emit_control,
+            session,
+            json_frame(FRAME_EVENT, {"event": "input_discarded"}),
+        )
         self._log({"type": "discard"})
         return True
 
@@ -865,6 +1078,10 @@ class StreamService:
         session = self._voice
         if session is None:
             return
+        session["disconnected"] = True
+        self._loop.call_soon_threadsafe(session["disconnected_event"].set)
+        for task in session["control_tasks"]:
+            self._loop.call_soon_threadsafe(task.cancel)
         session["source"].close()
         self._loop.call_soon_threadsafe(
             session["token"].cancel, CancelReason.SUPERSEDED
@@ -882,12 +1099,11 @@ class StreamService:
         from ..core.turn_detector import DurationInterruptionDetector
 
         stage = self._stt
-        out: queue.Queue = session["out"]
+        out: asyncio.Queue = session["out"]
         token: CancellationToken = session["token"]
 
         def emit(payload: bytes) -> None:
-            with contextlib.suppress(queue.Full):
-                out.put_nowait(payload)
+            self._voice_emit_control(session, payload)
 
         # 自動 barge-in：機器人講話中偵測到持續語音 → 中止。
         # 判定器與 turn 判定分離（§7.5），門檻在 TurnPolicy。
@@ -937,7 +1153,33 @@ class StreamService:
                 history = self._history()
                 pre_len = len(history) if history is not None else 0
                 self._discard_turn = False
-                await self._run(utterance, emit, origin="voice")
+                async def send(payload: bytes) -> None:
+                    if payload and payload[0] == FRAME_AUDIO_ABORT:
+                        self._voice_send_urgent(session, payload)
+                        return
+                    # 插話取消的是 turn token（不是 session token）：兩者都要監聽，
+                    # 否則佇列塞滿時插話成功、管線卻仍卡在 put 上
+                    runner = self._runner
+                    turn_token = runner._current_token if runner is not None else None
+                    if token.is_cancelled or (turn_token is not None and turn_token.is_cancelled):
+                        return
+                    put_task = asyncio.create_task(out.put(payload))
+                    disconnect_task = asyncio.create_task(session["disconnected_event"].wait())
+                    waits = {put_task, disconnect_task, asyncio.create_task(token.wait())}
+                    if turn_token is not None:
+                        waits.add(asyncio.create_task(turn_token.wait()))
+                    try:
+                        done, _ = await asyncio.wait(
+                            waits, return_when=asyncio.FIRST_COMPLETED
+                        )
+                        if put_task in done:
+                            put_task.result()
+                    finally:
+                        for task in waits:
+                            if not task.done():
+                                task.cancel()
+
+                await self._run(utterance, send, origin="voice")
 
                 if self._discard_turn:
                     # 捨棄打在這一輪上：把 commit 進歷史的內容拿掉——
@@ -948,17 +1190,16 @@ class StreamService:
                     self._save_active_session()
                     self._log({"type": "turn_discarded"})
 
-                # turn 結束補一個 padding frame：tunnel 代理（cloudflared）會
-                # 緩衝小尾巴，最後一段音訊可能卡在代理層直到下一輪資料把它
-                # 擠出去——「最後一段等下次輸入才播」就是這個。前端會忽略它。
-                emit(json_frame(FRAME_EVENT, {"event": "flush", "pad": "." * 16384}))
         except Exception as exc:  # noqa: BLE001
-            emit(json_frame(FRAME_ERROR, {"error": f"{type(exc).__name__}: {exc}"}))
+            if not session.get("disconnected"):
+                emit(json_frame(FRAME_ERROR, {"error": f"{type(exc).__name__}: {exc}"}))
         finally:
             stage.on_voice_event = None
             stage.on_partial = None
-            with contextlib.suppress(queue.Full):
-                out.put_nowait(None)
+            for task in session["control_tasks"]:
+                task.cancel()
+            if not session.get("disconnected"):
+                await out.put(None)
             if self._voice is session:
                 self._voice = None
 
@@ -967,15 +1208,119 @@ class StreamService:
         session = self._voice
         if session is None or session["sid"] != sid:
             return
-        out: queue.Queue = session["out"]
+        ended = False
+        try:
+            while True:
+                future = asyncio.run_coroutine_threadsafe(self._voice_next(session), self._loop)
+                while True:
+                    try:
+                        item = future.result(timeout=60.0)
+                        break
+                    except TimeoutError:
+                        continue  # 沿用同一 waiter，避免 timeout 邊界丟掉 frame
+                if item is None:
+                    ended = True
+                    return
+                yield item
+        finally:
+            # 產生器因 HTTP 斷線被關閉時，不可留下 producer 永久等 queue。
+            if not ended:
+                self._loop.call_soon_threadsafe(self._voice_stream_disconnected, sid)
+
+    def _voice_send_urgent(self, session: dict[str, Any], payload: bytes) -> None:
+        """把停止類 frame 放進優先通道。**只在 loop 執行緒呼叫。**"""
+        if session.get("disconnected"):
+            return
+        session["urgent"].append(payload)
+        session["urgent_event"].set()
+
+    async def _voice_next(self, session: dict[str, Any]) -> bytes | None:
+        """取下一個要送出的 frame：優先通道先於一般佇列。"""
+        out: asyncio.Queue = session["out"]
+        urgent: collections.deque = session["urgent"]
+        wake: asyncio.Event = session["urgent_event"]
         while True:
+            if urgent:
+                return urgent.popleft()
+            if not out.empty():
+                return out.get_nowait()
+            wake.clear()
+            get_task = asyncio.ensure_future(out.get())
+            wake_task = asyncio.ensure_future(wake.wait())
             try:
-                item = out.get(timeout=60.0)
-            except queue.Empty:
-                continue  # 沒動靜就繼續等——長靜音是正常狀態
-            if item is None:
-                return
-            yield item
+                await asyncio.wait({get_task, wake_task}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                wake_task.cancel()
+                if not get_task.done():
+                    # Queue.get 在拿到 item 前被取消不會吃掉資料
+                    get_task.cancel()
+            if get_task.done() and not get_task.cancelled():
+                return get_task.result()
+
+    def _voice_stream_disconnected(self, sid: str) -> None:
+        session = self._voice
+        if session is None or session["sid"] != sid:
+            return
+        session["disconnected"] = True
+        session["disconnected_event"].set()
+        for task in session["control_tasks"]:
+            task.cancel()
+        session["token"].cancel(CancelReason.SUPERSEDED, "voice output disconnected")
+        if self._runner is not None and self._runner.is_speaking:
+            self._runner.interrupt(CancelReason.SUPERSEDED)
+
+    def _voice_emit_control(self, session: dict[str, Any], payload: bytes) -> None:
+        """由 loop 排入低頻控制 frame；音訊經 async sink 做嚴格背壓。"""
+        if session.get("disconnected"):
+            return
+        tasks: set[asyncio.Task] = session["control_tasks"]
+        if len(tasks) >= 32:
+            session["token"].cancel(CancelReason.SUPERSEDED, "voice output backpressure")
+            if self._runner is not None:
+                self._runner.interrupt(CancelReason.SUPERSEDED)
+            return
+        task = asyncio.create_task(session["out"].put(payload))
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    def report_playback(self, report: dict[str, Any]) -> bool:
+        """驗證 generation 後，在 loop 上套用瀏覽器的播放回報。"""
+        generation = str(report.get("generation") or "")
+        # 已結算的 generation 仍可比對：重送的最終 ACK 由 apply_report 冪等處理
+        state = self._playbacks.get(generation) or self._finished_playbacks.get(generation)
+        if state is None or str(report.get("turn_id") or "") != state.turn_id:
+            return False
+        future = asyncio.run_coroutine_threadsafe(
+            self._apply_playback_report_on_loop(state, report), self._loop
+        )
+        try:
+            return bool(future.result(timeout=2.0))
+        except (TimeoutError, RuntimeError):
+            future.cancel()
+            return False
+
+    async def _apply_playback_report_on_loop(
+        self, state: _PlaybackState, report: dict[str, Any]
+    ) -> bool:
+        accepted = await state.apply_report(report)
+        if (
+            accepted
+            and report.get("status") == "aborted"
+            and self._runner is not None
+            and self._runner._current_turn_id == state.turn_id
+        ):
+            # ACK 與 /api/interrupt 可能同時抵達；先到的 ACK 也必須保留
+            # barge-in 取消語意，避免 turn 被錯標成 upstream failure。
+            self._runner.interrupt(CancelReason.BARGE_IN)
+        return accepted
+
+    def _retire_playback(self, playback: _PlaybackState) -> None:
+        """回合結算後移出進行中表，保留有限筆供重送 ACK 冪等比對。"""
+        self._playbacks.pop(playback.generation, None)
+        finished = self._finished_playbacks
+        finished[playback.generation] = playback
+        while len(finished) > 64:
+            finished.popitem(last=False)
 
     # --- 執行 ---
 
@@ -1006,14 +1351,22 @@ class StreamService:
         turn_id = utterance.turn_id
         t0 = time.perf_counter()
 
-        # 掛在 runner 的 sink 上會讓 PipelineRunner 負責 drain 與播放進度，
-        # 但這裡的「播放」在瀏覽器端，伺服器無從得知進度。
-        # 所以自己收 chunk，並把 spoken 的判定留給前端回報（Phase 5 再處理）。
-        sink = _EmitSink(emit, t0)
+        # 播放完成由瀏覽器依 generation 回報；runner drain 期間保留插話守衛。
+        playback = _PlaybackState(turn_id, uuid.uuid4().hex, self._loop)
+        self._playbacks[playback.generation] = playback
+        sink = _EmitSink(
+            emit, t0, playback,
+            flush_after_end=(origin == "voice"),
+            stop_confirm_timeout_s=self.playback_stop_confirm_s,
+        )
         runner.sink = sink
         runner.think_stage = _EmitThink(self._think, emit, t0)
 
-        result = await runner.run_turn(utterance)
+        try:
+            result = await runner.run_turn(utterance)
+        except BaseException:
+            self._retire_playback(playback)
+            raise
 
         trace = self.tracer.get(turn_id)
         segments = trace.segments_ms() if trace else {}
@@ -1032,17 +1385,30 @@ class StreamService:
             "chunks": trace.chunk_count if trace else 0,
             "split_reasons": dict(trace.split_reasons) if trace else {},
             "audio_seconds": round(sink.written_duration_s, 2),
+            "playback": playback.status,
+            "played_seconds": round(sink.played_duration_s, 3),
+            "generation": playback.generation,
+            # 只有播放回報逾時才有值：缺席 chunk、前端 issues、最後回報距今秒數
+            "playback_diag": playback.timeout_diag,
             "memory_injected": getattr(self._think, "last_injected_memory", None),
+            "tool_calls": list(getattr(self._think, "last_tool_calls", []) or []),
+            "gap_filler": self.gap_filler.last_emitted,
+            "styles": list(getattr(runner.think_stage, "styles", []) or []),
             "report": self.tracer.report(turn_id),
         }
-        emit(json_frame(FRAME_META, meta))
+        try:
+            await _emit(emit, json_frame(FRAME_META, meta))
+        finally:
+            self._retire_playback(playback)
         self._log({"type": "turn", "input": utterance.text, **meta})
+        for call in meta["tool_calls"]:
+            self._tool_counts[call["name"]] = self._tool_counts.get(call["name"], 0) + 1
+            self._log({"type": "tool_call", "turn_id": turn_id, **call})
         # 每輪落地一次——server 掛掉最多丟正在跑的那一輪，不會丟整個會話
         self._save_active_session()
 
         if self._dream_scheduler is not None:
             self._dream_scheduler.notify_interaction()
-
         # 記憶寫入：背景旁路，不擋下一輪。
         # **被捨棄的 turn 不寫**——voice_discard 在中止前就把 _discard_turn
         # 立起來了，這裡看得到；歷史剔除了、記憶卻留著 = 髒資料。
@@ -1055,13 +1421,37 @@ class StreamService:
             and result.spoken_text
         ):
             asyncio.ensure_future(
-                self._memory.store(
+                self._store_memory(
                     utterance.text,
                     result.spoken_text,
                     origin=origin,
                     truncated=bool(result.cancel_reason),
                 )
             )
+
+    async def _store_memory(self, user_text: str, spoken_text: str, **meta: Any) -> None:
+        """背景寫入 + 把 salience 結果記進 session log（驗收看這個）。"""
+        stored = await self._memory.store(user_text, spoken_text, **meta)
+        if stored:
+            self._log({"type": "memory_store", "input": user_text[:80], **stored})
+
+
+def _style_info(sentence: Any) -> dict[str, Any] | None:
+    """句子的情緒 style 摘要（前端標籤 / session log）。沒 style 回 None。
+
+    這是情緒標記的**唯一可觀測點**——標記在 think stage 就被剝掉了，
+    沒這個你只能靠耳朵猜她有沒有標（2026-08-23 之前就是這樣）。
+    """
+    style = getattr(sentence, "style", None)
+    if style is None:
+        return None
+    return {
+        "marker": sentence.metadata.get("emotion_marker") or style.style or None,
+        "carried": bool(sentence.metadata.get("emotion_carried")),
+        "emotion": {k: round(float(v), 3) for k, v in style.emotion.items() if v},
+        "intensity": style.intensity,
+        "speed": style.speed,
+    }
 
 
 class _EmitThink:
@@ -1088,9 +1478,14 @@ class _EmitThink:
         await self._inner.aclose()
 
     async def stream(self, utterance, token):
+        self.styles = []
         async for sentence in self._inner.stream(utterance, token):
             if sentence.text:
-                self._emit(
+                style = _style_info(sentence)
+                if style is not None:
+                    self.styles.append({"index": sentence.index, **style})
+                await _emit(
+                    self._emit,
                     json_frame(
                         FRAME_TEXT,
                         {
@@ -1099,6 +1494,7 @@ class _EmitThink:
                             "is_first": sentence.is_first,
                             "split_reason": sentence.split_reason,
                             "ms": (time.perf_counter() - self._t0) * 1000,
+                            "style": style,
                         },
                     )
                 )
@@ -1108,18 +1504,250 @@ class _EmitThink:
         await self._inner.commit(turn_id, spoken_text, generated_text)
 
 
+async def _emit(emit: Callable[[bytes], Any], payload: bytes) -> None:
+    result = emit(payload)
+    if inspect.isawaitable(result):
+        await result
+
+
+class _PlaybackState:
+    """單一 turn 的播放 ACK 狀態；只在服務 event loop 上更新。"""
+
+    def __init__(self, turn_id: str, generation: str, loop: asyncio.AbstractEventLoop):
+        self.turn_id = turn_id
+        self.generation = generation
+        self.loop = loop
+        self._event = asyncio.Event()
+        self._written = 0.0
+        self._played = 0.0
+        self._chunks: list[float] = []
+        self._ended = False
+        self.status = "pending"
+        self._abort_frame_sent = False
+        self._final_status: str | None = None
+        """已接受的最終回報（complete / aborted）；之後同狀態的重送冪等成功。"""
+        self._final_event = asyncio.Event()
+        self._awaiting_final = False
+        """後端已送出停止、正在等前端回報最終實播位置。"""
+        # ── 診斷（純觀察，不參與任何狀態判定）──
+        self._client_diag: dict[str, Any] | None = None
+        """前端最後一次回報附帶的 diag（缺席 chunk、issues），已截斷。"""
+        self._report_count = 0
+        self._last_report_at: float | None = None
+        self.timeout_diag: dict[str, Any] | None = None
+        """drain 逾時當下的快照；turn meta 以 ``playback_diag`` 輸出。"""
+
+    def add_chunk(self, duration: float) -> int:
+        index = len(self._chunks)
+        self._chunks.append(max(0.0, duration))
+        self._written += max(0.0, duration)
+        return index
+
+    async def apply_report(self, report: dict[str, Any]) -> bool:
+        if report.get("generation") != self.generation or report.get("turn_id") != self.turn_id:
+            return False
+        # 診斷只保存、不影響下方任何判定；舊前端沒有 diag 欄位時照常
+        self._report_count += 1
+        self._last_report_at = time.monotonic()
+        diag = _sanitize_client_diag(report.get("diag"))
+        if diag is not None:
+            self._client_diag = diag
+        status = report.get("status")
+        if self._final_status is not None:
+            # 前端確認成功前會重送同一份最終回報：同狀態冪等成功、其餘一律拒絕
+            return status == self._final_status
+        if self.status in {"complete", "aborted", "timeout"} and not self._awaiting_final:
+            return False
+        try:
+            played = float(report.get("played_s", 0.0))
+        except (TypeError, ValueError):
+            return False
+        if not 0 <= played <= self._written + 0.05:
+            return False
+        self._played = max(self._played, min(played, self._written))
+        if self._awaiting_final:
+            # 後端已停止：這份是前端停下時的最後位置，結算要等它（或逾時）
+            if status in {"aborted", "complete"}:
+                self._final_status = status
+                self._final_event.set()
+            return True
+        if status == "aborted":
+            self.status = "aborted"
+            self._final_status = "aborted"
+            self._final_event.set()
+            self._event.set()
+        elif status == "complete" and self._ended and self._played >= self._written - 0.05:
+            self.status = "complete"
+            self._final_status = "complete"
+            self._final_event.set()
+            self._event.set()
+        return True
+
+    async def drain(
+        self,
+        emit: Callable[[bytes], Any],
+        timeout_s: float,
+        flush_payload: bytes | None = None,
+    ) -> None:
+        self._ended = True
+        if self.status == "pending":
+            self.status = "waiting"
+        await _emit(emit, json_frame(FRAME_AUDIO_END, {
+            "generation": self.generation,
+            "turn_id": self.turn_id,
+            "chunks": len(self._chunks),
+            "duration_s": self._written,
+        }))
+        if flush_payload is not None:
+            # 先把 END 與 padding 一起送過 tunnel，前端收到 END 後才能回 ACK。
+            await _emit(emit, flush_payload)
+        try:
+            await asyncio.wait_for(self._event.wait(), timeout=timeout_s)
+        except asyncio.TimeoutError as exc:
+            self.status = "timeout"
+            self.timeout_diag = self._build_timeout_diag(timeout_s)
+            raise TimeoutError("瀏覽器播放回報逾時") from exc
+        if self.status == "aborted":
+            raise CancelledError(CancelReason.BARGE_IN, "瀏覽器已停止播放")
+
+    def abort(self, emit: Callable[[bytes], Any] | None = None) -> None:
+        if self.status == "complete" or self._abort_frame_sent:
+            return
+        if self.status != "timeout":
+            if emit is not None and self._chunks and self._final_status is None:
+                # 後端發起的停止：前端還沒回報停在哪裡，結算前要等它確認
+                self._awaiting_final = True
+            self.status = "aborted"
+            self._event.set()
+        if emit is not None:
+            self._abort_frame_sent = True
+            # stop() 是同步 AudioSink 契約；async voice outbox 透過 task 排隊。
+            result = emit(json_frame(FRAME_AUDIO_ABORT, {
+                "generation": self.generation,
+                "turn_id": self.turn_id,
+            }))
+            if inspect.isawaitable(result):
+                asyncio.create_task(result)
+
+    async def wait_final(self, timeout_s: float) -> None:
+        """等前端回報停止時的最終實播位置；逾時沿用最後已知值，之後不再改寫。"""
+        if not self._awaiting_final:
+            return
+        try:
+            await asyncio.wait_for(self._final_event.wait(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            self._awaiting_final = False
+
+    @property
+    def played_duration_s(self) -> float:
+        return self._played
+
+    def _build_timeout_diag(self, timeout_s: float) -> dict[str, Any]:
+        """逾時當下組出可寫進 session log 的診斷；缺席 chunk 補上後端記錄的時長。"""
+        client = self._client_diag or {}
+        missing = []
+        for item in client.get("missing", []):
+            index = item["index"]
+            duration = self._chunks[index] if 0 <= index < len(self._chunks) else None
+            missing.append({
+                "index": index,
+                "stage": item.get("stage"),
+                "duration_s": round(duration, 3) if duration is not None else None,
+            })
+        age = (
+            round(time.monotonic() - self._last_report_at, 3)
+            if self._last_report_at is not None
+            else None
+        )
+        return {
+            "timeout_s": round(timeout_s, 3),
+            "written_s": round(self._written, 3),
+            "played_s": round(self._played, 3),
+            "chunks": len(self._chunks),
+            "reports": self._report_count,
+            "last_report_age_s": age,
+            "client": {
+                key: client.get(key)
+                for key in (
+                    "ended_chunks", "expected_chunks", "received_chunks",
+                    "missing_count", "issue_count",
+                )
+            } if self._client_diag is not None else None,
+            "missing": missing,
+            "issues": list(client.get("issues", [])),
+        }
+
+
+_DIAG_MAX_MISSING = 10
+_DIAG_MAX_ISSUES = 10
+_DIAG_MAX_ISSUE_CHARS = 200
+
+
+def _sanitize_client_diag(raw: Any) -> dict[str, Any] | None:
+    """清洗前端送來的播放診斷：只留已知欄位、限制數量與字串長度。
+
+    格式不對就回 None（當作沒送）——診斷不能讓回報本身失敗。
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    def _int(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)) and value >= 0:
+            return int(value)
+        return None
+
+    missing: list[dict[str, Any]] = []
+    raw_missing = raw.get("missing")
+    if isinstance(raw_missing, list):
+        for item in raw_missing[:_DIAG_MAX_MISSING]:
+            if isinstance(item, dict):
+                index = _int(item.get("index"))
+                stage = item.get("stage")
+            else:
+                index, stage = _int(item), None
+            if index is None:
+                continue
+            missing.append({
+                "index": index,
+                "stage": str(stage)[:32] if stage is not None else None,
+            })
+    issues: list[str] = []
+    raw_issues = raw.get("issues")
+    if isinstance(raw_issues, list):
+        issues = [str(x)[:_DIAG_MAX_ISSUE_CHARS] for x in raw_issues[:_DIAG_MAX_ISSUES]]
+    return {
+        "ended_chunks": _int(raw.get("ended_chunks")),
+        "expected_chunks": _int(raw.get("expected_chunks")),
+        "received_chunks": _int(raw.get("received_chunks")),
+        "missing_count": _int(raw.get("missing_count")),
+        "issue_count": _int(raw.get("issue_count")),
+        "missing": missing,
+        "issues": issues,
+    }
+
+
 class _EmitSink:
     """把音訊直接送進 HTTP response 的 sink。
 
-    ``played_duration_s`` 回傳「已送出」而非「已播出」——真正的播放進度在
-    瀏覽器端，伺服器不知道。這代表 **barge-in 的 spoken_text 判定在
-    Web 前端會偏樂觀**（算成整段都聽到了）。要精確得讓前端回報播放位置，
-    留給 Phase 5 一起處理。
+    每段帶 generation 與序號；drain 先送 generation_end，再等瀏覽器回報實播
+    位置。逾時或中止會讓管線明確失敗，spoken_text 只按 ACK 的秒數計算。
     """
 
-    def __init__(self, emit: Callable[[bytes], None], t0: float) -> None:
+    def __init__(
+        self, emit: Callable[[bytes], Any], t0: float, playback: _PlaybackState,
+        drain_timeout_s: float = 8.0, flush_after_end: bool = False,
+        stop_confirm_timeout_s: float = 1.0,
+    ) -> None:
         self._emit = emit
         self._t0 = t0
+        self._playback = playback
+        self._drain_timeout_s = drain_timeout_s
+        self._flush_after_end = flush_after_end
+        self._stop_confirm_timeout_s = stop_confirm_timeout_s
         self.written_duration_s = 0.0
         self._stopped = False
         self._seen_sentences: set[int] = set()
@@ -1127,18 +1755,45 @@ class _EmitSink:
     async def write(self, chunk: AudioChunk) -> None:
         if self._stopped:
             return
+        index = self._playback.add_chunk(chunk.duration_s)
         self.written_duration_s += chunk.duration_s
-        self._emit(frame(FRAME_AUDIO, pcm_to_wav(chunk)))
+        if index == 0:
+            await _emit(self._emit, json_frame(FRAME_AUDIO_BEGIN, {
+                "generation": self._playback.generation,
+                "turn_id": self._playback.turn_id,
+            }))
+        prefix = struct.pack(
+            ">16sId",
+            bytes.fromhex(self._playback.generation),
+            index,
+            chunk.duration_s,
+        )
+        await _emit(self._emit, frame(FRAME_AUDIO, prefix + pcm_to_wav(chunk)))
 
     def stop(self) -> None:
         self._stopped = True
+        self._playback.abort(self._emit)
 
     async def drain(self) -> None:
-        return
+        timeout_s = max(
+            self._drain_timeout_s,
+            (self.written_duration_s - self.played_duration_s) * 1.5 + 2.0,
+        )
+        flush = (
+            json_frame(FRAME_EVENT, {"event": "flush", "pad": "." * 16384})
+            if self._flush_after_end
+            else None
+        )
+        await self._playback.drain(self._emit, timeout_s, flush)
+
+    async def confirm_stopped(self) -> None:
+        """停止後等前端確認最終實播量（有時限）；PipelineRunner 在推算
+        spoken_text 前呼叫，commit 因此不會早於播放量確認。"""
+        await self._playback.wait_final(self._stop_confirm_timeout_s)
 
     @property
     def played_duration_s(self) -> float:
-        return self.written_duration_s
+        return self._playback.played_duration_s
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -1194,6 +1849,16 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
+        if self.path == "/api/playback/report":
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                report = json.loads(self.rfile.read(length) or b"{}")
+            except json.JSONDecodeError:
+                self._json(400, {"ok": False, "error": "invalid json"})
+                return
+            ok = self.service.report_playback(report)
+            self._json(200 if ok else 409, {"ok": ok})
+            return
         if self.path == "/api/interrupt":
             self._json(200, {"interrupted": self.service.interrupt()})
             return

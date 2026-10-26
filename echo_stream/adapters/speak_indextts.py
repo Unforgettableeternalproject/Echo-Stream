@@ -46,16 +46,58 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
+import shutil
 import tempfile
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
 from .. import config
-from ..contracts.cancellation import CancellationToken, CancelledError
-from ..contracts.style import SpeechStyle
+from ..contracts.cancellation import CancellationToken, CancelledError, CancelReason
+from ..contracts.style import EMOTION_DIMENSIONS, SpeechStyle
 from ..contracts.types import TTS_SAMPLE_RATE, AudioChunk, Sentence
 from ..core.channel import StreamChannel
+
+logger = logging.getLogger(__name__)
+
+TEMP_PREFIX = "echo_stream_tts_"
+STALE_TEMP_AGE_S = 24 * 3600
+
+
+def sweep_stale_tempdirs(
+    root: str | Path | None = None, max_age_s: float = STALE_TEMP_AGE_S
+) -> int:
+    """清掉上一次沒正常收工留下的暫存目錄，回傳清了幾個。
+
+    ``TemporaryDirectory`` 只在 ``aclose()`` 時 cleanup；殺 port、關視窗、程式炸掉
+    這些結束方式（已知陷阱 #1 那種殘留 server 正是這樣收的）目錄會留著。
+    實測 %TEMP% 躺了 23 個空目錄（2026-08-23）。規則：空的一律刪、非空但超過
+    ``max_age_s`` 也刪——非空代表某次合成到一半被殺，那個 wav 沒人會再用。
+    **不碰自己這次建的**（prepare 時自己的 _tempdir 還沒建，所以天然排除）。
+    """
+    base = Path(root) if root is not None else Path(tempfile.gettempdir())
+    removed = 0
+    now = time.time()
+    try:
+        candidates = list(base.glob(f"{TEMP_PREFIX}*"))
+    except OSError:
+        return 0
+    for d in candidates:
+        if not d.is_dir():
+            continue
+        try:
+            empty = not any(d.iterdir())
+            old = now - d.stat().st_mtime > max_age_s
+            if empty or old:
+                shutil.rmtree(d, ignore_errors=True)
+                removed += 1
+        except OSError:
+            continue
+    if removed:
+        logger.info("清掉 %d 個殘留的 TTS 暫存目錄", removed)
+    return removed
 
 DEFAULT_SAMPLE_RATE = TTS_SAMPLE_RATE
 """22050Hz，對齊 IndexTTS2 config 的 ``s2mel.preprocess_params.sr``。"""
@@ -71,6 +113,43 @@ CONFIG_STRETCH_RATIO = 1.72
 引擎裡的關係是 ``stretch_ratio = config_stretch_ratio - speed × 0.5``，
 stretch 越大唸得越慢。
 """
+
+
+def scale_emotion(vector: list[float], intensity: float) -> list[float]:
+    """八維向量 × 相對強度 → 送進引擎的向量（總和落在 echo_tts 定案區間）。
+
+    區間常數與縮放函式從 echo_tts import——TTS 那邊調區間，這裡自動跟，
+    不在整合層再抄一份數字。import 不到（舊分支）退回「向量 × 強度」。
+    """
+    try:
+        from echo_tts.config.emotion_presets import scale_to_user_strength
+    except ImportError:
+        alpha = max(0.0, min(1.0, intensity))
+        return [v * alpha for v in vector]
+    return scale_to_user_strength(list(vector), intensity)
+
+
+def load_emotion_presets(
+    path: str | None = None,
+) -> tuple[dict[str, dict[str, float]], dict[str, str]]:
+    """讀 echo_tts 的 ``emotion_presets.yaml``，轉成 core 的 preset 表形狀。
+
+    回傳 ``(presets, aliases)``：presets 是 key → 八維分佈（只取 vector，
+    ``overrides`` 那些 dynamics / text_markers 是 echo_tts session 層的功能，
+    這條管線繞過它，不接）；aliases 目前空——中文別名在 core 的內建表。
+    """
+    from echo_tts.config.emotion_presets import get_preset_vector, load_presets
+
+    raw = load_presets(path) if path else load_presets()
+    presets: dict[str, dict[str, float]] = {}
+    for key, entry in raw.items():
+        vec = list(get_preset_vector(entry))
+        presets[str(key)] = {
+            dim: float(v)
+            for dim, v in zip(EMOTION_DIMENSIONS, vec, strict=False)
+            if float(v) > 0.0
+        }
+    return presets, {}
 
 
 def speed_multiplier_to_offset(multiplier: float) -> float:
@@ -177,6 +256,7 @@ class IndexTTS2SpeakStage:
         tts_repo: str | Path | None = None,
         device: str | None = None,
         use_fp16: bool | None = None,
+        use_accel: bool | None = None,
         queue_size: int | None = None,
         sentence_buffer: int = 2,
         sample_rate: int = DEFAULT_SAMPLE_RATE,
@@ -196,6 +276,13 @@ class IndexTTS2SpeakStage:
         self.device = device or config.get("ECHO_STREAM_TTS_DEVICE", "cuda")
         self.use_fp16 = (
             use_fp16 if use_fp16 is not None else config.get_bool("ECHO_STREAM_TTS_FP16", True)
+        )
+        # IndexTTS2Backend 的 use_accel 預設為 False；保留該預設，避免整合層
+        # 未經實機驗收就改變推理路徑。需要加速時可由參數或環境設定明確開啟。
+        self.use_accel = (
+            use_accel
+            if use_accel is not None
+            else config.get_bool("ECHO_STREAM_TTS_USE_ACCEL", False)
         )
         self.queue_size = queue_size or int(config.get("ECHO_STREAM_TTS_QUEUE", "2"))
         self.sentence_buffer = sentence_buffer
@@ -229,6 +316,8 @@ class IndexTTS2SpeakStage:
         self._output_dir = Path(output_dir) if output_dir else None
         self._tempdir: tempfile.TemporaryDirectory | None = None
         self._prepared = False
+        self._synthesis_lock = asyncio.Lock()
+        """持有模型存取權直到 executor worker 真正結束，不隨呼叫端取消提早釋放。"""
 
     # --- 生命週期 ---
 
@@ -237,6 +326,8 @@ class IndexTTS2SpeakStage:
         if self._prepared:
             return
         loop = asyncio.get_running_loop()
+        # 先掃上次沒收乾淨的暫存目錄，再建自己的
+        await loop.run_in_executor(None, sweep_stale_tempdirs)
         if self._backend is None:
             self._backend = await loop.run_in_executor(None, self._build_backend)
         load = getattr(self._backend, "load", None)
@@ -304,16 +395,19 @@ class IndexTTS2SpeakStage:
             paths=paths,
             device=self.device,
             use_fp16=self.use_fp16,
+            use_accel=self.use_accel,
             emotion_vector=self.emotion_vector,
         )
 
     async def aclose(self) -> None:
-        backend = self._backend
-        if backend is not None:
-            unload = getattr(backend, "unload", None)
-            if callable(unload):
-                with contextlib.suppress(Exception):
-                    unload()
+        # worker 對模型的同步存取尚未結束前，不卸載 backend。
+        async with self._synthesis_lock:
+            backend = self._backend
+            if backend is not None:
+                unload = getattr(backend, "unload", None)
+                if callable(unload):
+                    with contextlib.suppress(Exception):
+                        await asyncio.get_running_loop().run_in_executor(None, unload)
         if self._tempdir is not None:
             with contextlib.suppress(Exception):
                 self._tempdir.cleanup()
@@ -327,23 +421,29 @@ class IndexTTS2SpeakStage:
     ) -> AsyncIterator[AudioChunk]:
         await self.prepare()
         loop = asyncio.get_running_loop()
+        stream_token = token.child()
 
         # 句子緩衝：讓 SentenceSplitter 在 TTS 合成期間能繼續跑，
         # 否則兩層就變成序列相加而不是重疊
         sentence_ch: StreamChannel[Sentence] = StreamChannel(
-            maxsize=self.sentence_buffer, token=token
+            maxsize=self.sentence_buffer, token=stream_token
         )
         audio_ch: StreamChannel[AudioChunk] = StreamChannel(
-            maxsize=self.queue_size, token=token
+            maxsize=self.queue_size, token=stream_token
         )
 
-        feeder = asyncio.ensure_future(self._feed(sentences, sentence_ch, token))
-        producer = asyncio.ensure_future(self._produce(sentence_ch, audio_ch, loop, token))
+        feeder = asyncio.ensure_future(self._feed(sentences, sentence_ch, stream_token))
+        producer = asyncio.ensure_future(
+            self._produce(sentence_ch, audio_ch, loop, stream_token)
+        )
 
         try:
             async for chunk in audio_ch:
                 yield chunk
         finally:
+            # aclose/task.cancel 也必須解除 executor callback 的背壓；子 token
+            # 不會反向取消其他 stage 共用的 turn token。
+            stream_token.cancel(CancelReason.SHUTDOWN, "TTS stream closed")
             for task in (feeder, producer):
                 if not task.done():
                     task.cancel()
@@ -351,6 +451,7 @@ class IndexTTS2SpeakStage:
             for task in (feeder, producer):
                 with contextlib.suppress(Exception, asyncio.CancelledError):
                     await task
+            stream_token.detach()
 
     async def _feed(
         self,
@@ -380,15 +481,43 @@ class IndexTTS2SpeakStage:
         try:
             async for sentence in sentence_ch:
                 token.raise_if_cancelled()
-                await loop.run_in_executor(
-                    None, self._synthesize_one, sentence, audio_ch, loop, token
+                worker = asyncio.create_task(
+                    self._synthesize_exclusive(sentence, audio_ch, loop, token)
                 )
+                # shield 讓 producer 可在取消時立即退出；worker 自己持有鎖，
+                # 直到同步 generate 真正結束，因此後續 turn 不會重入模型。
+                worker.add_done_callback(self._consume_task_result)
+                await asyncio.shield(worker)
         except CancelledError:
             pass
         except Exception as exc:  # noqa: BLE001
             audio_ch.fail(exc)
             return
         audio_ch.close()
+
+    async def _synthesize_exclusive(
+        self,
+        sentence: Sentence,
+        audio_ch: StreamChannel[AudioChunk],
+        loop: asyncio.AbstractEventLoop,
+        token: CancellationToken,
+    ) -> None:
+        async with self._synthesis_lock:
+            # 已在等待模型所有權的工作可能已過期；此處檢查可阻止它進 generate。
+            token.raise_if_cancelled()
+            worker = loop.run_in_executor(
+                None, self._synthesize_one, sentence, audio_ch, loop, token
+            )
+            # shield 避免 task.cancel 把 asyncio 包裝 future 標成取消；鎖只會在
+            # executor future 完成後離開，callback 需要的 event loop 仍可正常運作。
+            await asyncio.shield(worker)
+
+    @staticmethod
+    def _consume_task_result(task: asyncio.Task) -> None:
+        """取回呼叫端取消後仍在背景完成的 worker task 例外。"""
+        if not task.cancelled():
+            with contextlib.suppress(Exception):
+                task.exception()
 
     def _synthesize_one(
         self,
@@ -458,9 +587,11 @@ class IndexTTS2SpeakStage:
         會被忽略——這是刻意的，SpeechStyle 是**各後端取所需**的共同描述，
         不是每個欄位都保證被實作。
 
-        ``intensity``（emo_alpha）的翻譯是**向量 × 強度**：引擎的
-        ``normalize_emotion_vector`` 只在總和超過上限時壓縮，所以縮放
-        向量本身就等於調整情緒的整體強度。
+        ``intensity`` 的翻譯走 echo_tts 的強度區間（2026-08-23 改）：
+        0~1 刻度 → ``user_to_strength`` → 總和 0.57~0.73（0.5 = 0.65 甜蜜點），
+        再 ``scale_to_strength`` 等比縮放——preset 向量只剩比例有意義。
+        舊做法「向量 × intensity」送進去的總和多半 < 0.5，落在 TTS 那邊定案的
+        「情緒表現不足」區，LLM 標記聽起來跟沒標一樣。
 
         style 為 None 或中性時**還原**角色檔預設，而不是不動——
         上一句的情緒殘留在 backend 狀態裡，是「一句開心之後全部都開心」
@@ -470,8 +601,7 @@ class IndexTTS2SpeakStage:
 
         # 情緒向量：有 style 就換算，沒有就還原預設
         if style is not None and not style.is_neutral:
-            alpha = max(0.0, min(1.0, style.intensity))
-            backend.emotion_vector = [v * alpha for v in style.emotion_vector()]
+            backend.emotion_vector = scale_emotion(style.emotion_vector(), style.intensity)
         else:
             backend.emotion_vector = (
                 list(self._default_emotion) if self._default_emotion else None
@@ -512,6 +642,9 @@ __all__ = [
     "smooth_segment_edges",
     "tensor_to_pcm16",
     "speed_multiplier_to_offset",
+    "sweep_stale_tempdirs",
+    "scale_emotion",
+    "load_emotion_presets",
     "DEFAULT_SAMPLE_RATE",
     "CONFIG_STRETCH_RATIO",
 ]

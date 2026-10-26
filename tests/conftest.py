@@ -5,10 +5,34 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import pytest
 
 from echo_stream.contracts.types import Sentence
+
+
+@pytest.fixture(autouse=True)
+def _isolate_defaults(monkeypatch, tmp_path):
+    """測試不讀 repo 根目錄的 echo_stream.toml——那是艾斯維爾自己的調參檔，
+    內容隨時會變；測試要的預設值自己在測試裡給。"""
+    from echo_stream import defaults
+
+    monkeypatch.setenv("ECHO_STREAM_CONFIG", str(tmp_path / "no-such.toml"))
+    defaults.load_defaults.cache_clear()
+    yield
+    defaults.load_defaults.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_emotion_presets():
+    """StreamService.prepare() 會把 echo_tts 的 preset 表註冊進全域
+    EMOTION_PRESETS（TTS repo 在同層時就讀得到）；每個測試結束都退回內建表，
+    避免測試結果依賴執行順序。"""
+    yield
+    from echo_stream.core import emotion
+
+    emotion.reset_presets()
 
 
 class FakeTTSBackend:
@@ -94,4 +118,31 @@ async def sentence_stream(
             is_first=i == 0,
             is_last=i == len(texts) - 1,
             style=style,
+        )
+
+
+# ─── 守門：測試不得往 outputs/ 寫東西 ──────────────────────────────
+# outputs/web_logs 是真對話的分析材料；pytest 每跑一次噴一批 session_*.jsonl
+# 進去，艾斯維爾得手動清（2026-08-22）。任何新測試若建 StreamService 忘了傳
+# log_dir=tmp_path，這裡會直接 fail 而不是默默污染。
+
+_OUTPUTS = Path(__file__).resolve().parents[1] / "outputs"
+
+
+def _outputs_snapshot() -> set[Path]:
+    return set(_OUTPUTS.rglob("*")) if _OUTPUTS.exists() else set()
+
+
+@pytest.fixture(autouse=True)
+def _no_writes_to_outputs():
+    before = _outputs_snapshot()
+    yield
+    leaked = sorted(p for p in _outputs_snapshot() - before if p.is_file())
+    if leaked:
+        for p in leaked:
+            p.unlink(missing_ok=True)
+        names = ", ".join(p.name for p in leaked[:5])
+        pytest.fail(
+            f"測試往 outputs/ 寫了 {len(leaked)} 個檔（已清掉）：{names} —— "
+            "StreamService 要傳 log_dir=tmp_path"
         )

@@ -99,6 +99,15 @@ def char_weight(ch: str) -> float:
     return 0.0
 
 
+FLUSH = "\x00flush"
+"""token 流裡的控制訊號：收到就把 buffer 立刻切成一句，**不看長度下限**。
+
+給「filler → 工具往返 → 續寫」用：filler（「嗯，讓我想一下。」權重 6）不夠首句下限
+時會被扣在 buffer 裡，等到第二段的 token 回來才放出——filler 就白講了
+（2026-08-22 實測 TTFA 多吃一整段 round-trip）。think stage 在 filler 後送這個訊號。
+內容是不可能出現在 LLM 輸出裡的 NUL 開頭字串，對既有的純文字消費端不可見。"""
+
+
 def text_weight(text: str) -> float:
     """整段文字的發音時長權重。"""
     return sum(char_weight(c) for c in text)
@@ -217,6 +226,14 @@ class SentenceSplitter:
             if token is not None:
                 token.raise_if_cancelled()
             if not tok:
+                continue
+            if tok == FLUSH:
+                if buffer.strip():
+                    yield self._make(buffer, turn_id, index, "flush")
+                    index += 1
+                buffer = ""
+                depth = 0
+                pending_ascii_at = -1
                 continue
 
             for ch in tok:

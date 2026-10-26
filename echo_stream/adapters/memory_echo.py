@@ -1,7 +1,8 @@
 """Memory adapter：Echo Memory（Phase 4a）。
 
 **這是唯一 import echo_memory 的地方**，其餘程式碼只認
-:class:`EchoMemoryAdapter` 的三個方法（retrieve / store / set_session）。
+:class:`EchoMemoryAdapter` 的幾個方法（retrieve / store / set_session /
+tool_definitions / execute_tool）。
 
 ## 為什麼是 adapter 而不是直接用 MemoryEngine
 
@@ -34,6 +35,7 @@ import asyncio
 import inspect
 import logging
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +51,18 @@ DEFAULT_MAX_CHARS = 500
 DEFAULT_MIN_MATCH = 0.45
 """檢索相似度下限。echo_memory 預設 0.3，實測 35-41% 的匹配是純雜訊
 （「攀岩」撈出「深藍色」），注入只會讓 LLM 亂講。"""
+DEFAULT_TOOLS = "deep_recall,force_remember"
+"""預設開放給 LLM 的記憶工具（ECHO_STREAM_MEMORY_TOOLS，逗號分隔，``off`` 關閉）。
+echo_memory 有四個：deep_recall（純讀）、force_remember（寫一筆高顯著性 episode）、
+adjust_importance（改既有 episode 的 salience）、trigger_dream（觸發鞏固）。
+後兩個讓模型自主決定風險高，預設不給——要開自己寫進 .env。"""
+DEFAULT_TOOL_MAX_CHARS = 1500
+"""工具結果回給 LLM 的字數上限。deep_recall 的 top_k 可到 20、門檻比自動注入鬆
+（0.2 vs 0.45），不截會把第二段續寫的 prompt 塞爆。"""
+ASSESS_MODES = ("llm", "heuristic", "off")
+"""salience 評估模式（ECHO_STREAM_MEMORY_ASSESS）：
+llm = SubconsciousAssessor 打一次 LLM（背景，不在熱路徑）；
+heuristic = echo_memory 的文字啟發式，零 token；off = 全部 0.5（Phase 4a 行為）。"""
 
 
 def build_engine(
@@ -124,9 +138,32 @@ class EchoMemoryAdapter:
         top_k: int | None = None,
         max_chars: int | None = None,
         llm_fn: Callable[[str], str] | None = None,
+        assess_llm_fn: Callable[[str], str] | None = None,
     ) -> None:
         self._engine = engine
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="echo-memory")
+        """engine 專用的單工作緒 executor——**所有** engine 呼叫都走這裡序列化。
+
+        echo_memory 不是 thread-safe 的：EntityStore._save 是「固定 tmp 檔名 +
+        整檔 replace」且無鎖，retrieve（會更新 mention）/ store / dream / 工具
+        呼叫若各自丟共用執行緒池，兩條執行緒同時進 engine 就會撞出
+        WinError 5（replace 時檔案被另一條執行緒開著，2026-08-24 實錄）。
+        代價：dream 蒸餾期間 retrieve 會排隊——但併發進去換到的不只是
+        WinError 5，還有整份 JSON 互相覆寫的資料損毀，序列化是底線。"""
         self._llm_fn = llm_fn
+        self._assess_llm_fn = assess_llm_fn
+        """評估用 LLM。五維打分不需要 reasoning，server 會給一個壓低 effort 的版本；
+        沒給就退回 dream 用的 llm_fn。"""
+        self._assessor: Any = None
+        self._judge: Any = None
+        self.assess_mode = config.get("ECHO_STREAM_MEMORY_ASSESS", "llm") or "llm"
+        if self.assess_mode not in ASSESS_MODES:
+            logger.warning("ECHO_STREAM_MEMORY_ASSESS=%r 不認得，改用 llm", self.assess_mode)
+            self.assess_mode = "llm"
+        self._contexts: dict[str, Any] = {}
+        """retrieve 的 MemoryContext 暫存（key = user text），給同一輪的 store
+        評估 novelty / dream_resonance 用。retrieve 與 store 之間隔一整輪對話，
+        所以不能只留「最後一個」。"""
         self.top_k = top_k or int(
             config.get("ECHO_STREAM_MEMORY_TOP_K", str(DEFAULT_TOP_K))
         )
@@ -138,6 +175,15 @@ class EchoMemoryAdapter:
         )
         self._session_id: str | None = None
         self.load_seconds: float | None = None
+        self._tool_executor: Any = None
+        self.tool_max_chars = int(
+            config.get("ECHO_STREAM_MEMORY_TOOL_MAX_CHARS", str(DEFAULT_TOOL_MAX_CHARS))
+        )
+        raw_tools = config.get("ECHO_STREAM_MEMORY_TOOLS", DEFAULT_TOOLS) or DEFAULT_TOOLS
+        self.enabled_tools: list[str] = (
+            [] if raw_tools.strip().lower() in ("off", "none", "false", "0")
+            else [t.strip() for t in raw_tools.split(",") if t.strip()]
+        )
 
     @property
     def engine(self) -> Any:
@@ -155,12 +201,79 @@ class EchoMemoryAdapter:
         embedding 模型（sentence-transformers）的首載也發生在這裡之後的
         第一次呼叫；真正的冷啟成本用 memory-check 量。
         """
-        await asyncio.get_running_loop().run_in_executor(None, lambda: self.engine)
+        await asyncio.get_running_loop().run_in_executor(self._executor, lambda: self.engine)
+
+    async def aclose(self) -> None:
+        """關閉 engine 專用 executor。
+
+        不取消排隊中的工作——store / dream 是寫入，丟掉就是記憶遺失；
+        等它們跑完再收，且不擋 event loop。重複呼叫是安全的。
+        """
+        await asyncio.get_running_loop().run_in_executor(
+            None, lambda: self._executor.shutdown(wait=True)
+        )
 
     def set_session(self, session_id: str | None) -> None:
         """換會話。之後的 retrieve 會排除這個會話的 episodes（防自我回聲），
         store 會把 episodes 標上這個 session_id。"""
         self._session_id = session_id
+        self._tool_executor = None  # echo_memory 的 ToolExecutor 綁 session_id，換會話重建
+
+    # --- 工具呼叫（C 段）---
+
+    def tool_definitions(self) -> list[dict[str, Any]]:
+        """開放給 LLM 的工具，OpenAI function schema。空列表 = 不給工具。
+
+        schema 來自 echo_memory 的 ``TOOL_DECLARATIONS``（它是 Gemini 格式的 dict，
+        欄位剛好與 OpenAI 的 function 一致，只差外面要包一層 ``type: function``）。
+        """
+        if not self.enabled_tools:
+            return []
+        try:
+            from llm_integration.tools.definitions import TOOL_DECLARATIONS
+        except ImportError as exc:
+            logger.warning("echo_memory 沒有 llm_integration.tools——工具停用：%s", exc)
+            return []
+        known = {d["name"]: d for d in TOOL_DECLARATIONS}
+        out = []
+        for name in self.enabled_tools:
+            decl = known.get(name)
+            if decl is None:
+                logger.warning(
+                    "ECHO_STREAM_MEMORY_TOOLS 裡的 %r 不是 echo_memory 的工具，略過", name
+                )
+                continue
+            out.append({"type": "function", "function": dict(decl)})
+        return out
+
+    @property
+    def tool_executor(self) -> Any:
+        """echo_memory 的 ToolExecutor，lazy、綁當前 session。"""
+        if self._tool_executor is None:
+            from llm_integration.tools.executor import ToolExecutor
+
+            self._tool_executor = ToolExecutor(
+                self.engine, session_id=self._session_id or "unknown"
+            )
+        return self._tool_executor
+
+    async def execute_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        """給 LLMThinkStage 的 ``tool_executor``。
+
+        白名單再擋一次——schema 只給了兩個，模型照理叫不出別的，
+        但「照理」不是防線。結果截到 ``tool_max_chars``。
+        """
+        if name not in self.enabled_tools:
+            return {"success": False, "result": f"Tool {name!r} is not available."}
+
+        def _work() -> dict[str, Any]:
+            outcome = self.tool_executor.execute(name, dict(args))
+            text = str(outcome.get("result", ""))
+            if len(text) > self.tool_max_chars:
+                outcome = {**outcome, "result": text[: self.tool_max_chars] + "…"}
+            return outcome
+
+        return await asyncio.get_running_loop().run_in_executor(self._executor, _work)
 
     # --- 管線介面 ---
 
@@ -192,6 +305,7 @@ class EchoMemoryAdapter:
                 logger.info("memory retrieve：圖擴散漏過門檻，丟棄 %d 筆",
                             len(context.episodes) - len(kept))
                 context.episodes = kept
+            self._remember_context(text, context)
             if context.is_empty():
                 return None
             rendered = context.to_text()
@@ -199,7 +313,104 @@ class EchoMemoryAdapter:
                 rendered = rendered[: self.max_chars] + "…"
             return rendered
 
-        return await asyncio.get_running_loop().run_in_executor(None, _work)
+        return await asyncio.get_running_loop().run_in_executor(self._executor, _work)
+
+    _CONTEXT_KEEP = 8
+
+    def _remember_context(self, text: str, context: Any) -> None:
+        self._contexts[text] = context
+        while len(self._contexts) > self._CONTEXT_KEEP:
+            self._contexts.pop(next(iter(self._contexts)))
+
+    # --- salience（Phase 4b）---
+
+    @property
+    def assessor(self) -> Any:
+        """SubconsciousAssessor，lazy。heuristic 模式不給 LLM，它自己會降級。"""
+        if self._assessor is None:
+            from echo_memory.affect.subconscious import SubconsciousAssessor
+
+            fn = None
+            if self.assess_mode == "llm":
+                fn = self._assess_llm_fn or self._llm_fn
+                if fn is None:
+                    logger.warning("assess=llm 但沒有 llm_fn，退回 heuristic")
+            self._assessor = SubconsciousAssessor(llm_fn=fn)
+        return self._assessor
+
+    def _evaluate_salience(
+        self, user_text: str, spoken_text: str, context: Any
+    ) -> dict[str, Any]:
+        """Entry.py Step 3：assess → signals → 三值 → neurochem → StorageJudge 微調。
+
+        推理全在 echo_memory；這裡只是把它們串起來。
+
+        StorageJudge 是第二段：OpenSoul 公式偏重 complexity/novelty，
+        「我妹妹要去筑波大學」「別再糾正我的英文」這種簡單但該記住的話
+        baseline 只有 0.35-0.45，過不了蒸餾門檻（2026-08-22 實測）。
+        Judge 的 JudgeGate 只在信號進灰區才打 LLM，用 salience_delta /
+        force_remember / metadata_tags（correction、preference…）補這一段。
+        """
+        from echo_memory.affect.salience import SalienceEvaluator
+        from echo_memory.affect.signals import SalienceSignals
+
+        assessment = self.assessor.assess(user_text, context)
+        signals = SalienceSignals.from_subconscious(assessment)
+        evaluator = SalienceEvaluator(self.engine.neurochem)
+        baseline, da, ht = evaluator.evaluate(
+            signals, user_input=user_text, agent_response=spoken_text
+        )
+        evaluator.update_neurochem(signals)
+        result: dict[str, Any] = {
+            "salience": baseline,
+            "da_weight": da,
+            "ht_weight": ht,
+            "assessment": assessment.to_dict(),
+        }
+        if self.judge_enabled:
+            try:
+                decision = self.judge.storage_decision(
+                    user_input=user_text,
+                    agent_response=spoken_text,
+                    baseline_salience=baseline,
+                    assessment=assessment,
+                    context=context if context is not None and not context.is_empty()
+                    else None,
+                )
+            except Exception as exc:  # noqa: BLE001 - judge 是加分項，炸了用 baseline
+                logger.warning("StorageJudge 失敗，用 baseline：%s: %s",
+                               type(exc).__name__, exc)
+            else:
+                result["salience"] = max(0.0, min(1.0, baseline + decision.salience_delta))
+                judge: dict[str, Any] = {"source": decision.source}
+                if decision.salience_delta:
+                    judge["delta"] = round(decision.salience_delta, 3)
+                if decision.metadata_tags:
+                    judge["tags"] = list(decision.metadata_tags)
+                if decision.force_remember:
+                    judge["force_remember"] = True
+                    result["force_remember"] = True
+                if decision.entity_triggers:
+                    result["entity_triggers"] = True
+                if decision.reasoning:
+                    judge["reasoning"] = decision.reasoning[:200]
+                result["judge"] = judge
+        return result
+
+    @property
+    def judge_enabled(self) -> bool:
+        return self.assess_mode == "llm" and (
+            config.get("ECHO_STREAM_MEMORY_JUDGE", "on") or "on"
+        ).lower() not in ("off", "false", "0")
+
+    @property
+    def judge(self) -> Any:
+        """StorageJudge，lazy。與 assessor 共用評估用的 LLM。"""
+        if self._judge is None:
+            from echo_memory.affect.judge import StorageJudge
+
+            self._judge = StorageJudge(llm_fn=self._assess_llm_fn or self._llm_fn)
+        return self._judge
 
     async def store(
         self,
@@ -207,30 +418,65 @@ class EchoMemoryAdapter:
         spoken_text: str,
         session_id: str | None = None,
         **metadata: Any,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         """把一輪對話寫進記憶。**寫 spoken 不寫 generated**——與歷史同一條語意。
 
-        旁路：任何失敗只 log，不往上拋。metadata 建議帶 origin
+        回傳存檔摘要（episode_id / salience 三值 / 評估維度）給 server 記 log；
+        旁路：任何失敗只 log、回 None，不往上拋。metadata 建議帶 origin
         （voice/text、是否被 barge-in 截斷）——agent 產物混進使用者指示
         會污染記憶（spike 實測）。
+
+        salience 評估失敗不擋寫入——退回 0.5 照存，寧可有一筆平淡的記憶
+        也不要丟掉一輪對話。
         """
         if not user_text or not user_text.strip():
-            return
+            return None
         sid = session_id or self._session_id or "unknown"
+        context = self._contexts.pop(user_text, None)
 
-        def _work() -> None:
-            self.engine.store_episode(
+        def _work() -> dict[str, Any]:
+            scores: dict[str, Any] = {}
+            if self.assess_mode != "off":
+                try:
+                    scores = self._evaluate_salience(user_text, spoken_text, context)
+                except Exception as exc:  # noqa: BLE001 - 評估是加分項
+                    logger.warning("salience 評估失敗，退回 0.5：%s: %s",
+                                   type(exc).__name__, exc)
+                    scores = {}
+            assessment = scores.pop("assessment", None)
+            extra = dict(metadata)
+            if assessment is not None:
+                extra["assessment"] = assessment
+            episode_id = self.engine.store_episode(
                 user_input=user_text,
                 agent_response=spoken_text,
                 session_id=sid,
-                **metadata,
+                **scores,
+                **extra,
             )
+            return {"episode_id": episode_id, **scores, "assessment": assessment}
 
         try:
-            await asyncio.get_running_loop().run_in_executor(None, _work)
+            return await asyncio.get_running_loop().run_in_executor(self._executor, _work)
         except Exception as exc:  # noqa: BLE001 - 旁路，失敗不該炸管線
             logger.warning("memory store 失敗（不影響對話）：%s: %s",
                            type(exc).__name__, exc)
+            return None
+
+    async def profile(self) -> str:
+        """使用者 profile 文字（subject=user 的 concept 全列）。沒有就空字串。
+
+        常駐脈絡，不是檢索結果——server 在暖機與每次 dream 後刷新一次，
+        不在每輪熱路徑呼叫。
+        """
+        max_chars = int(config.get("ECHO_STREAM_MEMORY_PROFILE_MAX_CHARS", "800"))
+        get_profile = getattr(self.engine, "get_profile", None)
+        if get_profile is None:
+            logger.warning("echo_memory 沒有 get_profile——分支太舊，profile 停用")
+            return ""
+        return await asyncio.get_running_loop().run_in_executor(
+            self._executor, lambda: get_profile(max_chars=max_chars) or ""
+        )
 
     async def dream(self, triggered_by: str = "manual") -> dict[str, Any]:
         """離線鞏固（蒸餾/重播/修剪）。背景執行，不擋對話。
@@ -239,7 +485,7 @@ class EchoMemoryAdapter:
         沒有 llm_fn 時 Dream Engine 會優雅跳過蒸餾步驟。
         """
         return await asyncio.get_running_loop().run_in_executor(
-            None, lambda: self.engine.dream(triggered_by)
+            self._executor, lambda: self.engine.dream(triggered_by)
         )
 
     DISTILL_MIN_SALIENCE = 0.5
@@ -271,11 +517,22 @@ class EchoMemoryAdapter:
                 offset += len(page)
             return pending
 
-        return await asyncio.get_running_loop().run_in_executor(None, _work)
+        return await asyncio.get_running_loop().run_in_executor(self._executor, _work)
 
-    def set_llm_fn(self, llm_fn: Callable[[str], str] | None) -> None:
-        """事後補上蒸餾用的 LLM——backend 建立時機晚於 adapter 時用。"""
+    def set_llm_fn(
+        self,
+        llm_fn: Callable[[str], str] | None,
+        assess_llm_fn: Callable[[str], str] | None = None,
+    ) -> None:
+        """事後補上 LLM——backend 建立時機晚於 adapter 時用。
+
+        ``llm_fn`` 給 dream 蒸餾；``assess_llm_fn`` 給每輪的 salience 評估
+        （可以是壓低 reasoning 的便宜版本）。
+        """
         self._llm_fn = llm_fn
+        self._assess_llm_fn = assess_llm_fn
+        self._assessor = None  # 下次用到時以新的 fn 重建
+        self._judge = None
         if self._engine is not None and hasattr(self._engine, "set_llm_fn"):
             self._engine.set_llm_fn(llm_fn)
 
