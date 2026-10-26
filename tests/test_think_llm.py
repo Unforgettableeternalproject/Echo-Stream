@@ -660,3 +660,49 @@ async def test_標記的情緒延續到同段被切出的後續句():
     assert any(s.metadata.get("emotion_carried") for s in sentences[:first_sad])
     assert sentences[0].metadata.get("emotion_carried") is None
     assert all("[" not in s.text for s in sentences)
+
+
+# --- 用量觀測（prompt cache 命中）---
+
+
+class UsageBackend(FakeBackend):
+    """串流結束後可查 ``get_last_stream_usage()`` 的假 backend。"""
+
+    def __init__(self, usages: list[dict[str, int]], **kw):
+        super().__init__(**kw)
+        self._usages = list(usages)
+        self._last: dict[str, int] = {}
+
+    async def stream_query(self, messages, system_instruction=None, **kwargs):
+        self._last = {}
+        async for ch in super().stream_query(messages, system_instruction, **kwargs):
+            yield ch
+        self._last = self._usages.pop(0)
+
+    def get_last_stream_usage(self) -> dict[str, int]:
+        return dict(self._last)
+
+
+async def test_last_usage_取自_backend_的串流用量():
+    backend = UsageBackend([{"input_tokens": 1500, "cached_tokens": 1024, "output_tokens": 30}])
+    stage = LLMThinkStage(backend, split_policy=SplitPolicy(first_min_weight=1.0, min_weight=1.0))
+    await collect(stage)
+    assert stage.last_usage == {"input_tokens": 1500, "cached_tokens": 1024, "output_tokens": 30}
+
+
+async def test_last_usage_每輪重置():
+    backend = UsageBackend([
+        {"input_tokens": 100, "cached_tokens": 0, "output_tokens": 5},
+        {"input_tokens": 200, "cached_tokens": 128, "output_tokens": 6},
+    ])
+    stage = LLMThinkStage(backend, split_policy=SplitPolicy(first_min_weight=1.0, min_weight=1.0))
+    await collect(stage)
+    await collect(stage)
+    assert stage.last_usage == {"input_tokens": 200, "cached_tokens": 128, "output_tokens": 6}
+
+
+async def test_backend_沒有用量介面時_last_usage_為空():
+    policy = SplitPolicy(first_min_weight=1.0, min_weight=1.0)
+    stage = LLMThinkStage(FakeBackend(), split_policy=policy)
+    await collect(stage)
+    assert stage.last_usage == {}

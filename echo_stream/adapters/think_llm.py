@@ -273,6 +273,11 @@ class LLMThinkStage:
         """這一輪實際呼叫了什麼——``[{name, args, duration_ms, ok, result_summary}]``，
         Web meta / session log 用，不參與邏輯。"""
 
+        self.last_usage: dict[str, int] = {}
+        """這一輪 LLM 的用量——``{input_tokens, cached_tokens, output_tokens}``（工具往返會加總）。
+        取自 backend 的 ``get_last_stream_usage()``；backend 沒提供就維持空 dict。
+        只供觀測 prompt cache 命中（cached_tokens / input_tokens），不參與邏輯。"""
+
         self.history: list[dict[str, str]] = []
         self._pending_user_text = ""
         self._pending_memory: str | None = None
@@ -359,6 +364,7 @@ class LLMThinkStage:
     ) -> AsyncIterator[str]:
         """LLM token 流，含工具往返。對上游的切句器來說這就是一條連續的文字流。"""
         self.last_tool_calls = []
+        self.last_usage = {}
         messages = list(messages)
         first = True
         spoke = False
@@ -388,6 +394,7 @@ class LLMThinkStage:
                 round_text.append(piece)
                 yield piece
 
+            self._collect_usage()
             if not calls:
                 return
 
@@ -413,6 +420,19 @@ class LLMThinkStage:
                     )
                 )
             )
+
+    def _collect_usage(self) -> None:
+        """把 backend 剛結束的那次串流用量加進 ``last_usage``。拿不到就略過。"""
+        getter = getattr(self._backend, "get_last_stream_usage", None)
+        if not callable(getter):
+            return
+        try:
+            usage = getter() or {}
+        except Exception:  # noqa: BLE001 - 觀測用，不該炸管線
+            return
+        for key in ("input_tokens", "cached_tokens", "output_tokens"):
+            if key in usage:
+                self.last_usage[key] = self.last_usage.get(key, 0) + int(usage[key] or 0)
 
     async def _run_tools(
         self,
