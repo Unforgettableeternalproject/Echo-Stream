@@ -110,6 +110,37 @@ async def test_prepare_會載入_backend():
     assert backend.loaded
 
 
+class _LoraBackend(FakeBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.merge_calls: list[float | None] = []
+
+    def merge_lora(self, checkpoint_path=None, scale=None):
+        assert self.loaded, "必須先 load 再 merge"
+        self.merge_calls.append(scale)
+        return {"accel_synced": True}
+
+
+async def test_lora_scale_為_None_不呼叫_merge():
+    backend = _LoraBackend()
+    await IndexTTS2SpeakStage(backend=backend).prepare()
+    assert backend.merge_calls == []
+
+
+async def test_lora_scale_有值時_prepare_合併一次():
+    backend = _LoraBackend()
+    stage = IndexTTS2SpeakStage(backend=backend, lora_scale=0.85)
+    await stage.prepare()
+    await stage.prepare()   # 第二次 prepare 不重複合併
+    assert backend.merge_calls == [0.85]
+
+
+async def test_backend_不支援_merge_lora_時明確失敗():
+    stage = IndexTTS2SpeakStage(backend=FakeBackend(), lora_scale=0.85)
+    with pytest.raises(RuntimeError):
+        await stage.prepare()
+
+
 # --- 背壓 ---
 
 
