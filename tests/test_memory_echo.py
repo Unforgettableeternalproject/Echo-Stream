@@ -407,3 +407,12 @@ async def test_store_salience評估期間不持鎖_另一呼叫能取得鎖(fake
     out = await asyncio.wait_for(task, 5)
     assert out["episode_id"] == "ep_test"
     assert engine.stored[0]["salience"] == 0.82
+
+
+def test_force_remember描述限定明確要求才呼叫(fake_tools, monkeypatch):
+    monkeypatch.delenv("ECHO_STREAM_MEMORY_TOOLS", raising=False)
+    defs = EchoMemoryAdapter(_Engine(_Ctx())).tool_definitions()
+    by_name = {d["function"]["name"]: d["function"] for d in defs}
+    desc = by_name["force_remember"]["description"]
+    assert "明確要求" in desc and "自動寫入" in desc
+    assert by_name["deep_recall"]["description"] == "d", "只覆寫 force_remember"

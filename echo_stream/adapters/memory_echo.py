@@ -60,6 +60,15 @@ DEFAULT_TOOLS = "deep_recall,force_remember"
 echo_memory 有四個：deep_recall（純讀）、force_remember（寫一筆高顯著性 episode）、
 adjust_importance（改既有 episode 的 salience）、trigger_dream（觸發鞏固）。
 後兩個讓模型自主決定風險高，預設不給——要開自己寫進 .env。"""
+
+FORCE_REMEMBER_DESCRIPTION = (
+    "只有在使用者明確要求記住時才呼叫（例如「記住」「幫我記」「別忘了」這類明確指示）。"
+    "一般對話內容系統每輪都會自動寫入記憶，不需要也不要為此呼叫。"
+    "content 寫成一句完整的第三人稱事實。"
+    "Only call when the user explicitly asks you to remember something; ordinary "
+    "conversation is already stored automatically every turn."
+)
+"""覆寫 echo_memory 原本偏寬的 force_remember 描述，避免模型把一般事實也當成要強制記憶。"""
 DEFAULT_TOOL_MAX_CHARS = 1500
 """工具結果回給 LLM 的字數上限。deep_recall 的 top_k 可到 20、門檻比自動注入鬆
 （0.2 vs 0.45），不截會把第二段續寫的 prompt 塞爆。"""
@@ -441,7 +450,10 @@ class EchoMemoryAdapter:
                     "ECHO_STREAM_MEMORY_TOOLS 裡的 %r 不是 echo_memory 的工具，略過", name
                 )
                 continue
-            out.append({"type": "function", "function": dict(decl)})
+            fn = dict(decl)
+            if name == "force_remember":
+                fn["description"] = FORCE_REMEMBER_DESCRIPTION
+            out.append({"type": "function", "function": fn})
         return out
 
     @property

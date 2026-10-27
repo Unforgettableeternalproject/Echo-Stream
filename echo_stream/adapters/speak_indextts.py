@@ -157,6 +157,9 @@ DEFAULT_SAMPLE_RATE = TTS_SAMPLE_RATE
 class _Aborted(Exception):
     """內部訊號：從 callback 拋出以中止 ``generate()``。"""
 
+    is_cancellation = True
+    """取消不算失敗：TTS 端 lite_engine 據此把這個例外降為 debug 記錄。"""
+
 
 CONFIG_STRETCH_RATIO = 1.72
 """引擎 config 的 ``s2mel_stretch_ratio`` 預設值。

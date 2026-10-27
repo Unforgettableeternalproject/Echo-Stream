@@ -597,3 +597,10 @@ def test_next_output_path_目錄被刪後自我修復(tmp_path):
     shutil.rmtree(first.parent)
     second = stage._next_output_path(sentence)
     assert second.parent.is_dir()
+
+
+def test_Aborted標記為取消而非失敗():
+    from echo_stream.adapters.speak_indextts import _Aborted
+
+    assert _Aborted.is_cancellation is True
+    assert getattr(_Aborted(), "is_cancellation", False) is True
