@@ -16,9 +16,9 @@ think stage 只需要「一段可以塞進 prompt 的文字」。adapter 負責�
 
 ## ⚠️ 分支依賴
 
-需要 echo_memory repo 在 ``feature/agent-memory-spike`` 分支——
+需要 echo_memory repo 在 ``develop`` 分支——
 ``namespace_id`` / ``exclude_session_id`` / ``llm_fn`` 這些 API
-**master 上沒有**（2026-08-22 確認）。build_engine 會驗 API 形狀，
+已併入 develop（舊的 spike 分支不再需要；master 落後）。build_engine 會驗 API 形狀，
 缺了就給出可行動的錯誤而不是深處的 TypeError。
 
 ## 設計決策（見 docs/hidden/phase4-memory-integration-plan.md）
@@ -113,6 +113,13 @@ def build_engine(
 
     embedding 走本地 bge-small-zh、CPU——不跟 GPU 上的 STT/TTS 搶資源
     （艾斯維爾 2026-08-21 定調）。
+
+    注意：這裡不指定 embedding 後端，沿用 echo_memory 的環境預設
+    （``EMBEDDING_BACKEND`` 預設 sentence-transformers + bge-small-zh，512 維）。
+    bot／Memory 線可能設成 ollama + bge-m3（1024 維），兩者不同。
+    資料目錄的 ``embedding_index.json`` manifest 記錄 model 與 dimension，
+    不符時 echo_memory 會判定索引需重建，而非靜默混用；因此不要讓兩邊
+    共用同一個資料目錄，除非 ``EMBEDDING_*`` 設定一致。
     """
     repo = memory_repo or config.get("ECHO_STREAM_MEMORY_REPO")
     config.ensure_importable(
@@ -142,9 +149,9 @@ def build_engine(
     if "namespace_id" not in params:
         raise RuntimeError(
             "echo_memory 的 MemoryEngine 沒有 namespace_id 參數——"
-            "repo 不在 feature/agent-memory-spike 分支上。\n"
+            "repo 不在 develop 分支上。\n"
             "到 TestSeperateMemorySystem 執行："
-            "git checkout feature/agent-memory-spike"
+            "git checkout develop"
         )
 
     data = Path(
@@ -301,16 +308,17 @@ class EchoMemoryAdapter:
     def _is_fine_grained(self) -> bool:
         """引擎是否自帶並行安全（記憶層 M-1b）。
 
-        偵測依據：公開 ``warmup`` 方法。M-1b 以同一批引入 ``ensure_initialized``
-        （全部延遲屬性在啟動時單執行緒建好）、``storage_lock`` 與 ``warmup``，
-        retrieve／store_episode／record_observation 的並行安全建立在它們之上；
-        舊引擎（develop bf76157）沒有 ``warmup``，也不是執行緒安全的。
+        偵測依據：公開 ``ensure_initialized`` 方法。M-1b 以同一批引入
+        ``ensure_initialized``（全部延遲屬性在啟動時單執行緒建好）、``storage_lock``
+        與 ``warmup``，retrieve／store_episode／record_observation 的並行安全建立在
+        前兩者之上；``warmup`` 比 ``ensure_initialized`` 早出現，不能當並行安全的指標。
+        舊引擎沒有 ``ensure_initialized``，也不是執行緒安全的。
         engine 尚未建構時（惰性建立）視同舊引擎走全包鎖，建好後才切換。
         """
         if self._fine_grained is None:
             if self._engine is None:
                 return False
-            self._fine_grained = callable(getattr(self._engine, "warmup", None))
+            self._fine_grained = callable(getattr(self._engine, "ensure_initialized", None))
             if self._fine_grained:
                 logger.info("記憶引擎自帶並行安全：採細粒度鎖")
         return self._fine_grained
@@ -842,8 +850,21 @@ class EchoMemoryAdapter:
         return await self._run(lambda: self.engine.dream(triggered_by), "dream")
 
     DISTILL_MIN_SALIENCE = 0.5
-    """與 echo_memory KnowledgeDistillation.MIN_SALIENCE_THRESHOLD 對齊——
-    低於這個值的 episode 蒸餾根本不會看，算進 pending 只會讓排程空跑。"""
+    """fallback：echo_memory 無法 import 時才用，值對齊 KnowledgeDistillation.
+    MIN_SALIENCE_THRESHOLD。平常由 :meth:`_distill_min_salience` 從來源讀取。"""
+
+    @classmethod
+    def _distill_min_salience(cls) -> float:
+        """蒸餾顯著性門檻——直接讀 echo_memory，避免複製的常數日後漂移。
+
+        低於這個值的 episode 蒸餾根本不會看，算進 pending 只會讓排程空跑。
+        """
+        try:
+            from echo_memory.dream.distillation import KnowledgeDistillation
+
+            return float(KnowledgeDistillation.MIN_SALIENCE_THRESHOLD)
+        except Exception:  # noqa: BLE001 - 舊版或尚未可 import：退回複製的常數
+            return cls.DISTILL_MIN_SALIENCE
 
     async def pending_dream_count(self) -> int:
         """有多少 episode 等著被蒸餾（未 dreamed 且顯著性過門檻）。
@@ -851,6 +872,8 @@ class EchoMemoryAdapter:
         DreamScheduler 用這個數字決定「跑了會不會有產出」。
         list_episodes 單頁上限 200，所以分頁掃。
         """
+
+        threshold = self._distill_min_salience()
 
         def _work() -> int:
             episodic = self.engine.episodic
@@ -865,7 +888,7 @@ class EchoMemoryAdapter:
                     1
                     for ep in page
                     if not ep.is_dreamed
-                    and ep.salience_score >= self.DISTILL_MIN_SALIENCE
+                    and ep.salience_score >= threshold
                 )
                 offset += len(page)
             return pending

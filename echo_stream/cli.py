@@ -419,7 +419,7 @@ async def _run_memory_check(args: argparse.Namespace) -> int:
         print(f"\n✗ engine 建立失敗：{type(exc).__name__}: {exc}")
         print("\n  檢查項：")
         print("  - ECHO_STREAM_MEMORY_REPO 是否指向 TestSeperateMemorySystem")
-        print("  - 該 repo 是否在 feature/agent-memory-spike 分支")
+        print("  - 該 repo 是否在 develop 分支")
         return 1
     engine_ms = (time.perf_counter() - t0) * 1000
     print(f"  engine 建立 {engine_ms:.0f}ms（不含 embedding 模型，那個在首次檢索）")

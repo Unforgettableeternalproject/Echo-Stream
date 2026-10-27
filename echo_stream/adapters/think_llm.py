@@ -45,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import inspect
 import json
 import logging
 import re
@@ -517,10 +518,23 @@ class LLMThinkStage:
         return {}
 
     async def aclose(self) -> None:
-        close = getattr(self._backend, "aclose", None)
+        """關閉 backend 持有的連線資源。
+
+        SessionControl 的 backend 沒有公開的 ``aclose``，但 OpenAI backend 持有
+        ``AsyncOpenAI`` client（``_async_client``，連線池要關）。優先用公開
+        ``aclose``；沒有才關 ``_async_client``。同步 ``_client`` 不關——記憶 adapter 的
+        llm_fn 在 executor 執行緒共用它，關了會弄壞仍在跑的 dream。
+        """
+        backend = self._backend
+        close = getattr(backend, "aclose", None)
+        if not callable(close):
+            client = getattr(backend, "_async_client", None)
+            close = getattr(client, "close", None) if client is not None else None
         if callable(close):
             with contextlib.suppress(Exception):
-                await close()
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
 
     # --- 串流 ---
 

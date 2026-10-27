@@ -83,6 +83,7 @@ class _GateEngine(_StoreEngine):
         self.entered = {n: threading.Event() for n in ("retrieve", "store", "dream")}
         if fine:
             self.warmup = lambda background=True: None
+            self.ensure_initialized = lambda: None
 
     def _enter(self, name):
         self.entered[name].set()

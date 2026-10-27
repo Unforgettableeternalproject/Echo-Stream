@@ -26,6 +26,7 @@ class _ObsEngine(_Engine):
         self.fail = False
         if fine:
             self.warmup = lambda background=True: None
+            self.ensure_initialized = lambda: None
 
     def record_observation(self, **kw):
         self.entered.set()
