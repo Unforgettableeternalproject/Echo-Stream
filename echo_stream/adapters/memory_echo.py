@@ -259,6 +259,34 @@ class EchoMemoryAdapter:
         """
         await self._run(lambda: self.engine)
 
+    async def warmup(self) -> bool:
+        """觸發 embedding 暖機入口；回傳是否成功觸發，絕不往外拋。
+
+        - engine 有公開 ``warmup`` → 呼叫它（記憶層 feature/memory-reliability 提供）。
+        - 沒有 → 退路：存取 ``engine.episodic`` 一次，首次存取會在
+          engine 內啟動背景 embedding 暖機。
+        - 兩者都沒有 → False。
+
+        走 :meth:`_run`（executor + engine_lock）：engine 首次建構與 ``episodic``
+        載入都不是執行緒安全的，需與其他路徑序列化；暖機本身是背景執行緒、
+        呼叫立即返回，因此持鎖時間只有觸發那一下，不會擋住 retrieve / store。
+        """
+
+        def _work() -> bool:
+            engine = self.engine
+            fn = getattr(engine, "warmup", None)
+            if callable(fn):
+                fn()
+                return True
+            # hasattr 會實際取值，即觸發 episodic 的延遲載入與背景暖機
+            return hasattr(engine, "episodic")
+
+        try:
+            return bool(await self._run(_work))
+        except Exception as exc:  # noqa: BLE001 - 暖機失敗不得影響管線
+            logger.warning("記憶 embedding 暖機失敗：%s", exc)
+            return False
+
     async def aclose(self) -> None:
         """關閉 engine 專用 executor。
 

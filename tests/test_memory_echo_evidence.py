@@ -240,3 +240,65 @@ async def test_activity_profile_例外回空():
     engine.activity_profile = boom
     adapter = EchoMemoryAdapter(engine=engine)
     assert await adapter.activity_profile() == []
+
+
+# ── warmup：embedding 暖機入口 ───────────────────────────────────
+
+
+class _WarmupEngine:
+    """有公開 warmup 的引擎。"""
+
+    def __init__(self) -> None:
+        self.warmed = 0
+
+    def warmup(self) -> None:
+        self.warmed += 1
+
+
+class _EpisodicOnlyEngine:
+    """只有 episodic 屬性（存取即觸發背景暖機）的舊版引擎。"""
+
+    def __init__(self) -> None:
+        self.episodic_loads = 0
+
+    @property
+    def episodic(self) -> object:
+        self.episodic_loads += 1
+        return object()
+
+
+@pytest.mark.asyncio
+async def test_warmup_uses_engine_warmup_when_present():
+    engine = _WarmupEngine()
+    adapter = EchoMemoryAdapter(engine=engine)
+    assert await adapter.warmup() is True
+    assert engine.warmed == 1
+    await adapter.aclose()
+
+
+@pytest.mark.asyncio
+async def test_warmup_falls_back_to_episodic_access():
+    engine = _EpisodicOnlyEngine()
+    adapter = EchoMemoryAdapter(engine=engine)
+    assert await adapter.warmup() is True
+    assert engine.episodic_loads == 1
+    await adapter.aclose()
+
+
+@pytest.mark.asyncio
+async def test_warmup_returns_false_when_nothing_to_warm():
+    adapter = EchoMemoryAdapter(engine=object())
+    assert await adapter.warmup() is False
+    await adapter.aclose()
+
+
+@pytest.mark.asyncio
+async def test_warmup_swallows_exception(caplog):
+    class _Boom:
+        def warmup(self) -> None:
+            raise RuntimeError("embedding 後端不可用")
+
+    adapter = EchoMemoryAdapter(engine=_Boom())
+    assert await adapter.warmup() is False
+    assert "暖機失敗" in caplog.text
+    await adapter.aclose()
