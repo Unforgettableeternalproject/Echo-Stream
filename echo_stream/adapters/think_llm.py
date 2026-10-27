@@ -65,6 +65,7 @@ from ..core.tracer import (
     MARK_TOOL_START,
     LatencyTracer,
 )
+from .output_guard import OutputGuard
 
 logger = logging.getLogger(__name__)
 
@@ -276,12 +277,15 @@ class LLMThinkStage:
         tool_lead_in: str = "fixed",
         tool_lead_in_extra: str = "",
         memory_resolver: Callable[[str | None], Any] | None = None,
+        output_guard: OutputGuard | None = None,
     ) -> None:
         if tool_lead_in not in TOOL_LEAD_IN_MODES:
             raise ValueError(
                 f"tool_lead_in={tool_lead_in!r} 不認得，可用：{', '.join(TOOL_LEAD_IN_MODES)}"
             )
         self._backend = backend
+        self.output_guard = output_guard if output_guard is not None else OutputGuard.from_config()
+        """輸出防線：濾掉模型偶發吐出的已知中文污染 token。沒傳就讀 .env 設定。"""
         self.system_prompt = system_prompt
         self.split_policy = split_policy or SplitPolicy()
         self.tracer = tracer
@@ -428,6 +432,21 @@ class LLMThinkStage:
             ):
                 if sentence.text:
                     sentence.text = _LIST_MARKER_RE.sub("", sentence.text)
+                if sentence.text:
+                    # 所有對外文字（TTS、DM／文字前端、commit 的 spoken_text）都從
+                    # 這個 yield 出去，在此統一過濾；放在 emotion 解析之前，
+                    # 污染詞不會干擾標記解析，也不會被當成句內容。
+                    guarded, hits = self.output_guard.clean(sentence.text)
+                    if hits:
+                        sentence.text = guarded
+                        sentence.metadata["output_guard_hits"] = hits
+                        if not guarded:
+                            # 整句只剩污染：丟棄。若這是收尾句，仍要送出零長度
+                            # 收尾句讓下游知道結束（切句器自己也這樣做）
+                            if not sentence.is_last:
+                                continue
+                            yield sentence
+                            continue
                 if self.emotion_markers and sentence.text:
                     # 先解析再交給下游——sanitize_for_tts 只會剝括號符號、
                     # 保留內容，順序反了標記就會被唸出來
