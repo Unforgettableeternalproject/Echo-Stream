@@ -35,8 +35,9 @@ import asyncio
 import inspect
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +47,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_NAMESPACE = "echo-stream"
 DEFAULT_TOP_K = 3
+FINE_POOL_WORKERS = 4
+"""細粒度模式的 executor 工作緒數（retrieve／store 並行 + dream 佔一條）。"""
 DEFAULT_MAX_CHARS = 500
 """注入 prompt 的記憶文字上限。記憶放在 user message 內（保 prompt cache），
 太長會吃掉 token 預算、也會影響切分行為——先保守，profiling 後再調。"""
@@ -148,6 +151,50 @@ def build_engine(
     )
 
 
+class _SharedExclusiveLock:
+    """共享／獨佔鎖（threading 原語，在 executor 執行緒內使用）。
+
+    共享者（store／record）可並行；獨佔者（dream）等所有共享者離開才進入，
+    且等待中的獨佔者會擋住新的共享者（寫者優先，避免 dream 被連續 store 餓死）。
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._readers = 0
+        self._writer = False
+        self._waiting_writers = 0
+
+    @contextmanager
+    def shared(self) -> Iterator[None]:
+        with self._cond:
+            while self._writer or self._waiting_writers:
+                self._cond.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._readers -= 1
+                self._cond.notify_all()
+
+    @contextmanager
+    def exclusive(self) -> Iterator[None]:
+        with self._cond:
+            self._waiting_writers += 1
+            try:
+                while self._writer or self._readers:
+                    self._cond.wait()
+            finally:
+                self._waiting_writers -= 1
+            self._writer = True
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._writer = False
+                self._cond.notify_all()
+
+
 class EchoMemoryAdapter:
     """把 MemoryEngine 包成管線期望的形狀。
 
@@ -184,6 +231,12 @@ class EchoMemoryAdapter:
         WinError 5（replace 時檔案被另一條執行緒開著，2026-08-24 實錄）。
         代價：dream 蒸餾期間 retrieve 會排隊——但併發進去換到的不只是
         WinError 5，還有整份 JSON 互相覆寫的資料損毀，序列化是底線。"""
+        self._shared_lock = _SharedExclusiveLock()
+        """細粒度模式的寫者互斥：store／record 取共享，dream 取獨佔。"""
+        self._fine_pool: ThreadPoolExecutor | None = None
+        """細粒度模式專用的多工作緒池（自建 executor 時才有；惰性建立）。"""
+        self._fine_grained: bool | None = None
+        """引擎是否自帶並行安全。engine 尚未建構時為 None（視同舊引擎）。"""
         self._llm_fn = llm_fn
         self._assess_llm_fn = assess_llm_fn
         """評估用 LLM。五維打分不需要 reasoning，server 會給一個壓低 effort 的版本；
@@ -235,21 +288,76 @@ class EchoMemoryAdapter:
             self.load_seconds = time.perf_counter() - t0
         return self._engine
 
-    def _locked(self, fn: Callable[[], Any]) -> Callable[[], Any]:
-        """有 ``engine_lock`` 就包一層持鎖；沒有就原樣回傳。"""
+    def _is_fine_grained(self) -> bool:
+        """引擎是否自帶並行安全（記憶層 M-1b）。
+
+        偵測依據：公開 ``warmup`` 方法。M-1b 以同一批引入 ``ensure_initialized``
+        （全部延遲屬性在啟動時單執行緒建好）、``storage_lock`` 與 ``warmup``，
+        retrieve／store_episode／record_observation 的並行安全建立在它們之上；
+        舊引擎（develop bf76157）沒有 ``warmup``，也不是執行緒安全的。
+        engine 尚未建構時（惰性建立）視同舊引擎走全包鎖，建好後才切換。
+        """
+        if self._fine_grained is None:
+            if self._engine is None:
+                return False
+            self._fine_grained = callable(getattr(self._engine, "warmup", None))
+            if self._fine_grained:
+                logger.info("記憶引擎自帶並行安全：採細粒度鎖")
+        return self._fine_grained
+
+    def _locked(self, fn: Callable[[], Any], kind: str = "read", *, fine: bool = False
+                ) -> Callable[[], Any]:
+        """依模式包鎖。
+
+        舊引擎（``fine=False``）：有 ``engine_lock`` 就全包持鎖，沒有就原樣（靠單工作緒）。
+        新引擎（``fine=True``），按 ``kind``：
+        - ``read``：不持任何鎖（retrieve／profile／activity_profile 等）。
+        - ``write``：取共享鎖（store／record_observation 可並行，但 dream 期間要等）。
+        - ``dream``：先取 ``engine_lock``（與宿主端 reflection 互斥），再取獨佔鎖
+          （擋所有 store；retrieve 不擋）。固定先 engine_lock 後獨佔鎖，不會死結。
+        """
         lock = self._engine_lock
-        if lock is None:
+        if not fine:
+            if lock is None:
+                return fn
+
+            def run_all() -> Any:
+                with lock:
+                    return fn()
+
+            return run_all
+
+        if kind == "read":
             return fn
+        if kind == "write":
+            def run_write() -> Any:
+                with self._shared_lock.shared():
+                    return fn()
 
-        def run() -> Any:
-            with lock:
-                return fn()
+            return run_write
 
-        return run
+        def run_dream() -> Any:
+            with (lock if lock is not None else nullcontext()):
+                with self._shared_lock.exclusive():
+                    return fn()
 
-    async def _run(self, fn: Callable[[], Any]) -> Any:
-        """把 engine 工作丟進專用 executor（持鎖）。"""
-        return await asyncio.get_running_loop().run_in_executor(self._executor, self._locked(fn))
+        return run_dream
+
+    async def _run(self, fn: Callable[[], Any], kind: str = "read") -> Any:
+        """把 engine 工作丟進 executor。舊引擎：單工作緒 + 全包鎖；新引擎：多工作緒 + 細粒度鎖。"""
+        fine = self._is_fine_grained()
+        executor = self._executor
+        if fine and self._owns_executor:
+            if self._fine_pool is None:
+                self._fine_pool = ThreadPoolExecutor(
+                    max_workers=FINE_POOL_WORKERS, thread_name_prefix="echo-memory-fine"
+                )
+            executor = self._fine_pool
+        elif fine and getattr(self._executor, "_max_workers", 2) == 1:
+            logger.warning("注入的 executor 只有單工作緒，細粒度鎖無法並行；請改給多工作緒")
+        return await asyncio.get_running_loop().run_in_executor(
+            executor, self._locked(fn, kind, fine=fine)
+        )
 
     async def prepare(self) -> None:
         """提早建立 engine——設定錯誤在暖機階段就爆，而不是第一次 retrieve。
@@ -296,9 +404,12 @@ class EchoMemoryAdapter:
         """
         if not self._owns_executor:
             return
-        await asyncio.get_running_loop().run_in_executor(
-            None, lambda: self._executor.shutdown(wait=True)
-        )
+        def _shutdown() -> None:
+            self._executor.shutdown(wait=True)
+            if self._fine_pool is not None:
+                self._fine_pool.shutdown(wait=True)
+
+        await asyncio.get_running_loop().run_in_executor(None, _shutdown)
 
     def set_session(self, session_id: str | None) -> None:
         """換會話。之後的 retrieve 會排除這個會話的 episodes（防自我回聲），
@@ -360,7 +471,10 @@ class EchoMemoryAdapter:
                 outcome = {**outcome, "result": text[: self.tool_max_chars] + "…"}
             return outcome
 
-        return await self._run(_work)
+        # trigger_dream 即 dream（獨佔）；deep_recall 是讀；其餘（force_remember 等）是寫
+        kind = "dream" if name == "trigger_dream" else (
+            "read" if name == "deep_recall" else "write")
+        return await self._run(_work, kind)
 
     # --- 管線介面 ---
 
@@ -580,7 +694,7 @@ class EchoMemoryAdapter:
                     **extra,
                 )
 
-            episode_id = await self._run(_write)
+            episode_id = await self._run(_write, "write")
             return {"episode_id": episode_id, **scores, "assessment": assessment}
         except Exception as exc:  # noqa: BLE001 - 旁路，失敗不該炸管線
             logger.warning("memory store 失敗（不影響對話）：%s: %s",
@@ -638,9 +752,7 @@ class EchoMemoryAdapter:
         if get_profile is None:
             logger.warning("echo_memory 沒有 get_profile——分支太舊，profile 停用")
             return ""
-        return await asyncio.get_running_loop().run_in_executor(
-            self._executor, self._locked(lambda: get_profile(max_chars=max_chars) or "")
-        )
+        return await self._run(lambda: get_profile(max_chars=max_chars) or "")
 
     async def activity_profile(self, top_n: int = 3) -> list[dict[str, Any]]:
         """遊玩紀錄摘要（依累計時長排序）：[{name, play_count, total_minutes, last_played}]。
@@ -663,9 +775,7 @@ class EchoMemoryAdapter:
         蒸餾走 ``llm_fn``（gpt-5.6-luna，同一顆 backend 的同步 query）；
         沒有 llm_fn 時 Dream Engine 會優雅跳過蒸餾步驟。
         """
-        return await asyncio.get_running_loop().run_in_executor(
-            self._executor, self._locked(lambda: self.engine.dream(triggered_by))
-        )
+        return await self._run(lambda: self.engine.dream(triggered_by), "dream")
 
     DISTILL_MIN_SALIENCE = 0.5
     """與 echo_memory KnowledgeDistillation.MIN_SALIENCE_THRESHOLD 對齊——
