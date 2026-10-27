@@ -55,20 +55,17 @@ def test_seed_有_resolver_時依_scope_分槽():
     assert "乙的記憶" in stage._build_messages("hi", "u2", "t3")[-1]["content"]
 
 
-async def test_prewarm_記下_usage_且依_api_降推理強度():
+async def test_prewarm_記下_usage_且不自帶_reasoning_參數():
     usage = {"input_tokens": 5000, "cached_tokens": 4096, "output_tokens": 2}
-    b = _Backend(api="responses", usage=usage)
-    stage = LLMThinkStage(b, system_prompt="人設", prompt_cache_key="")
-    assert stage.last_prewarm_usage is None
-    assert await stage.prewarm() is True
-    assert stage.last_prewarm_usage == usage
-    assert b.requests[0]["reasoning"] == {"effort": "none"}
-    assert "reasoning_effort" not in b.requests[0]
-
-    c = _Backend(api="chat", usage=usage)
-    await LLMThinkStage(c, system_prompt="人設", prompt_cache_key="").prewarm()
-    assert c.requests[0]["reasoning_effort"] == "none"
-    assert "reasoning" not in c.requests[0]
+    for api in ("responses", "chat"):
+        b = _Backend(api=api, usage=usage)
+        stage = LLMThinkStage(b, system_prompt="人設", prompt_cache_key="")
+        assert stage.last_prewarm_usage is None
+        assert await stage.prewarm() is True
+        assert stage.last_prewarm_usage == usage
+        # effort 屬 prompt cache key：預熱不得覆寫，交給 backend 與正常輪同一套邏輯
+        assert "reasoning" not in b.requests[0]
+        assert "reasoning_effort" not in b.requests[0]
 
 
 async def test_prewarm_沒回_usage_時為_None():
