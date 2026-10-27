@@ -66,6 +66,29 @@ llm = SubconsciousAssessor 打一次 LLM（背景，不在熱路徑）；
 heuristic = echo_memory 的文字啟發式，零 token；off = 全部 0.5（Phase 4a 行為）。"""
 
 
+def _coerce_evidence(item: Any) -> Any:
+    """dict → ``EvidenceInput``；已是 ``EvidenceInput`` 原樣回傳。"""
+    from echo_memory.schemas.evidence import EvidenceInput, SourceRef, TextSpan
+
+    if isinstance(item, EvidenceInput):
+        return item
+    if not isinstance(item, dict):
+        raise TypeError(f"evidence 項目必須是 EvidenceInput 或 dict，收到 {type(item).__name__}")
+    data = dict(item)
+    ref = data.get("source_ref")
+    if isinstance(ref, dict):
+        ref = dict(ref)
+        ref["ref_ids"] = tuple(ref.get("ref_ids") or ())
+        data["source_ref"] = SourceRef(**ref)
+    span = data.get("text_span")
+    if isinstance(span, dict):
+        data["text_span"] = TextSpan(**span)
+    for key in ("origin_evidence_ids", "derived_from"):
+        if key in data:
+            data[key] = tuple(data[key] or ())
+    return EvidenceInput(**data)
+
+
 def build_engine(
     *,
     data_path: str | Path | None = None,
@@ -186,6 +209,11 @@ class EchoMemoryAdapter:
         )
         self._session_id: str | None = None
         self.load_seconds: float | None = None
+        self.last_retrieve_degraded = False
+        """最近一次 retrieve 是否被引擎標為降級（``MemoryContext.degraded``）。
+        retrieve 對外只回文字，降級旗標存這裡給宿主 log 讀。"""
+        self.last_degraded_reason = ""
+        self._evidence_supported: bool | None = None
         self._tool_executor: Any = None
         self.tool_max_chars = int(
             config.get("ECHO_STREAM_MEMORY_TOOL_MAX_CHARS", str(DEFAULT_TOOL_MAX_CHARS))
@@ -335,6 +363,16 @@ class EchoMemoryAdapter:
                 logger.info("memory retrieve：圖擴散漏過門檻，丟棄 %d 筆",
                             len(context.episodes) - len(kept))
                 context.episodes = kept
+            # 降級旗標：引擎在 embedding / 後端不可用時回 degraded=True（空結果也要知道原因）。
+            # 用 ``is True`` 判斷，避免替身物件的任意屬性被當成真值
+            degraded = getattr(context, "degraded", False) is True
+            reason = getattr(context, "degraded_reason", "")
+            self.last_retrieve_degraded = degraded
+            self.last_degraded_reason = reason if degraded and isinstance(reason, str) else ""
+            if degraded:
+                logger.warning(
+                    "memory retrieve 降級：%s", self.last_degraded_reason or "未註明原因"
+                )
             self._remember_context(text, context)
             if context.is_empty():
                 return None
@@ -494,6 +532,9 @@ class EchoMemoryAdapter:
             extra = dict(metadata)
             if assessment is not None:
                 extra["assessment"] = assessment
+            evidence = self._prepare_evidence(extra.pop("evidence", None))
+            if evidence:
+                extra["evidence"] = evidence
 
             def _write() -> str:
                 return self.engine.store_episode(
@@ -508,6 +549,36 @@ class EchoMemoryAdapter:
             return {"episode_id": episode_id, **scores, "assessment": assessment}
         except Exception as exc:  # noqa: BLE001 - 旁路，失敗不該炸管線
             logger.warning("memory store 失敗（不影響對話）：%s: %s",
+                           type(exc).__name__, exc)
+            return None
+
+    def _supports_evidence(self) -> bool:
+        """引擎的 ``store_episode`` 是否有 ``evidence`` 參數（舊版沒有，不能傳）。"""
+        if self._evidence_supported is None:
+            try:
+                params = inspect.signature(self.engine.store_episode).parameters
+                self._evidence_supported = "evidence" in params
+            except (TypeError, ValueError):
+                self._evidence_supported = False
+        return self._evidence_supported
+
+    def _prepare_evidence(self, evidence: Any) -> list[Any] | None:
+        """把呼叫端的 evidence 轉成引擎吃的 ``EvidenceInput`` 清單。
+
+        接受 ``EvidenceInput`` 或同欄位的 dict（``source_ref`` / ``text_span`` 也可為 dict），
+        讓宿主不必 import echo_memory。引擎不支援 evidence（舊版）或宣告格式無法解析時
+        退回不帶 evidence——寧可以 legacy_unknown 存一筆，也不要丟掉一輪對話。
+        內容與 user_input / agent_response 不一致由引擎丟 ValueError，不在這裡吞掉。
+        """
+        if not evidence:
+            return None
+        if not self._supports_evidence():
+            logger.debug("引擎不支援 evidence 參數，略過來源宣告")
+            return None
+        try:
+            return [_coerce_evidence(item) for item in evidence]
+        except (TypeError, ValueError, KeyError, ImportError) as exc:
+            logger.warning("evidence 宣告無法解析，退回不帶來源：%s: %s",
                            type(exc).__name__, exc)
             return None
 
