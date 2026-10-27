@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -139,9 +140,19 @@ class EchoMemoryAdapter:
         max_chars: int | None = None,
         llm_fn: Callable[[str], str] | None = None,
         assess_llm_fn: Callable[[str], str] | None = None,
+        executor: ThreadPoolExecutor | None = None,
+        engine_lock: threading.Lock | None = None,
     ) -> None:
         self._engine = engine
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="echo-memory")
+        self._owns_executor = executor is None
+        """外部注入的 executor 由注入方管理生命週期，``aclose`` 不關它。"""
+        self._engine_lock = engine_lock
+        """可選的 engine 互斥鎖（``threading.Lock``）。同一個 engine 若另有執行緒
+        會碰（例如 bot 文字頻道路徑），雙方持同一把鎖才不會撞出 WinError 5。
+        不給 = 只靠單工作緒 executor 序列化（原行為）。"""
+        self._executor = executor or ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="echo-memory"
+        )
         """engine 專用的單工作緒 executor——**所有** engine 呼叫都走這裡序列化。
 
         echo_memory 不是 thread-safe 的：EntityStore._save 是「固定 tmp 檔名 +
@@ -195,20 +206,39 @@ class EchoMemoryAdapter:
             self.load_seconds = time.perf_counter() - t0
         return self._engine
 
+    def _locked(self, fn: Callable[[], Any]) -> Callable[[], Any]:
+        """有 ``engine_lock`` 就包一層持鎖；沒有就原樣回傳。"""
+        lock = self._engine_lock
+        if lock is None:
+            return fn
+
+        def run() -> Any:
+            with lock:
+                return fn()
+
+        return run
+
+    async def _run(self, fn: Callable[[], Any]) -> Any:
+        """把 engine 工作丟進專用 executor（持鎖）。"""
+        return await asyncio.get_running_loop().run_in_executor(self._executor, self._locked(fn))
+
     async def prepare(self) -> None:
         """提早建立 engine——設定錯誤在暖機階段就爆，而不是第一次 retrieve。
 
         embedding 模型（sentence-transformers）的首載也發生在這裡之後的
         第一次呼叫；真正的冷啟成本用 memory-check 量。
         """
-        await asyncio.get_running_loop().run_in_executor(self._executor, lambda: self.engine)
+        await self._run(lambda: self.engine)
 
     async def aclose(self) -> None:
         """關閉 engine 專用 executor。
 
         不取消排隊中的工作——store / dream 是寫入，丟掉就是記憶遺失；
         等它們跑完再收，且不擋 event loop。重複呼叫是安全的。
+        外部注入的 executor 不在這裡關（可能還有別的 adapter 在用）。
         """
+        if not self._owns_executor:
+            return
         await asyncio.get_running_loop().run_in_executor(
             None, lambda: self._executor.shutdown(wait=True)
         )
@@ -273,7 +303,7 @@ class EchoMemoryAdapter:
                 outcome = {**outcome, "result": text[: self.tool_max_chars] + "…"}
             return outcome
 
-        return await asyncio.get_running_loop().run_in_executor(self._executor, _work)
+        return await self._run(_work)
 
     # --- 管線介面 ---
 
@@ -313,7 +343,7 @@ class EchoMemoryAdapter:
                 rendered = rendered[: self.max_chars] + "…"
             return rendered
 
-        return await asyncio.get_running_loop().run_in_executor(self._executor, _work)
+        return await self._run(_work)
 
     _CONTEXT_KEEP = 8
 
@@ -457,7 +487,7 @@ class EchoMemoryAdapter:
             return {"episode_id": episode_id, **scores, "assessment": assessment}
 
         try:
-            return await asyncio.get_running_loop().run_in_executor(self._executor, _work)
+            return await self._run(_work)
         except Exception as exc:  # noqa: BLE001 - 旁路，失敗不該炸管線
             logger.warning("memory store 失敗（不影響對話）：%s: %s",
                            type(exc).__name__, exc)
@@ -475,7 +505,7 @@ class EchoMemoryAdapter:
             logger.warning("echo_memory 沒有 get_profile——分支太舊，profile 停用")
             return ""
         return await asyncio.get_running_loop().run_in_executor(
-            self._executor, lambda: get_profile(max_chars=max_chars) or ""
+            self._executor, self._locked(lambda: get_profile(max_chars=max_chars) or "")
         )
 
     async def dream(self, triggered_by: str = "manual") -> dict[str, Any]:
@@ -485,7 +515,7 @@ class EchoMemoryAdapter:
         沒有 llm_fn 時 Dream Engine 會優雅跳過蒸餾步驟。
         """
         return await asyncio.get_running_loop().run_in_executor(
-            self._executor, lambda: self.engine.dream(triggered_by)
+            self._executor, self._locked(lambda: self.engine.dream(triggered_by))
         )
 
     DISTILL_MIN_SALIENCE = 0.5
@@ -517,7 +547,7 @@ class EchoMemoryAdapter:
                 offset += len(page)
             return pending
 
-        return await asyncio.get_running_loop().run_in_executor(self._executor, _work)
+        return await self._run(_work)
 
     def set_llm_fn(
         self,
