@@ -38,6 +38,7 @@ import threading
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -780,6 +781,57 @@ class EchoMemoryAdapter:
             logger.warning("activity_profile 失敗，退回空清單：%s: %s",
                            type(exc).__name__, exc)
             return []
+
+    async def record_observation(
+        self,
+        *,
+        kind: str,
+        subject: str,
+        started_at: datetime,
+        ended_at: datetime,
+        attrs: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+        source_ref: Any = None,
+    ) -> str | None:
+        """記錄平台被動觀察（如遊戲時段），透傳引擎 ``record_observation``。
+
+        走寫入路徑（細粒度模式取共享鎖、舊模式全包 engine_lock）。回傳 evidence id；
+        引擎沒有此方法（舊版）或寫入失敗一律回 None——觀察是附帶資料，不讓呼叫端因此中斷。
+        ``attrs`` / ``idempotency_key`` / ``source_ref`` 為 None 時不傳給引擎，沿用其預設。
+        """
+        fn = getattr(self.engine, "record_observation", None)
+        if fn is None:
+            return None
+        kwargs: dict[str, Any] = {
+            "kind": kind, "subject": subject,
+            "started_at": started_at, "ended_at": ended_at,
+        }
+        if attrs is not None:
+            kwargs["attrs"] = attrs
+        if idempotency_key is not None:
+            kwargs["idempotency_key"] = idempotency_key
+        if source_ref is not None:
+            kwargs["source_ref"] = source_ref
+        try:
+            return await self._run(lambda: fn(**kwargs), "write")
+        except Exception as exc:  # noqa: BLE001 - 觀察寫入失敗只降級
+            logger.warning("record_observation 失敗，略過：%s: %s", type(exc).__name__, exc)
+            return None
+
+    async def forget_activity(self, kind: str = "game_activity") -> bool:
+        """退出用：清除活動彙整並遮蔽對應 observation 證據，透傳引擎 ``forget_activity``。
+
+        會改動證據與彙整，所以走寫入路徑。成功回 True；引擎沒有此方法或失敗回 False。
+        """
+        fn = getattr(self.engine, "forget_activity", None)
+        if fn is None:
+            return False
+        try:
+            await self._run(lambda: fn(kind), "write")
+            return True
+        except Exception as exc:  # noqa: BLE001 - 失敗只回報，不拋
+            logger.warning("forget_activity 失敗：%s: %s", type(exc).__name__, exc)
+            return False
 
     async def dream(self, triggered_by: str = "manual") -> dict[str, Any]:
         """離線鞏固（蒸餾/重播/修剪）。背景執行，不擋對話。
