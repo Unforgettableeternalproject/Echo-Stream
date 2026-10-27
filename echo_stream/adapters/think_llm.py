@@ -280,12 +280,21 @@ class LLMThinkStage:
         tool_lead_in_extra: str = "",
         memory_resolver: Callable[[str | None], Any] | None = None,
         output_guard: OutputGuard | None = None,
+        prompt_cache_key: str | None = None,
     ) -> None:
         if tool_lead_in not in TOOL_LEAD_IN_MODES:
             raise ValueError(
                 f"tool_lead_in={tool_lead_in!r} 不認得，可用：{', '.join(TOOL_LEAD_IN_MODES)}"
             )
         self._backend = backend
+        self.prompt_cache_key: str | None = (
+            prompt_cache_key
+            if prompt_cache_key is not None
+            else (config.get("ECHO_STREAM_LLM_PROMPT_CACHE_KEY") or "").strip()
+        ) or None
+        """OpenAI ``prompt_cache_key``：同值的請求會被路由到同一快取分片，提高前綴命中率。
+        ``None`` / 空 = 不帶。沒傳參數時讀 ``ECHO_STREAM_LLM_PROMPT_CACHE_KEY``。
+        正常輪與預熱都帶同一個值（兩者必須一致才會命中同一份快取）。"""
         self.output_guard = output_guard if output_guard is not None else OutputGuard.from_config()
         """輸出防線：濾掉模型偶發吐出的已知中文污染 token。沒傳就讀 .env 設定。"""
         self.system_prompt = system_prompt
@@ -325,6 +334,11 @@ class LLMThinkStage:
         """這一輪 LLM 的用量——``{input_tokens, cached_tokens, output_tokens}``（工具往返會加總）。
         取自 backend 的 ``get_last_stream_usage()``；backend 沒提供就維持空 dict。
         只供觀測 prompt cache 命中（cached_tokens / input_tokens），不參與邏輯。"""
+
+        self.last_prewarm_usage: dict[str, int] | None = None
+        """最近一次預熱成功後 backend 回報的用量（input_tokens / cached_tokens ...）。
+        ``None`` = 尚未預熱，或預熱沒拿到 usage（例如 responses 回 incomplete）。
+        echo_stream logger 的 INFO 不一定有輸出，宿主靠這個屬性觀測預熱是否有效。"""
 
         self.history: list[dict[str, str]] = []
         self._pending_user_text = ""
@@ -372,6 +386,21 @@ class LLMThinkStage:
         else:
             self._pending_by_scope.pop(None, None)
 
+    def seed_pending(self, scope: str | None, text: str) -> bool:
+        """預填該 scope 的待注入記憶（入頻道時用泛用查詢預取），讓首輪也有記憶。
+
+        ``scope`` 與 ``Utterance.speaker_id`` 同義（= ``active_scope`` 的值），內部經
+        ``_slot()`` 轉成槽 key：有 ``memory_resolver`` 時槽 = scope，沒有則共用 None 槽。
+        只在槽為空時放，不覆蓋真實檢索結果；空文字不放。回傳是否放入。
+        """
+        if not text or not text.strip():
+            return False
+        slot = self._slot(scope)
+        if self._pending_by_scope.get(slot):
+            return False
+        self._pending_by_scope[slot] = text
+        return True
+
     def _slot(self, scope: str | None) -> str | None:
         """待注入記憶的槽 key。沒設 resolver 就不分 scope（維持舊行為）。"""
         return scope if self.memory_resolver is not None else None
@@ -396,9 +425,14 @@ class LLMThinkStage:
     """同一穩定前綴在這段秒數內不重送預熱。"""
     PREWARM_USER_TEXT = "。"
     """預熱用的極短 user 訊息（只有它與正常輪不同，不在穩定前綴內）。"""
-    PREWARM_MAX_TOKENS = 16
-    """預熱的輸出上限。Responses API 的 max_output_tokens 下限是 16；
+    PREWARM_MAX_TOKENS = 64
+    """預熱的輸出上限。Responses API 的 max_output_tokens 下限是 16，但 reasoning token 與
+    可見輸出共用這個額度：額度太小會以 ``response.incomplete`` 收尾，SessionControl 只在
+    ``response.completed`` 記 usage，預熱就拿不到用量。64 讓極短回覆能 completed。
     backend 會把 ``max_tokens`` 映射成各 API 對應的參數名（max_completion_tokens 等）。"""
+    PREWARM_REASONING_EFFORT = "none"
+    """預熱請求的推理強度。只影響預熱的輸出，不影響前綴快取（快取比對的是 input 前綴：
+    instructions / tools / messages，reasoning 設定不在其中）；用最低值避免推理 token 吃光額度。"""
 
     async def prewarm(self, system_prompt: str | None = None) -> bool:
         """送一個極小請求讓 provider 的 prompt cache 熱起來，回傳是否真的送出且成功。
@@ -422,6 +456,7 @@ class LLMThinkStage:
             finally:
                 self.system_prompt = base
             kwargs: dict[str, Any] = {"max_tokens": self.PREWARM_MAX_TOKENS}
+            effort_kwargs = self._prewarm_effort_kwargs()
             if self.tools and self.tool_executor is not None:
                 kwargs["tools"] = self.tools
             history = list(self.history[-self.history_limit :])
@@ -443,7 +478,8 @@ class LLMThinkStage:
             messages = to_messages([*history, {"role": "user", "content": self.PREWARM_USER_TEXT}])
             try:
                 async for _ in self.backend.stream_query(
-                    messages, system_instruction=system, **kwargs
+                    messages, system_instruction=system, **kwargs, **effort_kwargs,
+                    **self._cache_kwargs(),
                 ):
                     pass  # 丟棄輸出（含任何工具呼叫事件）
             except BaseException:
@@ -451,6 +487,9 @@ class LLMThinkStage:
                 raise
             getter = getattr(self._backend, "get_last_stream_usage", None)
             usage = (getter() if callable(getter) else None) or {}
+            self.last_prewarm_usage = dict(usage) if usage else None
+            if not usage:
+                logger.warning("prompt 快取預熱完成但 backend 沒回 usage（可能是 incomplete）")
             logger.info(
                 "prompt 快取預熱完成：input=%s cached=%s",
                 usage.get("input_tokens"), usage.get("cached_tokens"),
@@ -459,6 +498,23 @@ class LLMThinkStage:
         except Exception as exc:  # noqa: BLE001 - 預熱是最佳努力，不該炸宿主
             logger.warning("prompt 快取預熱失敗：%s", exc)
             return False
+
+    def _cache_kwargs(self) -> dict[str, Any]:
+        """``prompt_cache_key`` 設了就帶（SessionControl 兩條路徑都 ``params.update(kwargs)``）。"""
+        if not self.prompt_cache_key:
+            return {}
+        return {"prompt_cache_key": self.prompt_cache_key}
+
+    def _prewarm_effort_kwargs(self) -> dict[str, Any]:
+        """預熱降推理強度的參數：responses 是 ``reasoning={"effort":..}``，
+        chat 是 ``reasoning_effort``。API 不明（fake / 非 OpenAI backend）就不帶。"""
+        api = getattr(self.backend, "api", None)
+        effort = self.PREWARM_REASONING_EFFORT
+        if api == "responses":
+            return {"reasoning": {"effort": effort}}
+        if api == "chat":
+            return {"reasoning_effort": effort}
+        return {}
 
     async def aclose(self) -> None:
         close = getattr(self._backend, "aclose", None)
@@ -575,7 +631,7 @@ class LLMThinkStage:
             round_text: list[str] = []
 
             async for piece in self.backend.stream_query(
-                messages, system_instruction=system, **kwargs
+                messages, system_instruction=system, **kwargs, **self._cache_kwargs()
             ):
                 token.raise_if_cancelled()
                 if _is_tool_call(piece):

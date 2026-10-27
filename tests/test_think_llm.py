@@ -755,7 +755,7 @@ async def test_prewarm_前綴與正常一輪相同且不污染歷史():
     warm = backend.requests[0]
     assert warm["system_instruction"] == stage._system_instruction()
     assert warm["tools"] is stage.tools
-    assert warm["max_tokens"] <= 16
+    assert warm["max_tokens"] <= 64
     assert warm["messages"][:-1] == before, "歷史前綴一致"
     assert warm["messages"][-1]["role"] == "user" and len(warm["messages"][-1]["content"]) <= 4
 
