@@ -516,7 +516,7 @@ class LLMThinkStage:
     def _effective_effort(self, with_tools: bool) -> str | None:
         """推算 backend 實際送出的 reasoning effort（與 SessionControl openai.py 同一套規則）。
 
-        - responses 路徑（``_stream_responses`` ~433）：帶 ``reasoning.effort = backend.reasoning_effort``。
+        - responses 路徑（``_stream_responses`` ~433）：帶 ``reasoning.effort``（= backend 設定）。
         - chat 路徑（``_stream_chat`` ~373）：帶 tools 且 effort 不是 none 時降成 ``none``。
         - 非 OpenAI / 假 backend 沒有 ``reasoning_effort`` 屬性 → ``None``（沒送）。
 
