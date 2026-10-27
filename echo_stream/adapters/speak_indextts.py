@@ -47,6 +47,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import re
 import shutil
 import tempfile
@@ -65,10 +66,55 @@ logger = logging.getLogger(__name__)
 
 TEMP_PREFIX = "echo_stream_tts_"
 STALE_TEMP_AGE_S = 24 * 3600
+EMPTY_TEMP_GRACE_S = 60.0
+"""空目錄的寬限期：剛建好、標記檔還沒寫入的目錄不能當殘留清掉。"""
+PID_MARKER = ".owner_pid"
+"""暫存目錄內的擁有者標記檔，內容是建立該目錄的行程 pid。"""
+
+
+def _pid_alive(pid: int) -> bool:
+    """行程是否存活。Windows 的 ``os.kill(pid, 0)`` 會真的終止行程，所以走 ctypes。"""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            # 存取被拒代表行程存在，只是我們沒權限
+            return ctypes.get_last_error() == 5 or kernel32.GetLastError() == 5
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _owner_alive(d: Path) -> bool:
+    """目錄裡的 pid 標記指向一個存活的行程（另一個仍在跑的 TTS stage）。"""
+    try:
+        pid = int((d / PID_MARKER).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return False
+    return _pid_alive(pid)
 
 
 def sweep_stale_tempdirs(
-    root: str | Path | None = None, max_age_s: float = STALE_TEMP_AGE_S
+    root: str | Path | None = None,
+    max_age_s: float = STALE_TEMP_AGE_S,
+    empty_grace_s: float = EMPTY_TEMP_GRACE_S,
 ) -> int:
     """清掉上一次沒正常收工留下的暫存目錄，回傳清了幾個。
 
@@ -76,7 +122,9 @@ def sweep_stale_tempdirs(
     這些結束方式（已知陷阱 #1 那種殘留 server 正是這樣收的）目錄會留著。
     實測 %TEMP% 躺了 23 個空目錄（2026-08-23）。規則：空的一律刪、非空但超過
     ``max_age_s`` 也刪——非空代表某次合成到一半被殺，那個 wav 沒人會再用。
-    **不碰自己這次建的**（prepare 時自己的 _tempdir 還沒建，所以天然排除）。
+    **不碰仍在使用的**：目錄內的 ``.owner_pid`` 標記指向存活行程就跳過（keep_wav=False
+    時兩句之間目錄本來就是空的，不能只靠「空」判斷）；沒有標記的空目錄要超過
+    ``empty_grace_s`` 才算殘留，避開剛建好還沒寫標記的瞬間。
     """
     base = Path(root) if root is not None else Path(tempfile.gettempdir())
     removed = 0
@@ -89,9 +137,11 @@ def sweep_stale_tempdirs(
         if not d.is_dir():
             continue
         try:
-            empty = not any(d.iterdir())
-            old = now - d.stat().st_mtime > max_age_s
-            if empty or old:
+            if _owner_alive(d):
+                continue
+            age = now - d.stat().st_mtime
+            empty = not any(p for p in d.iterdir() if p.name != PID_MARKER)
+            if (empty and age > empty_grace_s) or age > max_age_s:
                 shutil.rmtree(d, ignore_errors=True)
                 removed += 1
         except OSError:
@@ -707,8 +757,13 @@ class IndexTTS2SpeakStage:
             base = self._output_dir
         else:
             if self._tempdir is None:
-                self._tempdir = tempfile.TemporaryDirectory(prefix="echo_stream_tts_")
+                self._tempdir = tempfile.TemporaryDirectory(prefix=TEMP_PREFIX)
             base = Path(self._tempdir.name)
+            # 目錄可能被外部清掉（舊版 sweep、使用者手動清 %TEMP%）：自我修復並重寫標記
+            if not (base / PID_MARKER).exists():
+                base.mkdir(parents=True, exist_ok=True)
+                with contextlib.suppress(OSError):
+                    (base / PID_MARKER).write_text(str(os.getpid()), encoding="utf-8")
         return base / f"{sentence.turn_id}_{sentence.index:03d}.wav"
 
 
