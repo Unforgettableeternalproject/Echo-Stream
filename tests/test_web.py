@@ -677,6 +677,20 @@ def test_config_記憶開關與參數(server):
     assert not _wait_for(lambda: service._memory.stored, timeout=1.0)
 
 
+def test_config_關閉記憶時清掉_profile_開回來重新載入(server):
+    base, service = server
+    memory = StubMemory()
+    memory.profile_text = "- 妹妹會畫畫"
+    service._memory = memory
+    service._think.profile = memory.profile_text
+
+    post(f"{base}/api/config", {"memory": {"enabled": False}})
+    assert service._think.profile == "", "關記憶後 profile 仍會注入 prompt"
+
+    post(f"{base}/api/config", {"memory": {"enabled": True}})
+    assert service._think.profile == "- 妹妹會畫畫"
+
+
 def test_dream_未啟用記憶時回錯誤(server):
     base, _ = server
     with pytest.raises(urllib.error.HTTPError) as exc:

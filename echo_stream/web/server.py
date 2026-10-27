@@ -476,6 +476,9 @@ class StreamService:
         """把使用者 profile 掛到 think stage 的 system prompt。暖機與 dream 後各一次。"""
         if self._memory is None or not hasattr(self._memory, "profile"):
             return
+        if not self._memory_enabled:
+            # 記憶關閉時不注入 profile（開回來時會重新刷新）
+            return
         try:
             text = await self._memory.profile()
         except Exception as exc:  # noqa: BLE001 - 旁路
@@ -722,6 +725,13 @@ class StreamService:
                     self._think.memory = self._memory if enabled else None
                     # 工具跟著記憶開關走——記憶關了還讓模型 deep_recall 沒道理
                     self._think.tools = self._memory.tool_definitions() if enabled else []
+                # profile 是記憶的一部分：關閉時清掉，開回來時重新載入
+                if hasattr(self._think, "profile"):
+                    if enabled:
+                        await self._refresh_profile()
+                    elif self._think.profile:
+                        self._think.profile = ""
+                        self._log({"type": "profile", "chars": 0, "text": ""})
                 changed["enabled"] = enabled
             if "top_k" in memory:
                 self._memory.top_k = max(1, int(memory["top_k"]))
