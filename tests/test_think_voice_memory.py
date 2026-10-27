@@ -255,3 +255,63 @@ async def test_墊話斷言違規只觀測不攔截():
 
 def test_固定filler不含記憶斷言():
     assert not LEAD_IN_VIOLATION_RE.search(DEFAULT_TOOL_FILLER)
+
+
+# --- scope 所有權與工具執行（審查修正）---
+
+
+async def test_scope_收尾只清自己設的_交錯不誤清():
+    gate = asyncio.Event()
+
+    class GatedBackend(FakeBackend):
+        async def stream_query(self, messages, system_instruction=None, **kw):
+            await gate.wait()
+            async for ch in super().stream_query(messages, system_instruction, **kw):
+                yield ch
+
+    stage = LLMThinkStage(GatedBackend())
+    token = CancellationToken()
+    gen_a = stage.stream(Utterance(text="甲", speaker_id="A"), token)
+    gen_b = stage.stream(Utterance(text="乙", speaker_id="B"), token)
+    task_a = asyncio.ensure_future(gen_a.__anext__())
+    await asyncio.sleep(0.01)
+    assert stage.active_scope == "A"
+    task_b = asyncio.ensure_future(gen_b.__anext__())
+    await asyncio.sleep(0.01)
+    assert stage.active_scope == "B"
+
+    # A 先收尾：B 仍在跑，scope 不能被 A 清成 None
+    task_a.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task_a
+    await gen_a.aclose()
+    assert stage.active_scope == "B"
+
+    gate.set()
+    await task_b
+    await gen_b.aclose()
+    assert stage.active_scope is None
+
+
+async def test_工具執行用本次stream的scope_不讀被改掉的值():
+    seen: list[str | None] = []
+
+    class InterleavedBackend(ToolBackend):
+        async def stream_query(self, messages, system_instruction=None, **kw):
+            # 模擬另一個 stream 在這輪進行中把 active_scope 改掉
+            stage.active_scope = "OTHER"
+            async for piece in super().stream_query(messages, system_instruction, **kw):
+                yield piece
+
+    async def executor(name: str, args: dict) -> dict:
+        seen.append(stage.active_scope)
+        return {"success": True, "result": "ok"}
+
+    stage = LLMThinkStage(
+        InterleavedBackend(),
+        tools=[{"type": "function", "function": {"name": "deep_recall"}}],
+        tool_executor=executor,
+    )
+    await _run_turn(stage, "我的貓", "A")
+    assert seen == ["A"]
+    assert stage.active_scope is None

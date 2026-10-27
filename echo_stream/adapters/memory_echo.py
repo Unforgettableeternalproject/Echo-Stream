@@ -368,12 +368,16 @@ class EchoMemoryAdapter:
             self._assessor = SubconsciousAssessor(llm_fn=fn)
         return self._assessor
 
-    def _evaluate_salience(
+    async def _evaluate_salience(
         self, user_text: str, spoken_text: str, context: Any
     ) -> dict[str, Any]:
         """Entry.py Step 3：assess → signals → 三值 → neurochem → StorageJudge 微調。
 
         推理全在 echo_memory；這裡只是把它們串起來。
+
+        **鎖範圍**：assess 與 judge 是 LLM 呼叫（數秒），丟預設執行緒池、不持
+        engine 鎖也不佔 engine 專用 executor；只有碰 ``engine.neurochem`` 的
+        評估段（純 CPU、極短）走 :meth:`_run`（executor + 鎖）。
 
         StorageJudge 是第二段：OpenSoul 公式偏重 complexity/novelty，
         「我妹妹要去筑波大學」「別再糾正我的英文」這種簡單但該記住的話
@@ -384,13 +388,22 @@ class EchoMemoryAdapter:
         from echo_memory.affect.salience import SalienceEvaluator
         from echo_memory.affect.signals import SalienceSignals
 
-        assessment = self.assessor.assess(user_text, context)
-        signals = SalienceSignals.from_subconscious(assessment)
-        evaluator = SalienceEvaluator(self.engine.neurochem)
-        baseline, da, ht = evaluator.evaluate(
-            signals, user_input=user_text, agent_response=spoken_text
+        loop = asyncio.get_running_loop()
+        assessor = self.assessor
+        assessment = await loop.run_in_executor(
+            None, lambda: assessor.assess(user_text, context)
         )
-        evaluator.update_neurochem(signals)
+        signals = SalienceSignals.from_subconscious(assessment)
+
+        def _score() -> tuple[float, float, float]:
+            evaluator = SalienceEvaluator(self.engine.neurochem)
+            scored = evaluator.evaluate(
+                signals, user_input=user_text, agent_response=spoken_text
+            )
+            evaluator.update_neurochem(signals)
+            return scored
+
+        baseline, da, ht = await self._run(_score)
         result: dict[str, Any] = {
             "salience": baseline,
             "da_weight": da,
@@ -399,32 +412,36 @@ class EchoMemoryAdapter:
         }
         if self.judge_enabled:
             try:
-                decision = self.judge.storage_decision(
-                    user_input=user_text,
-                    agent_response=spoken_text,
-                    baseline_salience=baseline,
-                    assessment=assessment,
-                    context=context if context is not None and not context.is_empty()
-                    else None,
+                judge = self.judge
+                decision = await loop.run_in_executor(
+                    None,
+                    lambda: judge.storage_decision(
+                        user_input=user_text,
+                        agent_response=spoken_text,
+                        baseline_salience=baseline,
+                        assessment=assessment,
+                        context=context if context is not None and not context.is_empty()
+                        else None,
+                    ),
                 )
             except Exception as exc:  # noqa: BLE001 - judge 是加分項，炸了用 baseline
                 logger.warning("StorageJudge 失敗，用 baseline：%s: %s",
                                type(exc).__name__, exc)
             else:
                 result["salience"] = max(0.0, min(1.0, baseline + decision.salience_delta))
-                judge: dict[str, Any] = {"source": decision.source}
+                judge_info: dict[str, Any] = {"source": decision.source}
                 if decision.salience_delta:
-                    judge["delta"] = round(decision.salience_delta, 3)
+                    judge_info["delta"] = round(decision.salience_delta, 3)
                 if decision.metadata_tags:
-                    judge["tags"] = list(decision.metadata_tags)
+                    judge_info["tags"] = list(decision.metadata_tags)
                 if decision.force_remember:
-                    judge["force_remember"] = True
+                    judge_info["force_remember"] = True
                     result["force_remember"] = True
                 if decision.entity_triggers:
                     result["entity_triggers"] = True
                 if decision.reasoning:
-                    judge["reasoning"] = decision.reasoning[:200]
-                result["judge"] = judge
+                    judge_info["reasoning"] = decision.reasoning[:200]
+                result["judge"] = judge_info
         return result
 
     @property
@@ -464,11 +481,11 @@ class EchoMemoryAdapter:
         sid = session_id or self._session_id or "unknown"
         context = self._contexts.pop(user_text, None)
 
-        def _work() -> dict[str, Any]:
+        try:
             scores: dict[str, Any] = {}
             if self.assess_mode != "off":
                 try:
-                    scores = self._evaluate_salience(user_text, spoken_text, context)
+                    scores = await self._evaluate_salience(user_text, spoken_text, context)
                 except Exception as exc:  # noqa: BLE001 - 評估是加分項
                     logger.warning("salience 評估失敗，退回 0.5：%s: %s",
                                    type(exc).__name__, exc)
@@ -477,17 +494,18 @@ class EchoMemoryAdapter:
             extra = dict(metadata)
             if assessment is not None:
                 extra["assessment"] = assessment
-            episode_id = self.engine.store_episode(
-                user_input=user_text,
-                agent_response=spoken_text,
-                session_id=sid,
-                **scores,
-                **extra,
-            )
-            return {"episode_id": episode_id, **scores, "assessment": assessment}
 
-        try:
-            return await self._run(_work)
+            def _write() -> str:
+                return self.engine.store_episode(
+                    user_input=user_text,
+                    agent_response=spoken_text,
+                    session_id=sid,
+                    **scores,
+                    **extra,
+                )
+
+            episode_id = await self._run(_write)
+            return {"episode_id": episode_id, **scores, "assessment": assessment}
         except Exception as exc:  # noqa: BLE001 - 旁路，失敗不該炸管線
             logger.warning("memory store 失敗（不影響對話）：%s: %s",
                            type(exc).__name__, exc)

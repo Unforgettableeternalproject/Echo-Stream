@@ -328,11 +328,14 @@ class LLMThinkStage:
         （Discord bot）用它做 per-user 隔離，ES Web 版不設，行為不變。"""
         self.active_scope: str | None = None
         """這一輪的 scope（= ``utterance.speaker_id``），``stream()`` 期間有值、結束清回 None。
-        宿主的 tool_executor 讀它決定「查誰的記憶」。
+        宿主的 tool_executor 讀它決定「查誰的記憶」；工具執行前會以本次 stream 的 scope 重設。
 
         ⚠️ 不用 ContextVar：async generator 的收尾可能在不同 context，reset 會拋 ValueError。
         代價是仰賴「同一個 stage 實例一次只跑一個 stream」（宿主的鎖已保證）；
         若日後放寬併行，必須改 ContextVar 或顯式傳參。"""
+        self._scope_owner: object | None = None
+        """目前 ``active_scope`` 是哪個 stream 設的。stream 收尾只在自己仍是 owner 時才清
+        （compare-and-reset），交錯的另一個 stream 設的值不會被誤清。"""
         self._pending_by_scope: dict[str | None, str] = {}
         """上一輪 retrieve 的結果，這一輪注入，依 scope 分槽。§7.4：late-context 注入
         結構上不可能（KV cache 無法換前綴），所以是「下一輪生效」。
@@ -391,7 +394,9 @@ class LLMThinkStage:
         self, utterance: Utterance, token: CancellationToken
     ) -> AsyncIterator[Sentence]:
         scope = utterance.speaker_id
+        owner = object()
         self.active_scope = scope
+        self._scope_owner = owner
         memory_task: asyncio.Future | None = None
 
         # 這一輪目前生效的標記 style。標記只出現在情緒段落的開頭，但切句器會在
@@ -417,7 +422,7 @@ class LLMThinkStage:
 
             splitter = SentenceSplitter(self.split_policy)
             async for sentence in splitter.split(
-                self._tokens(messages, utterance.turn_id, token),
+                self._tokens(messages, utterance.turn_id, token, scope, owner),
                 utterance.turn_id,
                 token,
             ):
@@ -442,7 +447,9 @@ class LLMThinkStage:
                     sentence.style = self.default_style
                 yield sentence
         finally:
-            self.active_scope = None
+            if self._scope_owner is owner:
+                self.active_scope = None
+                self._scope_owner = None
             if memory_task is not None:
                 if not memory_task.done():
                     memory_task.cancel()
@@ -450,7 +457,12 @@ class LLMThinkStage:
                     await memory_task
 
     async def _tokens(
-        self, messages: Sequence[Any], turn_id: str, token: CancellationToken
+        self,
+        messages: Sequence[Any],
+        turn_id: str,
+        token: CancellationToken,
+        scope: str | None = None,
+        owner: object | None = None,
     ) -> AsyncIterator[str]:
         """LLM token 流，含工具往返。對上游的切句器來說這就是一條連續的文字流。"""
         self.last_tool_calls = []
@@ -520,6 +532,7 @@ class LLMThinkStage:
                     await self._run_tools(
                         calls, model_text or lead_in, turn_id, token,
                         lead_in=lead_in, lead_in_source=lead_in_source,
+                        scope=scope, owner=owner,
                     )
                 )
             )
@@ -546,6 +559,8 @@ class LLMThinkStage:
         *,
         lead_in: str = "",
         lead_in_source: str = "none",
+        scope: str | None = None,
+        owner: object | None = None,
     ) -> list[dict[str, Any]]:
         """執行工具、組出要接回 messages 的兩種訊息。
 
@@ -580,6 +595,11 @@ class LLMThinkStage:
         for call in calls:
             args = _parse_args(call.arguments)
             t0 = time.perf_counter()
+            if owner is not None:
+                # executor 讀 self.active_scope；交錯時可能已被別的 stream 改掉，
+                # 執行前以本次 stream 捕捉的 scope 重設
+                self.active_scope = scope
+                self._scope_owner = owner
             try:
                 outcome = await self.tool_executor(call.name, args)
             except (CancelledError, asyncio.CancelledError):
