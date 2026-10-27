@@ -214,6 +214,7 @@ class EchoMemoryAdapter:
         retrieve 對外只回文字，降級旗標存這裡給宿主 log 讀。"""
         self.last_degraded_reason = ""
         self._evidence_supported: bool | None = None
+        self._idempotency_supported: bool | None = None
         self._tool_executor: Any = None
         self.tool_max_chars = int(
             config.get("ECHO_STREAM_MEMORY_TOOL_MAX_CHARS", str(DEFAULT_TOOL_MAX_CHARS))
@@ -502,6 +503,7 @@ class EchoMemoryAdapter:
         user_text: str,
         spoken_text: str,
         session_id: str | None = None,
+        idempotency_key: str | None = None,
         **metadata: Any,
     ) -> dict[str, Any] | None:
         """把一輪對話寫進記憶。**寫 spoken 不寫 generated**——與歷史同一條語意。
@@ -510,6 +512,9 @@ class EchoMemoryAdapter:
         旁路：任何失敗只 log、回 None，不往上拋。metadata 建議帶 origin
         （voice/text、是否被 barge-in 截斷）——agent 產物混進使用者指示
         會污染記憶（spike 實測）。
+
+        ``idempotency_key``：同 key 重送由引擎回原 episode_id、不重寫；引擎簽名沒有
+        此參數（舊版）或為 None 時不傳。
 
         salience 評估失敗不擋寫入——退回 0.5 照存，寧可有一筆平淡的記憶
         也不要丟掉一輪對話。
@@ -535,6 +540,8 @@ class EchoMemoryAdapter:
             evidence = self._prepare_evidence(extra.pop("evidence", None))
             if evidence:
                 extra["evidence"] = evidence
+            if idempotency_key is not None and self._supports_idempotency():
+                extra["idempotency_key"] = idempotency_key
 
             def _write() -> str:
                 return self.engine.store_episode(
@@ -561,6 +568,16 @@ class EchoMemoryAdapter:
             except (TypeError, ValueError):
                 self._evidence_supported = False
         return self._evidence_supported
+
+    def _supports_idempotency(self) -> bool:
+        """引擎的 ``store_episode`` 是否有 ``idempotency_key`` 參數（舊版沒有，不能傳）。"""
+        if self._idempotency_supported is None:
+            try:
+                params = inspect.signature(self.engine.store_episode).parameters
+                self._idempotency_supported = "idempotency_key" in params
+            except (TypeError, ValueError):
+                self._idempotency_supported = False
+        return self._idempotency_supported
 
     def _prepare_evidence(self, evidence: Any) -> list[Any] | None:
         """把呼叫端的 evidence 轉成引擎吃的 ``EvidenceInput`` 清單。
@@ -596,6 +613,21 @@ class EchoMemoryAdapter:
         return await asyncio.get_running_loop().run_in_executor(
             self._executor, self._locked(lambda: get_profile(max_chars=max_chars) or "")
         )
+
+    async def activity_profile(self, top_n: int = 3) -> list[dict[str, Any]]:
+        """遊玩紀錄摘要（依累計時長排序）：[{name, play_count, total_minutes, last_played}]。
+
+        引擎沒有此方法（舊版）或查詢失敗一律回 []——不讓 prompt 組裝因此失敗。
+        """
+        fn = getattr(self.engine, "activity_profile", None)
+        if fn is None:
+            return []
+        try:
+            return list(await self._run(lambda: fn(top_n=top_n)) or [])
+        except Exception as exc:  # noqa: BLE001 - 加分項，失敗只降級
+            logger.warning("activity_profile 失敗，退回空清單：%s: %s",
+                           type(exc).__name__, exc)
+            return []
 
     async def dream(self, triggered_by: str = "manual") -> dict[str, Any]:
         """離線鞏固（蒸餾/重播/修剪）。背景執行，不擋對話。

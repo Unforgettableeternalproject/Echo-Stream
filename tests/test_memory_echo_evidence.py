@@ -175,3 +175,68 @@ async def test_retrieve_舊版_context_沒有降級欄位視為正常():
     adapter = EchoMemoryAdapter(engine=_RetrieveEngine(_Ctx()))
     await adapter.retrieve("問題")
     assert adapter.last_retrieve_degraded is False
+
+
+class _IdemEngine(_StoreEngine):
+    """store_episode 明確宣告 idempotency_key 的新版引擎。"""
+
+    def store_episode(self, user_input, agent_response, session_id, *,
+                      idempotency_key=None, **kw):
+        self.stored.append({"idempotency_key": idempotency_key, **kw})
+        return "ep_test"
+
+
+class _OldEngine(_StoreEngine):
+    """舊版引擎：簽名沒有 idempotency_key（也沒有 **kwargs）。"""
+
+    def store_episode(self, user_input, agent_response, session_id):
+        self.stored.append({"user_input": user_input})
+        return "ep_old"
+
+
+async def test_idempotency_key_有參數時透傳():
+    engine = _IdemEngine()
+    adapter = EchoMemoryAdapter(engine=engine)
+    adapter.assess_mode = "off"
+    await adapter.store("問", "答", "s1", idempotency_key="k1")
+    assert engine.stored[0]["idempotency_key"] == "k1"
+
+
+async def test_idempotency_key_為_None_不傳():
+    engine = _StoreEngine()
+    adapter = EchoMemoryAdapter(engine=engine)
+    adapter.assess_mode = "off"
+    await adapter.store("問", "答", "s1")
+    assert "idempotency_key" not in engine.stored[0]
+
+
+async def test_idempotency_key_舊版引擎不傳():
+    engine = _OldEngine()
+    adapter = EchoMemoryAdapter(engine=engine)
+    adapter.assess_mode = "off"
+    out = await adapter.store("問", "答", "s1", idempotency_key="k1")
+    assert out["episode_id"] == "ep_old"
+
+
+async def test_activity_profile_正常回傳():
+    engine = _StoreEngine()
+    rows = [{"name": "Hades", "play_count": 2, "total_minutes": 90.0, "last_played": "x"}]
+    engine.activity_profile = lambda top_n=3: rows[:top_n]
+    adapter = EchoMemoryAdapter(engine=engine)
+    assert await adapter.activity_profile(top_n=1) == rows
+
+
+async def test_activity_profile_引擎無此方法回空():
+    adapter = EchoMemoryAdapter(engine=_StoreEngine())
+    assert await adapter.activity_profile() == []
+
+
+async def test_activity_profile_例外回空():
+    engine = _StoreEngine()
+
+    def boom(top_n=3):
+        raise RuntimeError("壞了")
+
+    engine.activity_profile = boom
+    adapter = EchoMemoryAdapter(engine=engine)
+    assert await adapter.activity_profile() == []
