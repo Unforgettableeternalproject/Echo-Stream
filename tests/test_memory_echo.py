@@ -361,3 +361,58 @@ async def test_aclose_等排隊中的寫入跑完才關閉executor():
     with pytest.raises(RuntimeError):
         adapter._executor.submit(lambda: None)
     await adapter.aclose()  # 重複呼叫安全
+
+
+async def test_store_salience評估期間不持鎖_另一呼叫能取得鎖(fake_affect, monkeypatch):
+    import asyncio
+    import threading
+    import time
+
+    lock = threading.Lock()
+    in_assess = threading.Event()
+    release = threading.Event()
+
+    class SlowAssessor:
+        def __init__(self, llm_fn=None, structured_llm_fn=None):
+            pass
+
+        def assess(self, user_input, memory_ctx=None, agent_response=""):
+            in_assess.set()
+            assert release.wait(5), "測試沒放行"
+            return sys.modules["echo_memory.affect.subconscious"]._Assessment()
+
+    class _Assessment:
+        def to_dict(self):
+            return {}
+
+    sub = sys.modules["echo_memory.affect.subconscious"]
+    sub._Assessment = _Assessment
+    sub.SubconsciousAssessor = SlowAssessor
+
+    engine = _StoreEngine()
+    adapter = EchoMemoryAdapter(engine=engine, llm_fn=lambda p: "{}", engine_lock=lock)
+    task = asyncio.ensure_future(adapter.store("問", "答"))
+    deadline = time.monotonic() + 5
+    while not in_assess.is_set() and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert in_assess.is_set()
+
+    # assess 還在跑：鎖必須是空的，另一個 engine 呼叫（profile）要能立刻完成
+    assert lock.acquire(blocking=False), "salience 評估期間不該持有 engine 鎖"
+    lock.release()
+    engine.get_profile = lambda max_chars=800: "profile"
+    assert await asyncio.wait_for(adapter.profile(), 2) == "profile"
+
+    release.set()
+    out = await asyncio.wait_for(task, 5)
+    assert out["episode_id"] == "ep_test"
+    assert engine.stored[0]["salience"] == 0.82
+
+
+def test_force_remember描述限定明確要求才呼叫(fake_tools, monkeypatch):
+    monkeypatch.delenv("ECHO_STREAM_MEMORY_TOOLS", raising=False)
+    defs = EchoMemoryAdapter(_Engine(_Ctx())).tool_definitions()
+    by_name = {d["function"]["name"]: d["function"] for d in defs}
+    desc = by_name["force_remember"]["description"]
+    assert "明確要求" in desc and "自動寫入" in desc
+    assert by_name["deep_recall"]["description"] == "d", "只覆寫 force_remember"

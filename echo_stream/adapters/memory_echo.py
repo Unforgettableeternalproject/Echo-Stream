@@ -16,9 +16,9 @@ think stage 只需要「一段可以塞進 prompt 的文字」。adapter 負責�
 
 ## ⚠️ 分支依賴
 
-需要 echo_memory repo 在 ``feature/agent-memory-spike`` 分支——
+需要 echo_memory repo 在 ``develop`` 分支——
 ``namespace_id`` / ``exclude_session_id`` / ``llm_fn`` 這些 API
-**master 上沒有**（2026-08-22 確認）。build_engine 會驗 API 形狀，
+已併入 develop（舊的 spike 分支不再需要；master 落後）。build_engine 會驗 API 形狀，
 缺了就給出可行動的錯誤而不是深處的 TypeError。
 
 ## 設計決策（見 docs/hidden/phase4-memory-integration-plan.md）
@@ -34,8 +34,11 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +48,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_NAMESPACE = "echo-stream"
 DEFAULT_TOP_K = 3
+FINE_POOL_WORKERS = 4
+"""細粒度模式的 executor 工作緒數（retrieve／store 並行 + dream 佔一條）。"""
 DEFAULT_MAX_CHARS = 500
 """注入 prompt 的記憶文字上限。記憶放在 user message 內（保 prompt cache），
 太長會吃掉 token 預算、也會影響切分行為——先保守，profiling 後再調。"""
@@ -56,6 +61,15 @@ DEFAULT_TOOLS = "deep_recall,force_remember"
 echo_memory 有四個：deep_recall（純讀）、force_remember（寫一筆高顯著性 episode）、
 adjust_importance（改既有 episode 的 salience）、trigger_dream（觸發鞏固）。
 後兩個讓模型自主決定風險高，預設不給——要開自己寫進 .env。"""
+
+FORCE_REMEMBER_DESCRIPTION = (
+    "只有在使用者明確要求記住時才呼叫（例如「記住」「幫我記」「別忘了」這類明確指示）。"
+    "一般對話內容系統每輪都會自動寫入記憶，不需要也不要為此呼叫。"
+    "content 寫成一句完整的第三人稱事實。"
+    "Only call when the user explicitly asks you to remember something; ordinary "
+    "conversation is already stored automatically every turn."
+)
+"""覆寫 echo_memory 原本偏寬的 force_remember 描述，避免模型把一般事實也當成要強制記憶。"""
 DEFAULT_TOOL_MAX_CHARS = 1500
 """工具結果回給 LLM 的字數上限。deep_recall 的 top_k 可到 20、門檻比自動注入鬆
 （0.2 vs 0.45），不截會把第二段續寫的 prompt 塞爆。"""
@@ -63,6 +77,29 @@ ASSESS_MODES = ("llm", "heuristic", "off")
 """salience 評估模式（ECHO_STREAM_MEMORY_ASSESS）：
 llm = SubconsciousAssessor 打一次 LLM（背景，不在熱路徑）；
 heuristic = echo_memory 的文字啟發式，零 token；off = 全部 0.5（Phase 4a 行為）。"""
+
+
+def _coerce_evidence(item: Any) -> Any:
+    """dict → ``EvidenceInput``；已是 ``EvidenceInput`` 原樣回傳。"""
+    from echo_memory.schemas.evidence import EvidenceInput, SourceRef, TextSpan
+
+    if isinstance(item, EvidenceInput):
+        return item
+    if not isinstance(item, dict):
+        raise TypeError(f"evidence 項目必須是 EvidenceInput 或 dict，收到 {type(item).__name__}")
+    data = dict(item)
+    ref = data.get("source_ref")
+    if isinstance(ref, dict):
+        ref = dict(ref)
+        ref["ref_ids"] = tuple(ref.get("ref_ids") or ())
+        data["source_ref"] = SourceRef(**ref)
+    span = data.get("text_span")
+    if isinstance(span, dict):
+        data["text_span"] = TextSpan(**span)
+    for key in ("origin_evidence_ids", "derived_from"):
+        if key in data:
+            data[key] = tuple(data[key] or ())
+    return EvidenceInput(**data)
 
 
 def build_engine(
@@ -76,6 +113,13 @@ def build_engine(
 
     embedding 走本地 bge-small-zh、CPU——不跟 GPU 上的 STT/TTS 搶資源
     （艾斯維爾 2026-08-21 定調）。
+
+    注意：這裡不指定 embedding 後端，沿用 echo_memory 的環境預設
+    （``EMBEDDING_BACKEND`` 預設 sentence-transformers + bge-small-zh，512 維）。
+    bot／Memory 線可能設成 ollama + bge-m3（1024 維），兩者不同。
+    資料目錄的 ``embedding_index.json`` manifest 記錄 model 與 dimension，
+    不符時 echo_memory 會判定索引需重建，而非靜默混用；因此不要讓兩邊
+    共用同一個資料目錄，除非 ``EMBEDDING_*`` 設定一致。
     """
     repo = memory_repo or config.get("ECHO_STREAM_MEMORY_REPO")
     config.ensure_importable(
@@ -105,9 +149,9 @@ def build_engine(
     if "namespace_id" not in params:
         raise RuntimeError(
             "echo_memory 的 MemoryEngine 沒有 namespace_id 參數——"
-            "repo 不在 feature/agent-memory-spike 分支上。\n"
+            "repo 不在 develop 分支上。\n"
             "到 TestSeperateMemorySystem 執行："
-            "git checkout feature/agent-memory-spike"
+            "git checkout develop"
         )
 
     data = Path(
@@ -122,6 +166,50 @@ def build_engine(
         namespace_id=namespace_id
         or config.get("ECHO_STREAM_MEMORY_NAMESPACE", DEFAULT_NAMESPACE),
     )
+
+
+class _SharedExclusiveLock:
+    """共享／獨佔鎖（threading 原語，在 executor 執行緒內使用）。
+
+    共享者（store／record）可並行；獨佔者（dream）等所有共享者離開才進入，
+    且等待中的獨佔者會擋住新的共享者（寫者優先，避免 dream 被連續 store 餓死）。
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._readers = 0
+        self._writer = False
+        self._waiting_writers = 0
+
+    @contextmanager
+    def shared(self) -> Iterator[None]:
+        with self._cond:
+            while self._writer or self._waiting_writers:
+                self._cond.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._readers -= 1
+                self._cond.notify_all()
+
+    @contextmanager
+    def exclusive(self) -> Iterator[None]:
+        with self._cond:
+            self._waiting_writers += 1
+            try:
+                while self._writer or self._readers:
+                    self._cond.wait()
+            finally:
+                self._waiting_writers -= 1
+            self._writer = True
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._writer = False
+                self._cond.notify_all()
 
 
 class EchoMemoryAdapter:
@@ -139,9 +227,19 @@ class EchoMemoryAdapter:
         max_chars: int | None = None,
         llm_fn: Callable[[str], str] | None = None,
         assess_llm_fn: Callable[[str], str] | None = None,
+        executor: ThreadPoolExecutor | None = None,
+        engine_lock: threading.Lock | None = None,
     ) -> None:
         self._engine = engine
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="echo-memory")
+        self._owns_executor = executor is None
+        """外部注入的 executor 由注入方管理生命週期，``aclose`` 不關它。"""
+        self._engine_lock = engine_lock
+        """可選的 engine 互斥鎖（``threading.Lock``）。同一個 engine 若另有執行緒
+        會碰（例如 bot 文字頻道路徑），雙方持同一把鎖才不會撞出 WinError 5。
+        不給 = 只靠單工作緒 executor 序列化（原行為）。"""
+        self._executor = executor or ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="echo-memory"
+        )
         """engine 專用的單工作緒 executor——**所有** engine 呼叫都走這裡序列化。
 
         echo_memory 不是 thread-safe 的：EntityStore._save 是「固定 tmp 檔名 +
@@ -150,6 +248,12 @@ class EchoMemoryAdapter:
         WinError 5（replace 時檔案被另一條執行緒開著，2026-08-24 實錄）。
         代價：dream 蒸餾期間 retrieve 會排隊——但併發進去換到的不只是
         WinError 5，還有整份 JSON 互相覆寫的資料損毀，序列化是底線。"""
+        self._shared_lock = _SharedExclusiveLock()
+        """細粒度模式的寫者互斥：store／record 取共享，dream 取獨佔。"""
+        self._fine_pool: ThreadPoolExecutor | None = None
+        """細粒度模式專用的多工作緒池（自建 executor 時才有；惰性建立）。"""
+        self._fine_grained: bool | None = None
+        """引擎是否自帶並行安全。engine 尚未建構時為 None（視同舊引擎）。"""
         self._llm_fn = llm_fn
         self._assess_llm_fn = assess_llm_fn
         """評估用 LLM。五維打分不需要 reasoning，server 會給一個壓低 effort 的版本；
@@ -175,6 +279,12 @@ class EchoMemoryAdapter:
         )
         self._session_id: str | None = None
         self.load_seconds: float | None = None
+        self.last_retrieve_degraded = False
+        """最近一次 retrieve 是否被引擎標為降級（``MemoryContext.degraded``）。
+        retrieve 對外只回文字，降級旗標存這裡給宿主 log 讀。"""
+        self.last_degraded_reason = ""
+        self._evidence_supported: bool | None = None
+        self._idempotency_supported: bool | None = None
         self._tool_executor: Any = None
         self.tool_max_chars = int(
             config.get("ECHO_STREAM_MEMORY_TOOL_MAX_CHARS", str(DEFAULT_TOOL_MAX_CHARS))
@@ -195,23 +305,129 @@ class EchoMemoryAdapter:
             self.load_seconds = time.perf_counter() - t0
         return self._engine
 
+    def _is_fine_grained(self) -> bool:
+        """引擎是否自帶並行安全（記憶層 M-1b）。
+
+        偵測依據：公開 ``ensure_initialized`` 方法。M-1b 以同一批引入
+        ``ensure_initialized``（全部延遲屬性在啟動時單執行緒建好）、``storage_lock``
+        與 ``warmup``，retrieve／store_episode／record_observation 的並行安全建立在
+        前兩者之上；``warmup`` 比 ``ensure_initialized`` 早出現，不能當並行安全的指標。
+        舊引擎沒有 ``ensure_initialized``，也不是執行緒安全的。
+        engine 尚未建構時（惰性建立）視同舊引擎走全包鎖，建好後才切換。
+        """
+        if self._fine_grained is None:
+            if self._engine is None:
+                return False
+            self._fine_grained = callable(getattr(self._engine, "ensure_initialized", None))
+            if self._fine_grained:
+                logger.info("記憶引擎自帶並行安全：採細粒度鎖")
+        return self._fine_grained
+
+    def _locked(self, fn: Callable[[], Any], kind: str = "read", *, fine: bool = False
+                ) -> Callable[[], Any]:
+        """依模式包鎖。
+
+        舊引擎（``fine=False``）：有 ``engine_lock`` 就全包持鎖，沒有就原樣（靠單工作緒）。
+        新引擎（``fine=True``），按 ``kind``：
+        - ``read``：不持任何鎖（retrieve／profile／activity_profile 等）。
+        - ``write``：取共享鎖（store／record_observation 可並行，但 dream 期間要等）。
+        - ``dream``：先取 ``engine_lock``（與宿主端 reflection 互斥），再取獨佔鎖
+          （擋所有 store；retrieve 不擋）。固定先 engine_lock 後獨佔鎖，不會死結。
+        """
+        lock = self._engine_lock
+        if not fine:
+            if lock is None:
+                return fn
+
+            def run_all() -> Any:
+                with lock:
+                    return fn()
+
+            return run_all
+
+        if kind == "read":
+            return fn
+        if kind == "write":
+            def run_write() -> Any:
+                with self._shared_lock.shared():
+                    return fn()
+
+            return run_write
+
+        def run_dream() -> Any:
+            with (lock if lock is not None else nullcontext()):
+                with self._shared_lock.exclusive():
+                    return fn()
+
+        return run_dream
+
+    async def _run(self, fn: Callable[[], Any], kind: str = "read") -> Any:
+        """把 engine 工作丟進 executor。舊引擎：單工作緒 + 全包鎖；新引擎：多工作緒 + 細粒度鎖。"""
+        fine = self._is_fine_grained()
+        executor = self._executor
+        if fine and self._owns_executor:
+            if self._fine_pool is None:
+                self._fine_pool = ThreadPoolExecutor(
+                    max_workers=FINE_POOL_WORKERS, thread_name_prefix="echo-memory-fine"
+                )
+            executor = self._fine_pool
+        elif fine and getattr(self._executor, "_max_workers", 2) == 1:
+            logger.warning("注入的 executor 只有單工作緒，細粒度鎖無法並行；請改給多工作緒")
+        return await asyncio.get_running_loop().run_in_executor(
+            executor, self._locked(fn, kind, fine=fine)
+        )
+
     async def prepare(self) -> None:
         """提早建立 engine——設定錯誤在暖機階段就爆，而不是第一次 retrieve。
 
         embedding 模型（sentence-transformers）的首載也發生在這裡之後的
         第一次呼叫；真正的冷啟成本用 memory-check 量。
         """
-        await asyncio.get_running_loop().run_in_executor(self._executor, lambda: self.engine)
+        await self._run(lambda: self.engine)
+
+    async def warmup(self) -> bool:
+        """觸發 embedding 暖機入口；回傳是否成功觸發，絕不往外拋。
+
+        - engine 有公開 ``warmup`` → 呼叫它（記憶層 feature/memory-reliability 提供）。
+        - 沒有 → 退路：存取 ``engine.episodic`` 一次，首次存取會在
+          engine 內啟動背景 embedding 暖機。
+        - 兩者都沒有 → False。
+
+        走 :meth:`_run`（executor + engine_lock）：engine 首次建構與 ``episodic``
+        載入都不是執行緒安全的，需與其他路徑序列化；暖機本身是背景執行緒、
+        呼叫立即返回，因此持鎖時間只有觸發那一下，不會擋住 retrieve / store。
+        """
+
+        def _work() -> bool:
+            engine = self.engine
+            fn = getattr(engine, "warmup", None)
+            if callable(fn):
+                fn()
+                return True
+            # hasattr 會實際取值，即觸發 episodic 的延遲載入與背景暖機
+            return hasattr(engine, "episodic")
+
+        try:
+            return bool(await self._run(_work))
+        except Exception as exc:  # noqa: BLE001 - 暖機失敗不得影響管線
+            logger.warning("記憶 embedding 暖機失敗：%s", exc)
+            return False
 
     async def aclose(self) -> None:
         """關閉 engine 專用 executor。
 
         不取消排隊中的工作——store / dream 是寫入，丟掉就是記憶遺失；
         等它們跑完再收，且不擋 event loop。重複呼叫是安全的。
+        外部注入的 executor 不在這裡關（可能還有別的 adapter 在用）。
         """
-        await asyncio.get_running_loop().run_in_executor(
-            None, lambda: self._executor.shutdown(wait=True)
-        )
+        if not self._owns_executor:
+            return
+        def _shutdown() -> None:
+            self._executor.shutdown(wait=True)
+            if self._fine_pool is not None:
+                self._fine_pool.shutdown(wait=True)
+
+        await asyncio.get_running_loop().run_in_executor(None, _shutdown)
 
     def set_session(self, session_id: str | None) -> None:
         """換會話。之後的 retrieve 會排除這個會話的 episodes（防自我回聲），
@@ -243,7 +459,10 @@ class EchoMemoryAdapter:
                     "ECHO_STREAM_MEMORY_TOOLS 裡的 %r 不是 echo_memory 的工具，略過", name
                 )
                 continue
-            out.append({"type": "function", "function": dict(decl)})
+            fn = dict(decl)
+            if name == "force_remember":
+                fn["description"] = FORCE_REMEMBER_DESCRIPTION
+            out.append({"type": "function", "function": fn})
         return out
 
     @property
@@ -273,7 +492,10 @@ class EchoMemoryAdapter:
                 outcome = {**outcome, "result": text[: self.tool_max_chars] + "…"}
             return outcome
 
-        return await asyncio.get_running_loop().run_in_executor(self._executor, _work)
+        # trigger_dream 即 dream（獨佔）；deep_recall 是讀；其餘（force_remember 等）是寫
+        kind = "dream" if name == "trigger_dream" else (
+            "read" if name == "deep_recall" else "write")
+        return await self._run(_work, kind)
 
     # --- 管線介面 ---
 
@@ -305,6 +527,16 @@ class EchoMemoryAdapter:
                 logger.info("memory retrieve：圖擴散漏過門檻，丟棄 %d 筆",
                             len(context.episodes) - len(kept))
                 context.episodes = kept
+            # 降級旗標：引擎在 embedding / 後端不可用時回 degraded=True（空結果也要知道原因）。
+            # 用 ``is True`` 判斷，避免替身物件的任意屬性被當成真值
+            degraded = getattr(context, "degraded", False) is True
+            reason = getattr(context, "degraded_reason", "")
+            self.last_retrieve_degraded = degraded
+            self.last_degraded_reason = reason if degraded and isinstance(reason, str) else ""
+            if degraded:
+                logger.warning(
+                    "memory retrieve 降級：%s", self.last_degraded_reason or "未註明原因"
+                )
             self._remember_context(text, context)
             if context.is_empty():
                 return None
@@ -313,7 +545,7 @@ class EchoMemoryAdapter:
                 rendered = rendered[: self.max_chars] + "…"
             return rendered
 
-        return await asyncio.get_running_loop().run_in_executor(self._executor, _work)
+        return await self._run(_work)
 
     _CONTEXT_KEEP = 8
 
@@ -338,12 +570,16 @@ class EchoMemoryAdapter:
             self._assessor = SubconsciousAssessor(llm_fn=fn)
         return self._assessor
 
-    def _evaluate_salience(
+    async def _evaluate_salience(
         self, user_text: str, spoken_text: str, context: Any
     ) -> dict[str, Any]:
         """Entry.py Step 3：assess → signals → 三值 → neurochem → StorageJudge 微調。
 
         推理全在 echo_memory；這裡只是把它們串起來。
+
+        **鎖範圍**：assess 與 judge 是 LLM 呼叫（數秒），丟預設執行緒池、不持
+        engine 鎖也不佔 engine 專用 executor；只有碰 ``engine.neurochem`` 的
+        評估段（純 CPU、極短）走 :meth:`_run`（executor + 鎖）。
 
         StorageJudge 是第二段：OpenSoul 公式偏重 complexity/novelty，
         「我妹妹要去筑波大學」「別再糾正我的英文」這種簡單但該記住的話
@@ -354,13 +590,22 @@ class EchoMemoryAdapter:
         from echo_memory.affect.salience import SalienceEvaluator
         from echo_memory.affect.signals import SalienceSignals
 
-        assessment = self.assessor.assess(user_text, context)
-        signals = SalienceSignals.from_subconscious(assessment)
-        evaluator = SalienceEvaluator(self.engine.neurochem)
-        baseline, da, ht = evaluator.evaluate(
-            signals, user_input=user_text, agent_response=spoken_text
+        loop = asyncio.get_running_loop()
+        assessor = self.assessor
+        assessment = await loop.run_in_executor(
+            None, lambda: assessor.assess(user_text, context)
         )
-        evaluator.update_neurochem(signals)
+        signals = SalienceSignals.from_subconscious(assessment)
+
+        def _score() -> tuple[float, float, float]:
+            evaluator = SalienceEvaluator(self.engine.neurochem)
+            scored = evaluator.evaluate(
+                signals, user_input=user_text, agent_response=spoken_text
+            )
+            evaluator.update_neurochem(signals)
+            return scored
+
+        baseline, da, ht = await self._run(_score)
         result: dict[str, Any] = {
             "salience": baseline,
             "da_weight": da,
@@ -369,32 +614,36 @@ class EchoMemoryAdapter:
         }
         if self.judge_enabled:
             try:
-                decision = self.judge.storage_decision(
-                    user_input=user_text,
-                    agent_response=spoken_text,
-                    baseline_salience=baseline,
-                    assessment=assessment,
-                    context=context if context is not None and not context.is_empty()
-                    else None,
+                judge = self.judge
+                decision = await loop.run_in_executor(
+                    None,
+                    lambda: judge.storage_decision(
+                        user_input=user_text,
+                        agent_response=spoken_text,
+                        baseline_salience=baseline,
+                        assessment=assessment,
+                        context=context if context is not None and not context.is_empty()
+                        else None,
+                    ),
                 )
             except Exception as exc:  # noqa: BLE001 - judge 是加分項，炸了用 baseline
                 logger.warning("StorageJudge 失敗，用 baseline：%s: %s",
                                type(exc).__name__, exc)
             else:
                 result["salience"] = max(0.0, min(1.0, baseline + decision.salience_delta))
-                judge: dict[str, Any] = {"source": decision.source}
+                judge_info: dict[str, Any] = {"source": decision.source}
                 if decision.salience_delta:
-                    judge["delta"] = round(decision.salience_delta, 3)
+                    judge_info["delta"] = round(decision.salience_delta, 3)
                 if decision.metadata_tags:
-                    judge["tags"] = list(decision.metadata_tags)
+                    judge_info["tags"] = list(decision.metadata_tags)
                 if decision.force_remember:
-                    judge["force_remember"] = True
+                    judge_info["force_remember"] = True
                     result["force_remember"] = True
                 if decision.entity_triggers:
                     result["entity_triggers"] = True
                 if decision.reasoning:
-                    judge["reasoning"] = decision.reasoning[:200]
-                result["judge"] = judge
+                    judge_info["reasoning"] = decision.reasoning[:200]
+                result["judge"] = judge_info
         return result
 
     @property
@@ -417,6 +666,7 @@ class EchoMemoryAdapter:
         user_text: str,
         spoken_text: str,
         session_id: str | None = None,
+        idempotency_key: str | None = None,
         **metadata: Any,
     ) -> dict[str, Any] | None:
         """把一輪對話寫進記憶。**寫 spoken 不寫 generated**——與歷史同一條語意。
@@ -426,6 +676,9 @@ class EchoMemoryAdapter:
         （voice/text、是否被 barge-in 截斷）——agent 產物混進使用者指示
         會污染記憶（spike 實測）。
 
+        ``idempotency_key``：同 key 重送由引擎回原 episode_id、不重寫；引擎簽名沒有
+        此參數（舊版）或為 None 時不傳。
+
         salience 評估失敗不擋寫入——退回 0.5 照存，寧可有一筆平淡的記憶
         也不要丟掉一輪對話。
         """
@@ -434,11 +687,11 @@ class EchoMemoryAdapter:
         sid = session_id or self._session_id or "unknown"
         context = self._contexts.pop(user_text, None)
 
-        def _work() -> dict[str, Any]:
+        try:
             scores: dict[str, Any] = {}
             if self.assess_mode != "off":
                 try:
-                    scores = self._evaluate_salience(user_text, spoken_text, context)
+                    scores = await self._evaluate_salience(user_text, spoken_text, context)
                 except Exception as exc:  # noqa: BLE001 - 評估是加分項
                     logger.warning("salience 評估失敗，退回 0.5：%s: %s",
                                    type(exc).__name__, exc)
@@ -447,19 +700,65 @@ class EchoMemoryAdapter:
             extra = dict(metadata)
             if assessment is not None:
                 extra["assessment"] = assessment
-            episode_id = self.engine.store_episode(
-                user_input=user_text,
-                agent_response=spoken_text,
-                session_id=sid,
-                **scores,
-                **extra,
-            )
-            return {"episode_id": episode_id, **scores, "assessment": assessment}
+            evidence = self._prepare_evidence(extra.pop("evidence", None))
+            if evidence:
+                extra["evidence"] = evidence
+            if idempotency_key is not None and self._supports_idempotency():
+                extra["idempotency_key"] = idempotency_key
 
-        try:
-            return await asyncio.get_running_loop().run_in_executor(self._executor, _work)
+            def _write() -> str:
+                return self.engine.store_episode(
+                    user_input=user_text,
+                    agent_response=spoken_text,
+                    session_id=sid,
+                    **scores,
+                    **extra,
+                )
+
+            episode_id = await self._run(_write, "write")
+            return {"episode_id": episode_id, **scores, "assessment": assessment}
         except Exception as exc:  # noqa: BLE001 - 旁路，失敗不該炸管線
             logger.warning("memory store 失敗（不影響對話）：%s: %s",
+                           type(exc).__name__, exc)
+            return None
+
+    def _supports_evidence(self) -> bool:
+        """引擎的 ``store_episode`` 是否有 ``evidence`` 參數（舊版沒有，不能傳）。"""
+        if self._evidence_supported is None:
+            try:
+                params = inspect.signature(self.engine.store_episode).parameters
+                self._evidence_supported = "evidence" in params
+            except (TypeError, ValueError):
+                self._evidence_supported = False
+        return self._evidence_supported
+
+    def _supports_idempotency(self) -> bool:
+        """引擎的 ``store_episode`` 是否有 ``idempotency_key`` 參數（舊版沒有，不能傳）。"""
+        if self._idempotency_supported is None:
+            try:
+                params = inspect.signature(self.engine.store_episode).parameters
+                self._idempotency_supported = "idempotency_key" in params
+            except (TypeError, ValueError):
+                self._idempotency_supported = False
+        return self._idempotency_supported
+
+    def _prepare_evidence(self, evidence: Any) -> list[Any] | None:
+        """把呼叫端的 evidence 轉成引擎吃的 ``EvidenceInput`` 清單。
+
+        接受 ``EvidenceInput`` 或同欄位的 dict（``source_ref`` / ``text_span`` 也可為 dict），
+        讓宿主不必 import echo_memory。引擎不支援 evidence（舊版）或宣告格式無法解析時
+        退回不帶 evidence——寧可以 legacy_unknown 存一筆，也不要丟掉一輪對話。
+        內容與 user_input / agent_response 不一致由引擎丟 ValueError，不在這裡吞掉。
+        """
+        if not evidence:
+            return None
+        if not self._supports_evidence():
+            logger.debug("引擎不支援 evidence 參數，略過來源宣告")
+            return None
+        try:
+            return [_coerce_evidence(item) for item in evidence]
+        except (TypeError, ValueError, KeyError, ImportError) as exc:
+            logger.warning("evidence 宣告無法解析，退回不帶來源：%s: %s",
                            type(exc).__name__, exc)
             return None
 
@@ -474,9 +773,73 @@ class EchoMemoryAdapter:
         if get_profile is None:
             logger.warning("echo_memory 沒有 get_profile——分支太舊，profile 停用")
             return ""
-        return await asyncio.get_running_loop().run_in_executor(
-            self._executor, lambda: get_profile(max_chars=max_chars) or ""
-        )
+        return await self._run(lambda: get_profile(max_chars=max_chars) or "")
+
+    async def activity_profile(self, top_n: int = 3) -> list[dict[str, Any]]:
+        """遊玩紀錄摘要（依累計時長排序）：[{name, play_count, total_minutes, last_played}]。
+
+        引擎沒有此方法（舊版）或查詢失敗一律回 []——不讓 prompt 組裝因此失敗。
+        """
+        fn = getattr(self.engine, "activity_profile", None)
+        if fn is None:
+            return []
+        try:
+            return list(await self._run(lambda: fn(top_n=top_n)) or [])
+        except Exception as exc:  # noqa: BLE001 - 加分項，失敗只降級
+            logger.warning("activity_profile 失敗，退回空清單：%s: %s",
+                           type(exc).__name__, exc)
+            return []
+
+    async def record_observation(
+        self,
+        *,
+        kind: str,
+        subject: str,
+        started_at: datetime,
+        ended_at: datetime,
+        attrs: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+        source_ref: Any = None,
+    ) -> str | None:
+        """記錄平台被動觀察（如遊戲時段），透傳引擎 ``record_observation``。
+
+        走寫入路徑（細粒度模式取共享鎖、舊模式全包 engine_lock）。回傳 evidence id；
+        引擎沒有此方法（舊版）或寫入失敗一律回 None——觀察是附帶資料，不讓呼叫端因此中斷。
+        ``attrs`` / ``idempotency_key`` / ``source_ref`` 為 None 時不傳給引擎，沿用其預設。
+        """
+        fn = getattr(self.engine, "record_observation", None)
+        if fn is None:
+            return None
+        kwargs: dict[str, Any] = {
+            "kind": kind, "subject": subject,
+            "started_at": started_at, "ended_at": ended_at,
+        }
+        if attrs is not None:
+            kwargs["attrs"] = attrs
+        if idempotency_key is not None:
+            kwargs["idempotency_key"] = idempotency_key
+        if source_ref is not None:
+            kwargs["source_ref"] = source_ref
+        try:
+            return await self._run(lambda: fn(**kwargs), "write")
+        except Exception as exc:  # noqa: BLE001 - 觀察寫入失敗只降級
+            logger.warning("record_observation 失敗，略過：%s: %s", type(exc).__name__, exc)
+            return None
+
+    async def forget_activity(self, kind: str = "game_activity") -> bool:
+        """退出用：清除活動彙整並遮蔽對應 observation 證據，透傳引擎 ``forget_activity``。
+
+        會改動證據與彙整，所以走寫入路徑。成功回 True；引擎沒有此方法或失敗回 False。
+        """
+        fn = getattr(self.engine, "forget_activity", None)
+        if fn is None:
+            return False
+        try:
+            await self._run(lambda: fn(kind), "write")
+            return True
+        except Exception as exc:  # noqa: BLE001 - 失敗只回報，不拋
+            logger.warning("forget_activity 失敗：%s: %s", type(exc).__name__, exc)
+            return False
 
     async def dream(self, triggered_by: str = "manual") -> dict[str, Any]:
         """離線鞏固（蒸餾/重播/修剪）。背景執行，不擋對話。
@@ -484,13 +847,24 @@ class EchoMemoryAdapter:
         蒸餾走 ``llm_fn``（gpt-5.6-luna，同一顆 backend 的同步 query）；
         沒有 llm_fn 時 Dream Engine 會優雅跳過蒸餾步驟。
         """
-        return await asyncio.get_running_loop().run_in_executor(
-            self._executor, lambda: self.engine.dream(triggered_by)
-        )
+        return await self._run(lambda: self.engine.dream(triggered_by), "dream")
 
     DISTILL_MIN_SALIENCE = 0.5
-    """與 echo_memory KnowledgeDistillation.MIN_SALIENCE_THRESHOLD 對齊——
-    低於這個值的 episode 蒸餾根本不會看，算進 pending 只會讓排程空跑。"""
+    """fallback：echo_memory 無法 import 時才用，值對齊 KnowledgeDistillation.
+    MIN_SALIENCE_THRESHOLD。平常由 :meth:`_distill_min_salience` 從來源讀取。"""
+
+    @classmethod
+    def _distill_min_salience(cls) -> float:
+        """蒸餾顯著性門檻——直接讀 echo_memory，避免複製的常數日後漂移。
+
+        低於這個值的 episode 蒸餾根本不會看，算進 pending 只會讓排程空跑。
+        """
+        try:
+            from echo_memory.dream.distillation import KnowledgeDistillation
+
+            return float(KnowledgeDistillation.MIN_SALIENCE_THRESHOLD)
+        except Exception:  # noqa: BLE001 - 舊版或尚未可 import：退回複製的常數
+            return cls.DISTILL_MIN_SALIENCE
 
     async def pending_dream_count(self) -> int:
         """有多少 episode 等著被蒸餾（未 dreamed 且顯著性過門檻）。
@@ -498,6 +872,8 @@ class EchoMemoryAdapter:
         DreamScheduler 用這個數字決定「跑了會不會有產出」。
         list_episodes 單頁上限 200，所以分頁掃。
         """
+
+        threshold = self._distill_min_salience()
 
         def _work() -> int:
             episodic = self.engine.episodic
@@ -512,12 +888,12 @@ class EchoMemoryAdapter:
                     1
                     for ep in page
                     if not ep.is_dreamed
-                    and ep.salience_score >= self.DISTILL_MIN_SALIENCE
+                    and ep.salience_score >= threshold
                 )
                 offset += len(page)
             return pending
 
-        return await asyncio.get_running_loop().run_in_executor(self._executor, _work)
+        return await self._run(_work)
 
     def set_llm_fn(
         self,

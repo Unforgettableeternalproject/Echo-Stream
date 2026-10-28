@@ -706,3 +706,103 @@ async def test_backend_沒有用量介面時_last_usage_為空():
     stage = LLMThinkStage(FakeBackend(), split_policy=policy)
     await collect(stage)
     assert stage.last_usage == {}
+
+
+# --- prompt 快取預熱 ---
+
+
+class _PrewarmBackend:
+    def __init__(self, fail: bool = False) -> None:
+        self.requests: list[dict[str, Any]] = []
+        self.fail = fail
+
+    async def stream_query(
+        self, messages: Sequence[Any], system_instruction: str | None = None, **kwargs
+    ) -> AsyncIterator[Any]:
+        self.requests.append(
+            {"messages": [_d(m) for m in messages], "system_instruction": system_instruction,
+             **kwargs}
+        )
+        if self.fail:
+            raise RuntimeError("boom")
+        yield "好"
+        # 只在「帶 tools 且還沒有 tool 結果」時提出一次工具呼叫；否則 stage 會無限往返
+        # （第二段與超過往返上限後仍吐 call 會讓 messages 無限累積）
+        if "tools" in kwargs and not any(_d(m)["role"] == "tool" for m in messages):
+            yield _Call("c1", "deep_recall", "{}")  # 預熱不得執行工具
+
+    def get_last_stream_usage(self) -> dict[str, int]:
+        return {"input_tokens": 5923, "cached_tokens": 0, "output_tokens": 1}
+
+
+_TOOLS = [{"type": "function", "function": {"name": "deep_recall"}}]
+
+
+def _prewarm_stage(backend, log=None):
+    return LLMThinkStage(
+        backend, system_prompt="人設", tools=_TOOLS, tool_executor=_executor(log or []),
+    )
+
+
+async def test_prewarm_前綴與正常一輪相同且不污染歷史():
+    backend = _PrewarmBackend()
+    log: list = []
+    stage = _prewarm_stage(backend, log)
+    stage.history = [{"role": "user", "content": "舊"}, {"role": "assistant", "content": "答"}]
+    before = list(stage.history)
+
+    assert await stage.prewarm() is True
+    warm = backend.requests[0]
+    assert warm["system_instruction"] == stage._system_instruction()
+    assert warm["tools"] is stage.tools
+    assert warm["max_tokens"] <= 64
+    assert warm["messages"][:-1] == before, "歷史前綴一致"
+    assert warm["messages"][-1]["role"] == "user" and len(warm["messages"][-1]["content"]) <= 4
+
+    # 正常一輪的前綴（system、tools、歷史）與預熱相同
+    await collect(stage, "你好")
+    real = backend.requests[1]
+    assert real["system_instruction"] == warm["system_instruction"]
+    assert real["tools"] == warm["tools"]
+    assert real["messages"][:-1] == warm["messages"][:-1]
+
+    assert log == [], "預熱不執行工具"
+
+
+async def test_prewarm_歷史不變且不寫入():
+    backend = _PrewarmBackend()
+    stage = _prewarm_stage(backend)
+    await stage.prewarm()
+    assert stage.history == [] and stage._pending_user_text == ""
+    assert stage.last_tool_calls == [] and stage.last_usage == {}
+
+
+async def test_prewarm_同前綴去重_前綴變了才重送():
+    backend = _PrewarmBackend()
+    stage = _prewarm_stage(backend)
+    assert await stage.prewarm() is True
+    assert await stage.prewarm() is False
+    assert len(backend.requests) == 1
+    stage.profile = "新的 profile"  # 前綴變了
+    assert await stage.prewarm() is True
+    assert len(backend.requests) == 2
+    # 過期後可重送
+    for k in stage._prewarm_sent:
+        stage._prewarm_sent[k] -= 120
+    assert await stage.prewarm() is True
+
+
+async def test_prewarm_例外回False且允許重試():
+    backend = _PrewarmBackend(fail=True)
+    stage = _prewarm_stage(backend)
+    assert await stage.prewarm() is False
+    backend.fail = False
+    assert await stage.prewarm() is True
+
+
+async def test_prewarm_system_prompt覆寫不改變stage狀態():
+    backend = _PrewarmBackend()
+    stage = _prewarm_stage(backend)
+    assert await stage.prewarm("別的人設") is True
+    assert backend.requests[0]["system_instruction"].startswith("別的人設")
+    assert stage.system_prompt == "人設"

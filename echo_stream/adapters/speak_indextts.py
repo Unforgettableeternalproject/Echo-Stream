@@ -45,6 +45,7 @@ event loop 這側從通道拉。
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import logging
 import os
@@ -60,7 +61,7 @@ from .. import config
 from ..contracts.cancellation import CancellationToken, CancelledError, CancelReason
 from ..contracts.style import EMOTION_DIMENSIONS, SpeechStyle
 from ..contracts.types import TTS_SAMPLE_RATE, AudioChunk, Sentence
-from ..core.channel import StreamChannel
+from ..core.channel import ChannelClosed, StreamChannel
 
 logger = logging.getLogger(__name__)
 
@@ -157,9 +158,16 @@ DEFAULT_SAMPLE_RATE = TTS_SAMPLE_RATE
 class _Aborted(Exception):
     """內部訊號：從 callback 拋出以中止 ``generate()``。"""
 
+    is_cancellation = True
+    """取消不算失敗：TTS 端 lite_engine 據此把這個例外降為 debug 記錄。"""
+
 
 CONFIG_STRETCH_RATIO = 1.72
-"""引擎 config 的 ``s2mel_stretch_ratio`` 預設值。
+"""引擎 config 的 ``s2mel_stretch_ratio`` 預設值（fallback）。
+
+echo_tts 沒有可 import 的常數（值在 config.yaml 的 ``synthesis.s2mel_stretch_ratio``，
+lite_engine 內另有硬編碼預設），所以執行時改向 backend 查
+``get_speed_info()["config_stretch_ratio"]``，查不到才用這個值。
 
 引擎裡的關係是 ``stretch_ratio = config_stretch_ratio - speed × 0.5``，
 stretch 越大唸得越慢。
@@ -203,7 +211,9 @@ def load_emotion_presets(
     return presets, {}
 
 
-def speed_multiplier_to_offset(multiplier: float) -> float:
+def speed_multiplier_to_offset(
+    multiplier: float, config_stretch_ratio: float | None = None
+) -> float:
     """把 :attr:`SpeechStyle.speed` 的**倍率**換成 IndexTTS 的 speed 偏移。
 
     契約層用倍率（1.0 = 正常、1.1 = 快 10%），因為那是 backend 無關的說法；
@@ -217,14 +227,50 @@ def speed_multiplier_to_offset(multiplier: float) -> float:
     """
     if multiplier <= 0:
         return 0.0
-    offset = 2.0 * CONFIG_STRETCH_RATIO * (1.0 - 1.0 / multiplier)
+    ratio = config_stretch_ratio if config_stretch_ratio else CONFIG_STRETCH_RATIO
+    offset = 2.0 * ratio * (1.0 - 1.0 / multiplier)
     return max(-1.0, min(1.0, offset))
 
 
 _TTS_STRIP_CHARS = "「」『』【】《》〈〉“”‘’\"'`*_#~<>|（）()［］[]"
 """合成前剔除的符號。引號會被 IndexTTS 唸出怪聲（實測），
 括號、markdown 記號同理——它們是視覺標記，不是語音內容。
-逗號句號等韻律標點**保留**，那些影響停頓，是語音的一部分。"""
+逗號句號等韻律標點**保留**，那些影響停頓，是語音的一部分。
+
+例外：成對的「」『』不在這裡剔除，由 :func:`_keep_paired_quotes` 處理——
+TTS 端 ``TextNormalizer._emphasis_quotes_to_pauses`` 會把成對引號轉成停頓
+（強調語氣），前提是引號還在。"""
+
+_TTS_STRIP_TABLE = {ord(c): None for c in _TTS_STRIP_CHARS if c not in "「」『』"}
+
+_QUOTE_PAIRS = {"「": "」", "『": "』"}
+_QUOTE_CHARS = frozenset("「」『』")
+_QUOTE_INNER_MAX = 30
+"""TTS 端成對引號的正規式是 ``(.{1,30}?)``——內文超過 30 字的配對對方
+不認，留著反而會變成孤兒引號，所以超長的一律剔除。"""
+
+
+def _keep_paired_quotes(text: str) -> str:
+    """保留成對、不巢狀、內文 1~30 字的「」『』，其餘引號剔除。
+
+    成對判斷用堆疊（「」配「」、『』配『』）。孤兒、錯配、巢狀外層、
+    內文為空或過長的引號都刪掉，行為與舊版（全刪）一致。
+    """
+    keep: set[int] = set()
+    stack: list[int] = []
+    for i, ch in enumerate(text):
+        if ch in _QUOTE_PAIRS:
+            stack.append(i)
+        elif ch in _QUOTE_CHARS and stack and _QUOTE_PAIRS[text[stack[-1]]] == ch:
+            start = stack.pop()
+            inner = text[start + 1 : i]
+            if (
+                inner.strip()
+                and len(inner) <= _QUOTE_INNER_MAX
+                and not any(c in _QUOTE_CHARS for c in inner)
+            ):
+                keep.update((start, i))
+    return "".join(ch for i, ch in enumerate(text) if ch not in _QUOTE_CHARS or i in keep)
 
 
 # --- 顏文字 / 裝飾符號 ---
@@ -295,7 +341,10 @@ def sanitize_for_tts(text: str) -> str:
     # 句中的列表破折號（「小說。 - 《死亡擱淺》」）換成頓點——那是列舉的
     # 停頓，不是連字號。兩側都有空白才算，"well-known" 這種不受影響。
     cleaned = re.sub(r"\s+[-–—•·・]+\s+", "，", text)
-    cleaned = cleaned.translate({ord(c): None for c in _TTS_STRIP_CHARS})
+    # 先決定成對引號的去留（此時其他符號還在，內文長度以剝除後為準較貼近 TTS，
+    # 所以先剝其他符號、引號留到最後處理）
+    cleaned = cleaned.translate(_TTS_STRIP_TABLE)
+    cleaned = _keep_paired_quotes(cleaned)
     return " ".join(cleaned.split())
 
 
@@ -682,8 +731,18 @@ class IndexTTS2SpeakStage:
             )
             chunk_index += 1
             # 滿了會阻塞這個執行緒 = 背壓傳到 GPU；
-            # 取消時會拋 CancelledError，往上中止 generate()
-            audio_ch.put_threadsafe(chunk, loop)
+            # 取消時 put_threadsafe 會拋 CancelledError／ChannelClosed，
+            # 一律轉成 _Aborted：TTS 端 lite_engine 只認 is_cancellation 屬性，
+            # 否則 barge-in 的正常中止會被記成 ERROR。
+            try:
+                audio_ch.put_threadsafe(chunk, loop)
+            except (
+                CancelledError,
+                asyncio.CancelledError,
+                concurrent.futures.CancelledError,
+                ChannelClosed,
+            ) as exc:
+                raise _Aborted from exc
 
         try:
             self._backend.generate(
@@ -736,7 +795,7 @@ class IndexTTS2SpeakStage:
         # 語速：style 指定倍率就換算成偏移，否則回到啟動時的基準值。
         # 只在值真的變了才呼叫 set_speed——不必每句都戳引擎。
         target = (
-            speed_multiplier_to_offset(style.speed)
+            speed_multiplier_to_offset(style.speed, self._engine_config_stretch_ratio())
             if style is not None and style.speed != 1.0
             else (self.speed or 0.0)
         )
@@ -745,6 +804,20 @@ class IndexTTS2SpeakStage:
             if callable(set_speed):
                 set_speed(target)
                 self._current_speed_offset = target
+
+    def _engine_config_stretch_ratio(self) -> float | None:
+        """向已載入的引擎查實際 config 的 stretch 基準；查不到回 None（用常數 fallback）。"""
+        backend = self._backend
+        if getattr(backend, "engine", None) is None:
+            return None  # 未載入時 backend 回的是寫死的 1.7，不可信
+        getter = getattr(backend, "get_speed_info", None)
+        if not callable(getter):
+            return None
+        try:
+            value = float(getter()["config_stretch_ratio"])
+        except Exception:  # noqa: BLE001 - 查不到就用 fallback，不讓語速換算失敗
+            return None
+        return value if value > 0 else None
 
     def _next_output_path(self, sentence: Sentence) -> Path:
         """`generate()` 一定要寫檔，即使我們只要 callback 的音訊。

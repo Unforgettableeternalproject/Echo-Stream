@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import time
 from collections import deque
 from collections.abc import AsyncIterator, Callable
@@ -522,7 +523,9 @@ class _EchoSttBackend:
         from echo_stt.core.config import load_config
         from echo_stt.core.multi_channel_engine import MultiChannelSTTEngine
 
-        cfg = load_config()
+        # load_config() 回傳的是 STT 模組的全域快取 dict——先深拷貝再改，
+        # 否則「強制打開 multi_channel」會污染同行程內其他使用者看到的設定。
+        cfg = copy.deepcopy(load_config())
         # transcribe_segment 需要引擎初始化，而初始化被 enabled 旗標擋著。
         # 這裡是程式化使用，不受子系統 yaml 的預設值管——強制打開。
         cfg.setdefault("multi_channel", {})["enabled"] = True
