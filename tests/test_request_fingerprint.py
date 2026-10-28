@@ -128,3 +128,17 @@ async def test_全文hash涵蓋前綴之外的尾段():
     b = stage.last_request_fingerprint
     assert a["instructions_hash"] == b["instructions_hash"]
     assert a["instructions_full_hash"] != b["instructions_full_hash"]
+
+
+async def test_turn_context_附在本輪user開頭且不進歷史():
+    b = _Backend()
+    stage = _stage(b)
+    utt = Utterance(text="嗨", metadata={"turn_context": "在場：小明、小華"})
+    msgs = stage._build_messages(
+        utt.text, None, "t1", turn_context=utt.metadata["turn_context"])
+    assert msgs[-1]["content"].startswith("在場：小明、小華\n\n嗨")
+    async for _ in stage.stream(utt, CancellationToken()):
+        pass
+    await stage.commit(utt.turn_id, "好", "好")
+    assert all("在場" not in m["content"] for m in stage.history)
+    assert stage._build_messages("再見")[-1]["content"] == "再見"

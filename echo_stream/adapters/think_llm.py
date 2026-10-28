@@ -648,7 +648,10 @@ class LLMThinkStage:
         try:
             self._pending_user_text = utterance.text
             messages = to_messages(
-                self._build_messages(utterance.text, scope, utterance.turn_id)
+                self._build_messages(
+                    utterance.text, scope, utterance.turn_id,
+                    turn_context=utterance.metadata.get("turn_context"),
+                )
             )
 
             # §7.4：Memory retrieve 與 LLM prefill 平行，首句不等它
@@ -960,7 +963,11 @@ class LLMThinkStage:
         return list(history[start:])
 
     def _build_messages(
-        self, user_text: str, scope: str | None = None, turn_id: str = ""
+        self,
+        user_text: str,
+        scope: str | None = None,
+        turn_id: str = "",
+        turn_context: str | None = None,
     ) -> list[dict[str, str]]:
         """組出這一輪的 messages。記憶附掛在**最後一則 user message 內**。
 
@@ -971,6 +978,11 @@ class LLMThinkStage:
         代價是下一輪 prefill 會在「上一則 user message」處 cache 分歧、
         重算最後一組對答（便宜）；換來的是 context 不被逐輪的記憶
         blob 塞胖、過期記憶也不會殘留在歷史裡繼續影響後續輪次。
+
+        ``turn_context``（宿主經 ``Utterance.metadata["turn_context"]`` 傳入）是每輪會變的
+        情境（在場名單、觸發情境、通話筆記等）：放在本輪 user 訊息**開頭**、同樣不進歷史。
+        宿主應把這類內容放這裡而不是 system prompt 尾端——instructions 一變，其後整段
+        歷史都失去快取。同 turn_id 重生成時由宿主帶同一份，這裡不另外快取。
         """
         messages = self._history_window()
         content = user_text
@@ -990,6 +1002,8 @@ class LLMThinkStage:
                 f"{injected}）"
             )
         self.last_injected_memory = injected
+        if turn_context and turn_context.strip():
+            content = f"{turn_context.strip()}\n\n{content}"
         messages.append({"role": "user", "content": content})
         return messages
 
