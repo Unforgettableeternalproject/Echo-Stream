@@ -47,6 +47,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
+import re
 import shutil
 import tempfile
 import time
@@ -64,10 +66,55 @@ logger = logging.getLogger(__name__)
 
 TEMP_PREFIX = "echo_stream_tts_"
 STALE_TEMP_AGE_S = 24 * 3600
+EMPTY_TEMP_GRACE_S = 60.0
+"""空目錄的寬限期：剛建好、標記檔還沒寫入的目錄不能當殘留清掉。"""
+PID_MARKER = ".owner_pid"
+"""暫存目錄內的擁有者標記檔，內容是建立該目錄的行程 pid。"""
+
+
+def _pid_alive(pid: int) -> bool:
+    """行程是否存活。Windows 的 ``os.kill(pid, 0)`` 會真的終止行程，所以走 ctypes。"""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            # 存取被拒代表行程存在，只是我們沒權限
+            return ctypes.get_last_error() == 5 or kernel32.GetLastError() == 5
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _owner_alive(d: Path) -> bool:
+    """目錄裡的 pid 標記指向一個存活的行程（另一個仍在跑的 TTS stage）。"""
+    try:
+        pid = int((d / PID_MARKER).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return False
+    return _pid_alive(pid)
 
 
 def sweep_stale_tempdirs(
-    root: str | Path | None = None, max_age_s: float = STALE_TEMP_AGE_S
+    root: str | Path | None = None,
+    max_age_s: float = STALE_TEMP_AGE_S,
+    empty_grace_s: float = EMPTY_TEMP_GRACE_S,
 ) -> int:
     """清掉上一次沒正常收工留下的暫存目錄，回傳清了幾個。
 
@@ -75,7 +122,9 @@ def sweep_stale_tempdirs(
     這些結束方式（已知陷阱 #1 那種殘留 server 正是這樣收的）目錄會留著。
     實測 %TEMP% 躺了 23 個空目錄（2026-08-23）。規則：空的一律刪、非空但超過
     ``max_age_s`` 也刪——非空代表某次合成到一半被殺，那個 wav 沒人會再用。
-    **不碰自己這次建的**（prepare 時自己的 _tempdir 還沒建，所以天然排除）。
+    **不碰仍在使用的**：目錄內的 ``.owner_pid`` 標記指向存活行程就跳過（keep_wav=False
+    時兩句之間目錄本來就是空的，不能只靠「空」判斷）；沒有標記的空目錄要超過
+    ``empty_grace_s`` 才算殘留，避開剛建好還沒寫標記的瞬間。
     """
     base = Path(root) if root is not None else Path(tempfile.gettempdir())
     removed = 0
@@ -88,9 +137,11 @@ def sweep_stale_tempdirs(
         if not d.is_dir():
             continue
         try:
-            empty = not any(d.iterdir())
-            old = now - d.stat().st_mtime > max_age_s
-            if empty or old:
+            if _owner_alive(d):
+                continue
+            age = now - d.stat().st_mtime
+            empty = not any(p for p in d.iterdir() if p.name != PID_MARKER)
+            if (empty and age > empty_grace_s) or age > max_age_s:
                 shutil.rmtree(d, ignore_errors=True)
                 removed += 1
         except OSError:
@@ -176,10 +227,71 @@ _TTS_STRIP_CHARS = "「」『』【】《》〈〉“”‘’\"'`*_#~<>|（）(
 逗號句號等韻律標點**保留**，那些影響停頓，是語音的一部分。"""
 
 
-def sanitize_for_tts(text: str) -> str:
-    """清掉不該被唸出來的符號，並收攏多餘空白。"""
-    import re
+# --- 顏文字 / 裝飾符號 ---
+# 合成前整段剔除：引擎只會濾掉部分字元，「￣▽￣ノ」處理後會殘留「￣ ￣」被唸出怪聲。
+# 規則（刻意保守，純 ASCII 與一般中英文不受影響）：
+#   1. 括號群組：內含「非中英數／非一般標點」的字元（▽◕ω・ 等）、或整串只有符號
+#      （^_^、>_<、T_T），連同前導與緊貼的尾巴（ﾉ*:・ﾟ✧、ノ、單一字母 b/o）一起刪
+#   2. 無括號：幾何／方塊／雜項符號、emoji、全形長音符 ￣、半形假名 ﾟﾉ、ヾゞヽ 等「裝飾字元」
+#      一律刪；其後緊貼的 ノ 或單一 b/o/p（￣▽￣b）一併刪
+#   3. 獨立的 ^^ / >_< / T_T / -_- 類表情（前後不得緊貼英數）
+# 不動：OK b 計畫、C++、A/B 測試、(2024年)、(笑)、30°C、一般括號說明。
+_KAO_DECOR = (
+    r"\u2022"                # 項目符號 •
+    r"\u2190-\u21ff"         # 箭頭
+    r"\u2300-\u23ff"         # 技術符號
+    r"\u2500-\u27bf"         # 方塊／幾何／雜項符號／Dingbats（┻▽◕★✧♪♥）
+    r"\u2900-\u29ff\u2b00-\u2bff"
+    r"\ufe30-\ufe4f"         # 直排括號（︵︶）
+    r"\uffe3"                # ￣
+    r"\uff61-\uff9f"         # 半形標點與假名（｡ﾟﾉ）
+    r"\u30fd\u30fe\u309d\u309e"   # ヽヾゝゞ
+    r"\u0294\u0295\u1d25"    # ʔʕᴥ
+    r"\U0001f000-\U0001faff"  # emoji
+    r"\ufe0f\u200d"          # emoji 變體／連接符
+)
+_KAO_TAIL = (  # 括號群組後緊貼的手腳（含泰文）
+    r"[\u30fb\uff9f\u30ce\uff89\u30fe\u309e\u30fd"
+    r"/\\*:~.\u0e00-\u0e7f]*"
+)
+_KAO_LETTER = r"(?:[boBOpP](?![A-Za-z0-9]))?"
+# 括號內「一般內容」字元：英數、空白、CJK 與假名（不含 ・）、全形標點、一般標點
+_KAO_NORMAL = re.compile(
+    r"[A-Za-z0-9\s\u4e00-\u9fff\u3000-\u303b\u3041-\u3096\u30a1-\u30fa\u30fc"
+    r"\uff00-\uff60\u2010-\u2027\u00b7,.!?;:'\"\-+/%&@#$*=<>_^|\\~`]"
+)
+_KAO_SYMBOL_ONLY = re.compile(r"^(?=.*[\^_;<>])[\^\-_=~*;:<>.\sA-Za-z]{2,9}$")
+_KAO_GROUP = re.compile(
+    r"[" + _KAO_DECOR + r"]*[(（\[]([^()（）\[\]\n]{1,24})[)）\]]" + _KAO_TAIL + _KAO_LETTER
+)
+_KAO_RUN = re.compile(r"[" + _KAO_DECOR + r"]+(?:ノ|[boBOpP](?![A-Za-z0-9]))?")
+_KAO_FACE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:\^[_.\-w]?\^|>[_.\-w]<|[Tt;=\-][_.][Tt;=\-])(?![A-Za-z0-9_])"
+)
 
+
+def _is_kaomoji_group(inner: str) -> bool:
+    """括號內容是否為顏文字（含裝飾字元，或整串只有符號）。"""
+    if not inner.strip():
+        return False
+    if any(not _KAO_NORMAL.match(ch) for ch in inner):
+        return True
+    if not any(ch.isalnum() for ch in inner):
+        return True   # (^_^) (>_<) (;_;)：整串沒有字母數字
+    return bool(_KAO_SYMBOL_ONLY.match(inner)) and not re.search(r"[A-Za-z]{3}", inner)
+
+
+def strip_kaomoji(text: str) -> str:
+    """剔除顏文字與裝飾符號（見上方規則）。不處理空白，由呼叫端收攏。"""
+    text = _KAO_GROUP.sub(lambda m: "" if _is_kaomoji_group(m.group(1)) else m.group(0), text)
+    text = _KAO_RUN.sub("", text)
+    return _KAO_FACE.sub("", text)
+
+
+def sanitize_for_tts(text: str) -> str:
+    """清掉不該被唸出來的符號（含顏文字），並收攏多餘空白。"""
+    # 顏文字要先於括號剝除（後者會把括號拿掉，群組特徵就沒了）
+    text = strip_kaomoji(text)
     # 句中的列表破折號（「小說。 - 《死亡擱淺》」）換成頓點——那是列舉的
     # 停頓，不是連字號。兩側都有空白才算，"well-known" 這種不受影響。
     cleaned = re.sub(r"\s+[-–—•·・]+\s+", "，", text)
@@ -264,6 +376,7 @@ class IndexTTS2SpeakStage:
         emotion_vector: list[float] | None = None,
         emotion_overrides: dict | None = None,
         speed: float | None = None,
+        lora_scale: float | None = None,
         output_dir: str | Path | None = None,
         keep_wav: bool = False,
         warmup: bool = False,
@@ -298,6 +411,9 @@ class IndexTTS2SpeakStage:
 
         預設 0.0 是**引擎原本的預設值**，與 webapp 一致——adapter 不該偷改
         既有的音色特性。要調快就設這個參數，別讓管線層自己猜。"""
+        self.lora_scale = lora_scale
+        """LoRA 合併強度。None = 不載（預設）；有值就在 ``prepare()`` 以此 scale **永久合併**
+        進 GPT 權重（accel 下也會同步進 accel 複本）。合併後不能再調，要換強度須重新載入。"""
         self.keep_wav = keep_wav
         self.warmup = warmup
         self.warmup_text = warmup_text
@@ -333,6 +449,16 @@ class IndexTTS2SpeakStage:
         load = getattr(self._backend, "load", None)
         if callable(load):
             await loop.run_in_executor(None, load)
+
+        # LoRA：用合併而非 PEFT 動態掛載——accel 路徑不經 inference_model，掛載會靜默失效
+        if self.lora_scale is not None:
+            merge = getattr(self._backend, "merge_lora", None)
+            if not callable(merge):
+                raise RuntimeError("backend 不支援 merge_lora，無法套用 LoRA")
+            stats = await loop.run_in_executor(
+                None, lambda: merge(scale=self.lora_scale)
+            )
+            logger.info("[IndexTTS2] LoRA 已合併 scale=%s 同步統計=%s", self.lora_scale, stats)
 
         # 語速要在載入後才能設（會動到引擎狀態）
         if self.speed:
@@ -529,10 +655,10 @@ class IndexTTS2SpeakStage:
         """在 executor 執行緒裡跑同步推理。**這個函式不在 event loop 上。**"""
         chunk_index = 0
         output_path = self._next_output_path(sentence)
-        self._apply_style(sentence.style)
         speak_text = sanitize_for_tts(sentence.text)
-        if not speak_text:
-            return  # 整句都是符號（例如純引號）——沒東西可唸
+        if not any(ch.isalnum() for ch in speak_text):
+            return  # 整句都是符號／標點／顏文字——沒東西可唸，不送去合成
+        self._apply_style(sentence.style)
 
         def on_segment(tensor: Any, seg_idx: int, total: int) -> None:
             nonlocal chunk_index
@@ -631,14 +757,20 @@ class IndexTTS2SpeakStage:
             base = self._output_dir
         else:
             if self._tempdir is None:
-                self._tempdir = tempfile.TemporaryDirectory(prefix="echo_stream_tts_")
+                self._tempdir = tempfile.TemporaryDirectory(prefix=TEMP_PREFIX)
             base = Path(self._tempdir.name)
+            # 目錄可能被外部清掉（舊版 sweep、使用者手動清 %TEMP%）：自我修復並重寫標記
+            if not (base / PID_MARKER).exists():
+                base.mkdir(parents=True, exist_ok=True)
+                with contextlib.suppress(OSError):
+                    (base / PID_MARKER).write_text(str(os.getpid()), encoding="utf-8")
         return base / f"{sentence.turn_id}_{sentence.index:03d}.wav"
 
 
 __all__ = [
     "IndexTTS2SpeakStage",
     "sanitize_for_tts",
+    "strip_kaomoji",
     "smooth_segment_edges",
     "tensor_to_pcm16",
     "speed_multiplier_to_offset",

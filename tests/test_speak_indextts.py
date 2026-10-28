@@ -110,6 +110,37 @@ async def test_prepare_會載入_backend():
     assert backend.loaded
 
 
+class _LoraBackend(FakeBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.merge_calls: list[float | None] = []
+
+    def merge_lora(self, checkpoint_path=None, scale=None):
+        assert self.loaded, "必須先 load 再 merge"
+        self.merge_calls.append(scale)
+        return {"accel_synced": True}
+
+
+async def test_lora_scale_為_None_不呼叫_merge():
+    backend = _LoraBackend()
+    await IndexTTS2SpeakStage(backend=backend).prepare()
+    assert backend.merge_calls == []
+
+
+async def test_lora_scale_有值時_prepare_合併一次():
+    backend = _LoraBackend()
+    stage = IndexTTS2SpeakStage(backend=backend, lora_scale=0.85)
+    await stage.prepare()
+    await stage.prepare()   # 第二次 prepare 不重複合併
+    assert backend.merge_calls == [0.85]
+
+
+async def test_backend_不支援_merge_lora_時明確失敗():
+    stage = IndexTTS2SpeakStage(backend=FakeBackend(), lora_scale=0.85)
+    with pytest.raises(RuntimeError):
+        await stage.prepare()
+
+
 # --- 背壓 ---
 
 
@@ -511,6 +542,7 @@ def test_sweep_刪空目錄與過期目錄_留新的非空目錄(tmp_path):
 
     empty = tmp_path / f"{TEMP_PREFIX}empty"
     empty.mkdir()
+    os.utime(empty, (time.time() - 3600, time.time() - 3600))
     stale = tmp_path / f"{TEMP_PREFIX}stale"
     stale.mkdir()
     (stale / "x.wav").write_bytes(b"0")
@@ -526,3 +558,42 @@ def test_sweep_刪空目錄與過期目錄_留新的非空目錄(tmp_path):
     assert not empty.exists() and not stale.exists()
     assert fresh.exists() and other.exists()
     assert sweep_stale_tempdirs(tmp_path) == 0
+
+
+def test_sweep_不刪另一個執行中_stage_的空目錄(tmp_path):
+    """回歸：keep_wav=False 時兩句之間目錄是空的，舊版 sweep 會誤刪。"""
+    import os
+    import time
+
+    from echo_stream.adapters.speak_indextts import PID_MARKER, TEMP_PREFIX, sweep_stale_tempdirs
+
+    live = tmp_path / f"{TEMP_PREFIX}live"
+    live.mkdir()
+    (live / PID_MARKER).write_text(str(os.getpid()))
+    old = time.time() - 3 * 24 * 3600
+    os.utime(live, (old, old))  # 連過期也不能刪：擁有者還活著
+    dead = tmp_path / f"{TEMP_PREFIX}dead"
+    dead.mkdir()
+    (dead / PID_MARKER).write_text("999999999")
+    os.utime(dead, (old, old))
+    fresh_empty = tmp_path / f"{TEMP_PREFIX}fresh_empty"
+    fresh_empty.mkdir()
+
+    assert sweep_stale_tempdirs(tmp_path) == 1
+    assert live.exists() and fresh_empty.exists() and not dead.exists()
+
+
+def test_next_output_path_目錄被刪後自我修復(tmp_path):
+    import shutil
+
+    from echo_stream.adapters.speak_indextts import IndexTTS2SpeakStage
+    from echo_stream.contracts.types import Sentence
+
+    stage = IndexTTS2SpeakStage.__new__(IndexTTS2SpeakStage)
+    stage._output_dir = None
+    stage._tempdir = None
+    sentence = Sentence(turn_id="t", index=0, text="好")
+    first = stage._next_output_path(sentence)
+    shutil.rmtree(first.parent)
+    second = stage._next_output_path(sentence)
+    assert second.parent.is_dir()
