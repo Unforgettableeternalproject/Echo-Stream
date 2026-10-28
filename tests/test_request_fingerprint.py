@@ -97,3 +97,51 @@ async def test_預熱與正常輪都不自帶_reasoning_參數():
     await _run_turn(stage)
     for req in b.requests:
         assert "reasoning" not in req and "reasoning_effort" not in req
+
+
+async def test_指紋含全文hash與逐則訊息hash_跨輪前綴可比對():
+    stage = _stage(_Backend())
+    stage.history = [{"role": "user", "content": "一"}, {"role": "assistant", "content": "二"}]
+    await _run_turn(stage)
+    first = stage.last_request_fingerprint
+    assert len(first["instructions_full_hash"]) == 6
+    assert first["tools_hash"] is None
+    assert len(first["input_hashes"]) == 3
+
+    stage.history = [*stage.history[:2], {"role": "user", "content": "嗨"},
+                     {"role": "assistant", "content": "好"}]
+    await _run_turn(stage)
+    second = stage.last_request_fingerprint
+    assert second["instructions_full_hash"] == first["instructions_full_hash"]
+    # 既有歷史未被改寫 → 前兩則 hash 相同，可用來判斷跨輪前綴是否一致
+    assert second["input_hashes"][:2] == first["input_hashes"][:2]
+    assert len(second["input_hashes"]) == 5
+
+
+async def test_全文hash涵蓋前綴之外的尾段():
+    stage = _stage(_Backend())
+    stage.system_prompt = "人" * 5000
+    await _run_turn(stage)
+    a = stage.last_request_fingerprint
+    stage.system_prompt = "人" * 4999 + "設"
+    await _run_turn(stage)
+    b = stage.last_request_fingerprint
+    assert a["instructions_hash"] == b["instructions_hash"]
+    assert a["instructions_full_hash"] != b["instructions_full_hash"]
+
+
+async def test_turn_context_附在本輪user開頭且不進歷史():
+    b = _Backend()
+    stage = _stage(b)
+    utt = Utterance(text="嗨", metadata={"turn_context": "在場：小明、小華"})
+    msgs = stage._build_messages(
+        utt.text, None, "t1", turn_context=utt.metadata["turn_context"])
+    assert msgs[-1]["content"].startswith("在場：小明、小華\n\n嗨")
+    async for _ in stage.stream(utt, CancellationToken()):
+        pass
+    await stage.commit(utt.turn_id, "好", "好")
+    assert all("在場" not in m["content"] for m in stage.history)
+    assert stage._build_messages("再見")[-1]["content"] == "再見"
+
+def test_supports_turn_context_旗標():
+    assert LLMThinkStage.supports_turn_context is True
