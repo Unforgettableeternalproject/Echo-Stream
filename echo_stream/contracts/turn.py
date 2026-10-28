@@ -77,6 +77,8 @@ class VoiceEvent:
     speaker_id: str | None = None
     partial_text: str = ""
     """截至此刻的部分轉錄。語意型 TurnDetector 要用；純 VAD 版忽略。"""
+    is_voiced: bool = False
+    """VAD 對此 chunk 的判定（狀態為 SPEECH）。多聲道宿主據此累積說話秒數。"""
 
 
 @dataclass(slots=True)

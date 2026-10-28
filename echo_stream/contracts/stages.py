@@ -107,6 +107,43 @@ class InputStage(Stage, Protocol):
 
 
 @runtime_checkable
+class MultiChannelInputStage(Protocol):
+    """多聲道輸入：每個說話者一條聲道，整個 session 一條輸出流。
+
+    平台無關——Discord、主機 PC、Web 都由各自的 adapter 把音訊轉成
+    16kHz mono int16 後 ``feed``。``feed`` / ``join`` / ``leave`` / ``discard``
+    **可從任何執行緒呼叫**（例如 Discord sink 執行緒）。多人轉錄窗與 turn
+    聚合不在這層，留給宿主。
+    """
+
+    name: str
+
+    async def prepare(self) -> None: ...
+
+    async def aclose(self) -> None: ...
+
+    def open(self, token: CancellationToken) -> AsyncIterator[Utterance]:
+        """開啟 session，回傳整個 session 唯一的 Utterance 流（帶 speaker_id）。"""
+        ...
+
+    def feed(self, speaker_id: str, pcm: bytes, ts: float | None = None) -> None:
+        """餵入 16kHz mono int16 PCM。``ts`` 為抵達時刻（牆鐘），省略則取現在。"""
+        ...
+
+    def join(self, speaker_id: str, **opts: object) -> None:
+        """預先建立聲道（可帶 policy 等覆寫）。不呼叫也會在首次 feed 時 lazy 建立。"""
+        ...
+
+    def leave(self, speaker_id: str, flush: bool = True) -> None:
+        """移除聲道；``flush=True`` 先把殘餘段送出。"""
+        ...
+
+    def discard(self, speaker_id: str | None = None) -> None:
+        """丟棄進行中的輸入；None 表示全部聲道。"""
+        ...
+
+
+@runtime_checkable
 class ThinkStage(Protocol):
     """turn → 逐句吐出回應。
 

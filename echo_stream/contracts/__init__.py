@@ -7,7 +7,15 @@ session control），也不含任何推理邏輯。所有能力都由 adapter �
 """
 
 from .cancellation import CancellationToken, CancelledError, CancelReason
-from .stages import AudioSink, AudioSource, InputStage, SpeakStage, Stage, ThinkStage
+from .stages import (
+    AudioSink,
+    AudioSource,
+    InputStage,
+    MultiChannelInputStage,
+    SpeakStage,
+    Stage,
+    ThinkStage,
+)
 from .style import EMOTION_DIMENSIONS, NEUTRAL, SpeechStyle
 from .turn import (
     AddressingClassifier,
@@ -40,6 +48,7 @@ __all__ = [
     "AudioSink",
     "AudioSource",
     "InputStage",
+    "MultiChannelInputStage",
     "SpeakStage",
     "Stage",
     "ThinkStage",

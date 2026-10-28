@@ -1,0 +1,536 @@
+"""多聲道 InputStage 測試——fake backend、無 GPU、無第三方套件。
+
+音訊用常數振幅（DC）訊號：RMS 穩定高於 VAD 閾值，且第一個樣本值可當作
+「這段音訊是誰的」標記，讓 backend 把它原樣吐回文字。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import struct
+import threading
+import time
+
+from echo_stream.adapters.input_multichannel import MultiChannelSttInputStage
+from echo_stream.adapters.input_stt import TranscriptionResult
+from echo_stream.contracts.cancellation import CancellationToken
+from echo_stream.contracts.stages import MultiChannelInputStage
+from echo_stream.contracts.turn import TurnPolicy
+from echo_stream.core.multichannel import TranscriberPool
+
+SR = 16_000
+CHUNK_S = 0.02
+
+
+def dc(value: int, seconds: float) -> bytes:
+    n = int(SR * seconds)
+    return struct.pack(f"<{n}h", *([value] * n))
+
+
+def quiet(seconds: float) -> bytes:
+    return b"\x00\x00" * int(SR * seconds)
+
+
+def split(pcm: bytes, chunk_s: float = CHUNK_S) -> list[bytes]:
+    step = int(SR * chunk_s) * 2
+    return [pcm[i : i + step] for i in range(0, len(pcm), step)]
+
+
+class EchoBackend:
+    """文字 = 音訊第一個樣本值；記錄呼叫順序與同時執行數。"""
+
+    def __init__(self, delay_s: float = 0.0) -> None:
+        self.delay_s = delay_s
+        self.calls: list[int] = []
+        self._lock = threading.Lock()
+        self._active = 0
+        self.peak = 0
+        self.closed = False
+
+    def transcribe(self, pcm: bytes, sample_rate: int) -> TranscriptionResult | None:
+        assert sample_rate == SR
+        with self._lock:
+            self._active += 1
+            self.peak = max(self.peak, self._active)
+        try:
+            if self.delay_s:
+                time.sleep(self.delay_s)
+            value = max(memoryview(pcm).cast("h"))  # preroll 的靜音在前面，取最大值
+            with self._lock:
+                self.calls.append(value)
+            return TranscriptionResult(text=str(value), language="zh")
+        finally:
+            with self._lock:
+                self._active -= 1
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeClock:
+    def __init__(self, start: float = 1000.0) -> None:
+        self.t = start
+
+    def __call__(self) -> float:
+        return self.t
+
+
+def make_stage(backend=None, **kwargs) -> MultiChannelSttInputStage:
+    policy = kwargs.pop("policy", TurnPolicy(silence_threshold_s=0.3, min_utterance_s=0.2))
+    return MultiChannelSttInputStage(backend=backend or EchoBackend(), policy=policy, **kwargs)
+
+
+class Session:
+    """開啟 stage 並在背景收集 Utterance。"""
+
+    def __init__(self, stage: MultiChannelSttInputStage) -> None:
+        self.stage = stage
+        self.token = CancellationToken()
+        self.results: list = []
+        self.task = asyncio.ensure_future(self._consume())
+
+    async def _consume(self) -> None:
+        async for utterance in self.stage.open(self.token):
+            self.results.append(utterance)
+
+    async def ready(self) -> Session:
+        for _ in range(200):
+            if self.stage.engine._loop is not None:
+                return self
+            await asyncio.sleep(0.005)
+        raise AssertionError("stage 沒有開啟")
+
+    async def wait_for(self, n: int, timeout: float = 5.0) -> list:
+        deadline = time.perf_counter() + timeout
+        while len(self.results) < n:
+            if time.perf_counter() > deadline:
+                raise AssertionError(f"只收到 {len(self.results)}/{n} 則")
+            await asyncio.sleep(0.01)
+        return self.results
+
+    async def close(self) -> None:
+        self.token.cancel()
+        await asyncio.wait_for(self.task, 5)
+
+
+async def open_session(stage: MultiChannelSttInputStage) -> Session:
+    return await Session(stage).ready()
+
+
+def feed_all(stage: MultiChannelSttInputStage, sid: str, pcm: bytes) -> None:
+    for chunk in split(pcm):
+        stage.feed(sid, chunk)
+
+
+def test_符合_MultiChannelInputStage_協定() -> None:
+    assert isinstance(make_stage(), MultiChannelInputStage)
+
+
+class TestTurns:
+    async def test_兩聲道交錯_turn_邊界獨立且_speaker_id_正確(self) -> None:
+        stage = make_stage()
+        session = await open_session(stage)
+        try:
+            a = split(dc(1000, 0.6) + quiet(0.6))
+            b = split(dc(2000, 0.4) + quiet(0.6))
+            for i in range(max(len(a), len(b))):
+                if i < len(a):
+                    stage.feed("A", a[i])
+                if i < len(b):
+                    stage.feed("B", b[i])
+            results = await session.wait_for(2)
+            by_speaker = {u.speaker_id: u for u in results}
+            assert set(by_speaker) == {"A", "B"}
+            assert by_speaker["A"].text == "1000"
+            assert by_speaker["B"].text == "2000"
+            assert stage.engine.stats["channels_rejected"] == 0
+        finally:
+            await session.close()
+
+    async def test_同聲道多個_turn_順序不亂(self) -> None:
+        backend = EchoBackend(delay_s=0.02)
+        stage = make_stage(backend)
+        session = await open_session(stage)
+        try:
+            for value in (1111, 1222, 1333):
+                feed_all(stage, "A", dc(value, 0.5) + quiet(0.6))
+            results = await session.wait_for(3)
+            assert [u.text for u in results] == ["1111", "1222", "1333"]
+            assert {u.speaker_id for u in results} == {"A"}
+        finally:
+            await session.close()
+
+    async def test_增量切分的多段拼成一則_Utterance(self) -> None:
+        parts: list[tuple[str, str, int]] = []
+        stage = make_stage(
+            on_partial=lambda sid, text, idx: parts.append((sid, text, idx)),
+            partial_silence_s=0.2,
+            partial_min_speech_s=0.4,
+            policy=TurnPolicy(silence_threshold_s=0.6, min_utterance_s=0.2),
+        )
+        session = await open_session(stage)
+        try:
+            feed_all(stage, "A", dc(1700, 0.6) + quiet(0.3) + dc(1700, 0.5) + quiet(0.8))
+            (utt,) = await session.wait_for(1)
+            assert utt.metadata["channel_segments"] >= 2
+            assert utt.text.split() == ["1700"] * utt.metadata["channel_segments"]
+            assert parts and parts[0][0] == "A"
+        finally:
+            await session.close()
+
+    async def test_metadata_時間順序(self) -> None:
+        stage = make_stage(EchoBackend(delay_s=0.02))
+        session = await open_session(stage)
+        try:
+            feed_all(stage, "A", dc(1500, 0.5) + quiet(0.6))
+            (utt,) = await session.wait_for(1)
+            md = utt.metadata
+            assert md["speech_start_ts"] <= md["speech_end_ts"] <= md["turn_end_ts"]
+            assert md["turn_end_ts"] <= md["stt_done_ts"]
+            assert md["stt_ms"] >= 15
+            assert md["queue_ms"] >= 0
+            assert md["channel_segments"] == 1
+            assert utt.started_at == md["speech_start_ts"]
+            assert utt.ended_at == md["speech_end_ts"]
+        finally:
+            await session.close()
+
+
+class TestSilenceWithoutPackets:
+    async def test_無封包時以補靜音結束_turn(self) -> None:
+        """Discord 不說話就不送封包：只靠時鐘前進也要能結束 turn。"""
+        clock = FakeClock()
+        stage = make_stage(clock=clock, tick_interval_s=1000.0)
+        session = await open_session(stage)
+        try:
+            feed_all(stage, "A", dc(1900, 0.5))
+            await asyncio.sleep(0.1)
+            assert stage.engine._channels["A"].core.active
+            assert session.results == []
+
+            # 時間過了 0.2s：靜音還不夠長（門檻 0.3s）
+            clock.t += 0.5 + 0.2
+            stage.engine._tick(clock())
+            await asyncio.sleep(0.05)
+            assert session.results == []
+
+            clock.t += 0.3
+            stage.engine._tick(clock())
+            (utt,) = await session.wait_for(1)
+            assert utt.speaker_id == "A" and utt.text == "1900"
+            md = utt.metadata
+            assert md["speech_end_ts"] <= md["turn_end_ts"] <= md["stt_done_ts"]
+        finally:
+            await session.close()
+
+    async def test_背景_tick_迴圈真的會補靜音(self) -> None:
+        stage = make_stage(tick_interval_s=0.02)
+        session = await open_session(stage)
+        try:
+            feed_all(stage, "A", dc(1900, 0.4))  # 之後完全沒有封包
+            (utt,) = await session.wait_for(1, timeout=4)
+            assert utt.speaker_id == "A"
+        finally:
+            await session.close()
+
+    async def test_封包缺口在下一個封包抵達時補靜音(self) -> None:
+        clock = FakeClock()
+        stage = make_stage(clock=clock, tick_interval_s=1000.0)
+        session = await open_session(stage)
+        try:
+            feed_all(stage, "A", dc(1900, 0.5))
+            # 靜默 1.0 秒後才又來一個封包（中間沒有 tick）
+            stage.feed("A", dc(1901, CHUNK_S), ts=clock() + 1.5)
+            (utt,) = await session.wait_for(1)
+            assert utt.text == "1900"
+        finally:
+            await session.close()
+
+
+class TestVoiceEvent:
+    async def test_每個_chunk_觸發且帶_speaker_id_與_is_voiced(self) -> None:
+        events = []
+
+        def boom_then_record(event) -> None:
+            events.append(event)
+            raise RuntimeError("訂閱者壞掉")
+
+        stage = make_stage(on_voice_event=boom_then_record)
+        session = await open_session(stage)
+        try:
+            feed_all(stage, "A", dc(1800, 0.1))
+            feed_all(stage, "B", quiet(0.1))
+            await asyncio.sleep(0.2)
+            assert len(events) == 10
+            a = [e for e in events if e.speaker_id == "A"]
+            b = [e for e in events if e.speaker_id == "B"]
+            assert len(a) == 5 and all(e.is_voiced for e in a)
+            assert len(b) == 5 and not any(e.is_voiced for e in b)
+            assert all(isinstance(e.timestamp, float) for e in events)
+            # callback 丟例外後管線仍活著
+            feed_all(stage, "A", dc(1800, 0.3) + quiet(0.5))
+            await session.wait_for(1)
+        finally:
+            await session.close()
+
+
+class TestLifecycle:
+    async def test_閒置聲道被回收_進行中的不回收(self) -> None:
+        clock = FakeClock()
+        stage = make_stage(clock=clock, tick_interval_s=1000.0, idle_evict_s=10.0)
+        session = await open_session(stage)
+        try:
+            feed_all(stage, "idle", quiet(0.1))
+            feed_all(stage, "busy", dc(1900, 0.4))
+            await asyncio.sleep(0.1)
+            clock.t += 30
+            stage.engine._tick(clock())
+            assert "idle" not in stage.engine.channel_ids
+            assert "busy" in stage.engine.channel_ids  # 有進行中的語音，不能收
+            assert stage.engine.stats["channels_evicted"] == 1
+        finally:
+            await session.close()
+
+    async def test_leave_flush_送出殘餘並移除聲道(self) -> None:
+        stage = make_stage()
+        session = await open_session(stage)
+        try:
+            feed_all(stage, "A", dc(1600, 0.5))  # 還沒講完
+            stage.leave("A", flush=True)
+            (utt,) = await session.wait_for(1)
+            assert utt.speaker_id == "A" and utt.text == "1600"
+            assert "A" not in stage.engine.channel_ids
+        finally:
+            await session.close()
+
+    async def test_leave_不_flush_不送出(self) -> None:
+        stage = make_stage()
+        session = await open_session(stage)
+        try:
+            feed_all(stage, "A", dc(1600, 0.5))
+            stage.leave("A", flush=False)
+            await asyncio.sleep(0.3)
+            assert session.results == []
+            assert "A" not in stage.engine.channel_ids
+        finally:
+            await session.close()
+
+    async def test_斷線重連_同_id_是乾淨的新聲道(self) -> None:
+        stage = make_stage()
+        session = await open_session(stage)
+        try:
+            feed_all(stage, "A", dc(1600, 0.5))
+            old = stage.engine._channels["A"]
+            stage.leave("A", flush=True)
+            await session.wait_for(1)
+            assert "A" not in stage.engine.channel_ids
+
+            stage.join("A")
+            feed_all(stage, "A", dc(1650, 0.5) + quiet(0.6))
+            new = stage.engine._channels["A"]
+            assert new is not old
+            assert new.core.gen == 0
+            assert new.core.vad is not old.core.vad
+            assert new.core.vad.clock_s <= 1.2  # 時鐘從頭算，不繼承舊聲道
+            results = await session.wait_for(2)
+            assert [u.text for u in results] == ["1600", "1650"]
+        finally:
+            await session.close()
+
+    async def test_leave_與_discard_交錯不送出被丟棄的段(self) -> None:
+        stage = make_stage()
+        session = await open_session(stage)
+        try:
+            feed_all(stage, "A", dc(1600, 0.5))
+            stage.leave("A", flush=True)
+            stage.discard("A")
+            await asyncio.sleep(0.4)
+            assert session.results == []
+
+            # 先讓 flush 跑完、段已在轉錄路上，再 discard：世代作廢
+            feed_all(stage, "B", dc(1610, 0.5))
+            stage.leave("B", flush=True)
+            await asyncio.sleep(0)
+            stage.discard(None)
+            await asyncio.sleep(0.4)
+            assert session.results == []
+        finally:
+            await session.close()
+
+    async def test_discard_只影響該聲道(self) -> None:
+        # min_utterance 拉高：被丟棄後殘留的尾巴（含 VAD hangover）不足以成 turn
+        stage = make_stage(policy=TurnPolicy(silence_threshold_s=0.3, min_utterance_s=0.4))
+        session = await open_session(stage)
+        try:
+            a = split(dc(1100, 0.5) + quiet(0.6))
+            b = split(dc(1200, 0.5) + quiet(0.6))
+            for i in range(len(a)):
+                stage.feed("A", a[i])
+                stage.feed("B", b[i])
+                if i == 20:  # A 講到一半被丟棄
+                    stage.discard("A")
+            await asyncio.sleep(0.5)
+            assert [u.speaker_id for u in session.results] == ["B"]
+            assert stage.engine._channels["A"].core.gen == 1
+            assert stage.engine._channels["B"].core.gen == 0
+        finally:
+            await session.close()
+
+    async def test_discard_None_丟棄全部聲道(self) -> None:
+        stage = make_stage()
+        session = await open_session(stage)
+        try:
+            feed_all(stage, "A", dc(1100, 0.5))
+            feed_all(stage, "B", dc(1200, 0.5))
+            await asyncio.sleep(0.1)
+            stage.discard()
+            feed_all(stage, "A", quiet(0.6))
+            feed_all(stage, "B", quiet(0.6))
+            await asyncio.sleep(0.4)
+            assert session.results == []
+        finally:
+            await session.close()
+
+    async def test_max_channels_超過不崩潰(self) -> None:
+        stage = make_stage(max_channels=2)
+        session = await open_session(stage)
+        try:
+            for sid in ("A", "B", "C"):
+                stage.feed(sid, dc(1100, CHUNK_S))
+            await asyncio.sleep(0.1)
+            assert sorted(stage.engine.channel_ids) == ["A", "B"]
+            assert stage.engine.stats["channels_rejected"] == 1
+        finally:
+            await session.close()
+
+    async def test_佇列滿了丟最舊並計數(self) -> None:
+        stage = make_stage(chunk_queue_max=3)
+        session = await open_session(stage)
+        try:
+            for _ in range(10):  # 同一個 loop tick 內連續 feed，pump 來不及消化
+                stage.feed("A", dc(1100, CHUNK_S))
+            assert stage.engine.stats["chunks_dropped"] == 7
+        finally:
+            await session.close()
+
+    async def test_從其他執行緒_feed(self) -> None:
+        stage = make_stage()
+        session = await open_session(stage)
+        try:
+            def producer() -> None:
+                for chunk in split(dc(1333, 0.5) + quiet(0.6)):
+                    stage.feed("T", chunk)
+
+            thread = threading.Thread(target=producer)
+            thread.start()
+            thread.join()
+            (utt,) = await session.wait_for(1)
+            assert utt.speaker_id == "T" and utt.text == "1333"
+        finally:
+            await session.close()
+
+    async def test_token_取消後沒有懸掛_task(self) -> None:
+        stage = make_stage()
+        session = await open_session(stage)
+        feed_all(stage, "A", dc(1100, 0.2))
+        feed_all(stage, "B", dc(1100, 0.2))
+        await asyncio.sleep(0.1)
+        await session.close()
+        await asyncio.sleep(0.05)
+        current = asyncio.current_task()
+        leftover = [t for t in asyncio.all_tasks() if t is not current and not t.done()]
+        assert leftover == []
+        assert stage.engine._loop is None
+        # 關閉後 feed 不崩潰，只計數
+        stage.feed("A", dc(1100, CHUNK_S))
+        assert stage.engine.stats["feed_not_open"] >= 1
+
+    async def test_prepare_不重載已注入的_backend(self, monkeypatch) -> None:
+        backend = EchoBackend()
+        stage = make_stage(backend)
+
+        def boom(self):
+            raise AssertionError("不該重載已注入的 backend")
+
+        monkeypatch.setattr(MultiChannelSttInputStage, "_build_backend", boom)
+        await stage.prepare()
+        await stage.prepare()
+        assert stage._backend is backend
+        await stage.aclose()
+        assert backend.closed is False  # 注入的 backend 屬於宿主
+
+
+class TestTranscriberPool:
+    async def test_同時執行數不超過上限(self) -> None:
+        backend = EchoBackend(delay_s=0.03)
+        pool = TranscriberPool(backend, max_concurrency=2)
+        jobs = [pool.run(f"S{i}", struct.pack("<h", i + 1) * 100, SR) for i in range(5)]
+        await asyncio.gather(*jobs)
+        assert backend.peak == 2
+        assert pool.peak_active == 2
+
+    async def test_預設併發為_1(self) -> None:
+        backend = EchoBackend(delay_s=0.02)
+        pool = TranscriberPool(backend)
+        await asyncio.gather(*(pool.run(f"S{i}", struct.pack("<h", 1) * 100, SR) for i in range(3)))
+        assert backend.peak == 1
+
+    async def test_同聲道不並行且順序固定(self) -> None:
+        backend = EchoBackend(delay_s=0.02)
+        pool = TranscriberPool(backend, max_concurrency=3)
+        await asyncio.gather(
+            *(pool.run("A", struct.pack("<h", v) * 100, SR) for v in (1, 2, 3, 4))
+        )
+        assert backend.calls == [1, 2, 3, 4]
+        assert backend.peak == 1
+
+    async def test_跨聲道_round_robin_不餓死(self) -> None:
+        backend = EchoBackend(delay_s=0.02)
+        pool = TranscriberPool(backend, max_concurrency=1)
+        a = [pool.run("A", struct.pack("<h", v) * 100, SR) for v in (11, 12, 13, 14)]
+        b = [pool.run("B", struct.pack("<h", 21) * 100, SR)]
+        c = [pool.run("C", struct.pack("<h", 31) * 100, SR)]
+        await asyncio.gather(*a, *b, *c)
+        # A 的第一個先跑；B、C 插在 A 的後續任務之前輪流
+        assert backend.calls[:3] == [11, 21, 31]
+        assert backend.calls[3:] == [12, 13, 14]
+
+    async def test_有_transcribe_for_時帶_speaker_id(self) -> None:
+        seen: list[tuple[str, int]] = []
+
+        class PerChannel:
+            def transcribe(self, pcm, sample_rate):
+                raise AssertionError("應該走 transcribe_for")
+
+            def transcribe_for(self, speaker_id, pcm, sample_rate):
+                seen.append((speaker_id, sample_rate))
+                return TranscriptionResult(text=speaker_id)
+
+        pool = TranscriberPool(PerChannel())
+        result = await pool.run("alice", b"\x01\x00" * 10, SR)
+        assert result.result.text == "alice"
+        assert seen == [("alice", SR)]
+
+    async def test_queue_ms_與_stt_ms_分開(self) -> None:
+        backend = EchoBackend(delay_s=0.05)
+        pool = TranscriberPool(backend, max_concurrency=1)
+        first, second = await asyncio.gather(
+            pool.run("A", struct.pack("<h", 1) * 100, SR),
+            pool.run("B", struct.pack("<h", 2) * 100, SR),
+        )
+        assert first.queue_ms < 30
+        assert second.queue_ms >= 40  # 等了第一個任務
+        assert second.stt_ms >= 40
+        assert second.stt_ms < second.queue_ms + second.stt_ms
+        pool.close()
+
+    async def test_discard_讓排隊中的任務以空結果完成(self) -> None:
+        backend = EchoBackend(delay_s=0.05)
+        pool = TranscriberPool(backend, max_concurrency=1)
+        running = asyncio.ensure_future(pool.run("A", struct.pack("<h", 1) * 100, SR))
+        queued = asyncio.ensure_future(pool.run("B", struct.pack("<h", 2) * 100, SR))
+        await asyncio.sleep(0.01)
+        pool.discard("B")
+        assert (await queued).result is None
+        assert (await running).result.text == "1"
+        assert backend.calls == [1]
