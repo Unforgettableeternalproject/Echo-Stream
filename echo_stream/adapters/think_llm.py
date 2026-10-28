@@ -273,6 +273,7 @@ class LLMThinkStage:
         split_policy: SplitPolicy | None = None,
         tracer: LatencyTracer | None = None,
         history_limit: int = 20,
+        history_trim_to: int | None = None,
         default_style: SpeechStyle | None = None,
         emotion_markers: bool = False,
         memory: Any = None,
@@ -307,6 +308,14 @@ class LLMThinkStage:
         self.history_limit = history_limit
         """保留幾則歷史訊息。**佔位方案**——Phase 4 換成 ContextManager
         的四層漸進式壓縮後就不需要粗暴截斷。"""
+        self.history_trim_to = (
+            max(1, min(history_trim_to, history_limit))
+            if history_trim_to is not None
+            else max(1, history_limit // 2)
+        )
+        """階梯式修剪：可見歷史超過 ``history_limit`` 時，視窗起點一次跳到只剩約這麼多則，
+        之後在再次超限前起點不動，讓連續多輪的 prompt cache 前綴一致。
+        ``None`` = ``history_limit // 2``；傳 ``history_limit`` 等同逐則滑動（舊行為）。"""
 
         self.default_style = default_style
         self.emotion_markers = emotion_markers
@@ -467,7 +476,7 @@ class LLMThinkStage:
             kwargs: dict[str, Any] = {"max_tokens": self.PREWARM_MAX_TOKENS}
             if self.tools and self.tool_executor is not None:
                 kwargs["tools"] = self.tools
-            history = list(self.history[-self.history_limit :])
+            history = self._history_window()
             prefix_key = hashlib.sha256(
                 json.dumps(
                     [system, kwargs.get("tools"), history], ensure_ascii=False,
@@ -896,6 +905,29 @@ class LLMThinkStage:
             if self.tracer is not None:
                 self.tracer.mark(utterance.turn_id, MARK_MEMORY_DONE)
 
+    def _history_window(self) -> list[dict[str, str]]:
+        """送進 prompt 的歷史視窗（預熱與正常輪共用，確保兩者前綴一致）。
+
+        起點是歷史長度的**純函數**（不存狀態，history 被外部 clear／截斷／重載也不會錯位）：
+        長度 n <= limit 時整段送出；超過後起點以 ``step = limit - trim_to`` 為單位階梯前移，
+        n 在同一階內起點不變。起點再往後對齊到 user 訊息，避免視窗以孤兒 assistant 開頭
+        （history 目前只存 user/assistant 純文字，工具往返不進歷史，無 tool 配對問題）。
+        """
+        history = self.history
+        n = len(history)
+        limit = self.history_limit
+        step = limit - self.history_trim_to
+        if n <= limit:
+            return list(history)
+        if step <= 0:
+            return list(history[-limit:])
+        start = -(-(n - limit) // step) * step  # ceil((n - limit) / step) * step
+        while start < n and history[start].get("role") != "user":
+            start += 1
+        if start >= n:  # 找不到 user 起點：退回舊的尾端切片
+            return list(history[-limit:])
+        return list(history[start:])
+
     def _build_messages(
         self, user_text: str, scope: str | None = None, turn_id: str = ""
     ) -> list[dict[str, str]]:
@@ -909,7 +941,7 @@ class LLMThinkStage:
         重算最後一組對答（便宜）；換來的是 context 不被逐輪的記憶
         blob 塞胖、過期記憶也不會殘留在歷史裡繼續影響後續輪次。
         """
-        messages = list(self.history[-self.history_limit :])
+        messages = self._history_window()
         content = user_text
         slot = self._slot(scope)
         # 同 turn_id 重生成（executor 的 regen 迴圈會用同一個 turn_id 連呼 stream）：
