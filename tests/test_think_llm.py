@@ -806,3 +806,73 @@ async def test_prewarm_system_prompt覆寫不改變stage狀態():
     assert await stage.prewarm("別的人設") is True
     assert backend.requests[0]["system_instruction"].startswith("別的人設")
     assert stage.system_prompt == "人設"
+
+
+# --- 階梯式歷史修剪（穩定 prompt cache 前綴）---
+
+
+def _pairs(n: int) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for i in range(n):
+        out.append({"role": "user", "content": f"u{i}"})
+        out.append({"role": "assistant", "content": f"a{i}"})
+    return out
+
+
+def test_階梯修剪_未滿上限與舊行為相同():
+    stage = LLMThinkStage(FakeBackend(), history_limit=20)
+    for n in range(0, 11):
+        stage.history = _pairs(n)
+        assert stage._history_window() == stage.history[-20:]
+
+
+def test_階梯修剪_超限後起點只跳一次且前綴穩定():
+    stage = LLMThinkStage(FakeBackend(), history_limit=20)  # trim_to 預設 10
+    assert stage.history_trim_to == 10
+    starts = []
+    for n in range(10, 30):
+        stage.history = _pairs(n)
+        win = stage._history_window()
+        starts.append(win[0]["content"])
+        assert len(win) <= 20
+    # 第 11 對（22 則）起超限，起點跳一次；其後一段時間內不變
+    jump = starts.index(next(s for s in starts if s != "u0"))
+    stable = starts[jump : jump + 5]
+    assert len(set(stable)) == 1
+    assert stable[0] != "u0"
+    # 跳過之後仍保留至少 trim_to 則
+    stage.history = _pairs(11)
+    assert len(stage._history_window()) >= 10
+
+
+def test_階梯修剪_起點落在_user_訊息():
+    stage = LLMThinkStage(FakeBackend(), history_limit=7, history_trim_to=3)
+    for n in range(1, 40):
+        stage.history = _pairs(n)
+        win = stage._history_window()
+        assert win[0]["role"] == "user"
+        assert len(win) <= 7
+    # 起點被切到 assistant 上時會往後對齊到 user
+    stage.history = [{"role": "assistant", "content": f"x{i}"} for i in range(5)] + _pairs(10)
+    assert stage._history_window()[0]["role"] == "user"
+
+
+def test_階梯修剪_trim_to_等於_limit_退回逐則滑動():
+    stage = LLMThinkStage(FakeBackend(), history_limit=4, history_trim_to=4)
+    stage.history = _pairs(10)
+    assert stage._history_window() == stage.history[-4:]
+
+
+async def test_階梯修剪_預熱與正常輪視窗一致():
+    backend = FakeBackend()
+    stage = LLMThinkStage(backend, history_limit=10)
+    stage.history = _pairs(9)  # 18 則，已超限
+    await stage.prewarm()
+    def _texts() -> list[str]:
+        return [m["content"] if isinstance(m, dict) else m.content for m in backend.last_messages]
+
+    prewarm_msgs = _texts()
+    await collect(stage, "新問題")
+    turn_msgs = _texts()
+    assert prewarm_msgs[:-1] == turn_msgs[:-1]
+    assert prewarm_msgs[0] == stage._history_window()[0]["content"]
