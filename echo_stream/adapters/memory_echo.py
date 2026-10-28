@@ -35,9 +35,10 @@ import asyncio
 import inspect
 import logging
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -166,6 +167,20 @@ def build_engine(
         namespace_id=namespace_id
         or config.get("ECHO_STREAM_MEMORY_NAMESPACE", DEFAULT_NAMESPACE),
     )
+
+
+@dataclass
+class SharedRetrieval:
+    """``retrieve_shared`` 的結果：渲染文字與 projection ids 一起給 bot。
+
+    ``text`` 無項目時為空字串；``ids`` 回覆後傳給 ``store`` 的 ``shared_context_ids``。
+    """
+
+    text: str = ""
+    ids: list[str] = field(default_factory=list)
+    scope_id: str = ""
+    degraded: bool = False
+    degraded_reason: str = ""
 
 
 class _SharedExclusiveLock:
@@ -716,11 +731,29 @@ class EchoMemoryAdapter:
                 )
 
             episode_id = await self._run(_write, "write")
-            return {"episode_id": episode_id, **scores, "assessment": assessment}
+            unit_ids = await self._episode_user_unit_ids(episode_id)
+            return {"episode_id": episode_id, **scores, "assessment": assessment,
+                    "unit_ids": unit_ids}
         except Exception as exc:  # noqa: BLE001 - 旁路，失敗不該炸管線
             logger.warning("memory store 失敗（不影響對話）：%s: %s",
                            type(exc).__name__, exc)
             return None
+
+    async def _episode_user_unit_ids(self, episode_id: Any) -> list[str]:
+        """查本輪 episode 的使用者 evidence unit id（供 restrict_unit／scan_privacy_intent）。
+
+        引擎沒有 ``evidence.get_by_episode`` 或查詢失敗都回空清單，不影響 store 結果。
+        """
+        evidence = getattr(self.engine, "evidence", None)
+        getter = getattr(evidence, "get_by_episode", None)
+        if getter is None or not episode_id:
+            return []
+        try:
+            units = await self._run(lambda: list(getter(episode_id)), "read")
+            return [u.id for u in units if getattr(u, "source_type", "user") == "user"]
+        except Exception as exc:  # noqa: BLE001 - 附加資訊，失敗只降級
+            logger.warning("查本輪 unit_ids 失敗，回空清單：%s: %s", type(exc).__name__, exc)
+            return []
 
     def _supports_evidence(self) -> bool:
         """引擎的 ``store_episode`` 是否有 ``evidence`` 參數（舊版沒有，不能傳）。"""
@@ -824,6 +857,117 @@ class EchoMemoryAdapter:
             return await self._run(lambda: fn(**kwargs), "write")
         except Exception as exc:  # noqa: BLE001 - 觀察寫入失敗只降級
             logger.warning("record_observation 失敗，略過：%s: %s", type(exc).__name__, exc)
+            return None
+
+    async def retrieve_shared(
+        self,
+        text: str,
+        *,
+        scope_id: str,
+        viewer_uid: str,
+        present_uids: Iterable[Any] = (),
+        display_name: Callable[[str], str] | None = None,
+    ) -> SharedRetrieval | None:
+        """檢索場域共享摘要，透傳引擎 ``retrieve_shared``（唯讀，不持寫鎖）。
+
+        應呼叫在 scope engine（namespace ``scope-g<guild_id>``）的 adapter 上；DM 不要呼叫。
+        ``display_name``：uid -> 顯示名稱的 callable，缺省由引擎用「成員 <uid>」。
+        回傳 ``SharedRetrieval``（text 無項目時為空字串、ids 供回覆後 store 的
+        ``shared_context_ids``）；引擎沒有此方法或失敗回 None。引擎端失敗會自行回
+        degraded 的空結果，此時 ``degraded=True``。
+        """
+        fn = getattr(self.engine, "retrieve_shared", None)
+        if fn is None or not text or not text.strip():
+            return None
+        try:
+            result = await self._run(
+                lambda: fn(text, scope_id=scope_id, viewer_uid=viewer_uid,
+                           present_uids=tuple(present_uids)),
+                "read",
+            )
+            rendered = result.to_text(display_name) if display_name else result.to_text()
+            return SharedRetrieval(
+                text=rendered or "",
+                ids=list(result.ids),
+                scope_id=getattr(result, "scope_id", scope_id),
+                degraded=bool(getattr(result, "degraded", False)),
+                degraded_reason=str(getattr(result, "degraded_reason", "") or ""),
+            )
+        except Exception as exc:  # noqa: BLE001 - 共享脈絡是加分項
+            logger.warning("retrieve_shared 失敗，略過：%s: %s", type(exc).__name__, exc)
+            return None
+
+    async def restrict_unit(
+        self,
+        unit_id: str,
+        *,
+        reason_code: str = "user_restrict",
+        triggered_by: str = "conversation",
+    ) -> dict[str, Any] | None:
+        """把某句話收緊為私密，透傳引擎 ``restrict_unit``（寫入路徑）。
+
+        回傳引擎的結果 dict；引擎沒有此方法或失敗回 None。
+        """
+        fn = getattr(self.engine, "restrict_unit", None)
+        if fn is None:
+            return None
+        try:
+            return await self._run(
+                lambda: fn(unit_id, reason_code=reason_code, triggered_by=triggered_by),
+                "write",
+            )
+        except Exception as exc:  # noqa: BLE001 - 收緊失敗只降級，由呼叫端決定是否提示
+            logger.warning("restrict_unit 失敗，略過：%s: %s", type(exc).__name__, exc)
+            return None
+
+    async def scan_privacy_intent(
+        self,
+        unit_ids: Iterable[str],
+        *,
+        timeout: float = 20.0,
+        force: bool = False,
+    ) -> dict[str, Any] | None:
+        """熱路徑外的隱私意圖掃描，透傳引擎 ``scan_privacy_intent``。
+
+        最長阻塞約 ``timeout`` 秒（LLM 在引擎鎖外），所以走 read 路徑、不持寫鎖。
+        建議回覆送出後以 fire-and-forget 呼叫，不要在回覆路徑上 await。
+        引擎沒有此方法或失敗回 None。
+        """
+        fn = getattr(self.engine, "scan_privacy_intent", None)
+        if fn is None:
+            return None
+        ids = list(unit_ids)
+        if not ids:
+            return None
+        try:
+            return await self._run(lambda: fn(ids, timeout=timeout, force=force), "read")
+        except Exception as exc:  # noqa: BLE001 - 掃描是附加防線
+            logger.warning("scan_privacy_intent 失敗，略過：%s: %s", type(exc).__name__, exc)
+            return None
+
+    async def revoke_owner(
+        self,
+        scope: Any,
+        owner_uid: str,
+        *,
+        reason_code: str = "member_left",
+        block: bool = True,
+    ) -> Any | None:
+        """成員退出場域：撤回其在該 scope 的所有投影，透傳 ``engine.share_layer.revoke_owner``。
+
+        場域層操作，應呼叫在 scope engine（namespace ``scope-g<guild_id>``）的 adapter 上。
+        回傳引擎的 ``RevokeResult``（型別註記用 Any）；引擎沒有 share_layer／此方法或失敗回 None。
+        """
+        layer = getattr(self.engine, "share_layer", None)
+        fn = getattr(layer, "revoke_owner", None)
+        if fn is None:
+            return None
+        try:
+            return await self._run(
+                lambda: fn(scope, owner_uid, reason_code=reason_code, block=block), "write"
+            )
+        except Exception as exc:  # noqa: BLE001 - 退出流程不因撤回失敗中斷
+            logger.warning("revoke_owner 失敗，略過：%s: %s", type(exc).__name__, exc)
             return None
 
     async def forget_activity(self, kind: str = "game_activity") -> bool:
