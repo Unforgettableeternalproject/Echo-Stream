@@ -971,7 +971,9 @@ class EchoMemoryAdapter:
             return None
 
     async def restore_owner(self, scope: Any, owner_uid: str) -> bool | None:
-        """成員回到場域：解除 ``revoke_owner(block=True)`` 的封鎖，透傳 ``share_layer.restore_owner``。
+        """成員回到場域：解除 ``revoke_owner(block=True)`` 的封鎖。
+
+        透傳 ``engine.share_layer.restore_owner``。
 
         舊投影維持撤回，下次 Dream 重判後才重新投影。應呼叫在 scope engine 的 adapter 上。
         回傳引擎的 bool；引擎沒有 share_layer／此方法或失敗回 None。
