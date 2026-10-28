@@ -20,7 +20,6 @@ import logging
 import math
 import re
 import threading
-import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
