@@ -56,6 +56,10 @@ class _Layer:
         self.calls.append((scope, owner_uid, reason_code, block))
         return "RR"
 
+    def restore_owner(self, scope, owner_uid):
+        self.calls.append(("restore", scope, owner_uid))
+        return True
+
 
 class _ShareEngine(_Engine):
     def __init__(self):
@@ -131,6 +135,15 @@ async def test_revoke_owner_透傳share_layer():
         "scope", "u9", reason_code="left", block=False)
     assert out == "RR"
     assert eng.share_layer.calls == [("scope", "u9", "left", False)]
+
+
+async def test_restore_owner_透傳share_layer():
+    eng = _ShareEngine()
+    assert await EchoMemoryAdapter(engine=eng).restore_owner("scope", "u9") is True
+    assert eng.share_layer.calls == [("restore", "scope", "u9")]
+    assert await EchoMemoryAdapter(engine=_Engine(_Ctx())).restore_owner("s", "u") is None
+    eng.share_layer.restore_owner = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x"))
+    assert await EchoMemoryAdapter(engine=eng).restore_owner("s", "u") is None
 
 
 async def test_引擎缺方法回None():

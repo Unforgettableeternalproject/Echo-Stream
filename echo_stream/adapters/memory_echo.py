@@ -970,6 +970,22 @@ class EchoMemoryAdapter:
             logger.warning("revoke_owner 失敗，略過：%s: %s", type(exc).__name__, exc)
             return None
 
+    async def restore_owner(self, scope: Any, owner_uid: str) -> bool | None:
+        """成員回到場域：解除 ``revoke_owner(block=True)`` 的封鎖，透傳 ``share_layer.restore_owner``。
+
+        舊投影維持撤回，下次 Dream 重判後才重新投影。應呼叫在 scope engine 的 adapter 上。
+        回傳引擎的 bool；引擎沒有 share_layer／此方法或失敗回 None。
+        """
+        layer = getattr(self.engine, "share_layer", None)
+        fn = getattr(layer, "restore_owner", None)
+        if fn is None:
+            return None
+        try:
+            return await self._run(lambda: fn(scope, owner_uid), "write")
+        except Exception as exc:  # noqa: BLE001 - 回歸流程不因解除失敗中斷
+            logger.warning("restore_owner 失敗，略過：%s: %s", type(exc).__name__, exc)
+            return None
+
     async def forget_activity(self, kind: str = "game_activity") -> bool:
         """退出用：清除活動彙整並遮蔽對應 observation 證據，透傳引擎 ``forget_activity``。
 
