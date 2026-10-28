@@ -39,7 +39,6 @@ import asyncio
 import contextlib
 import copy
 import time
-from collections import deque
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
@@ -47,9 +46,12 @@ from typing import Protocol, runtime_checkable
 from .. import config
 from ..contracts.cancellation import CancellationToken, CancelledError
 from ..contracts.stages import AudioSource
-from ..contracts.turn import TurnDetector, TurnPolicy, VoiceEvent, VoiceState
+from ..contracts.turn import TurnDetector, TurnPolicy, VoiceEvent
 from ..contracts.types import STT_SAMPLE_RATE, Utterance, new_turn_id
 from ..core.channel import StreamChannel
+from ..core.channel_engine import Segment as _Segment
+from ..core.channel_engine import VoiceChannel as _Channel
+from ..core.channel_engine import merge_parts
 from ..core.turn_detector import SilenceTurnDetector
 from ..core.vad import EnergyVad
 
@@ -73,34 +75,6 @@ class TranscriberBackend(Protocol):
     """
 
     def transcribe(self, pcm: bytes, sample_rate: int) -> TranscriptionResult | None: ...
-
-
-class _Segment:
-    """一段待轉錄的音訊與它的時間標記。
-
-    ``final=False`` 是 turn 進行中在停頓處切出的**增量段**——轉錄結果
-    先經 ``on_partial`` 推給前端顯示，turn 結束時與殘餘段拼成完整轉錄。
-    ``final=True`` 標記 turn 結束，``pcm`` 只含最後一段增量之後的殘餘
-    （可能為空），時間標記代表**整個 turn** 的起訖。
-    """
-
-    __slots__ = ("pcm", "started_at", "ended_at", "final", "gen")
-
-    def __init__(
-        self,
-        pcm: bytes,
-        started_at: float,
-        ended_at: float,
-        final: bool = True,
-        gen: int = 0,
-    ) -> None:
-        self.pcm = pcm
-        self.started_at = started_at
-        self.ended_at = ended_at
-        self.final = final
-        self.gen = gen
-        """切出這段時的世代號。``discard_current`` 會把世代往前推，
-        舊世代的段（包含已經在轉錄中的）一律作廢。"""
 
 
 class SttInputStage:
@@ -278,18 +252,8 @@ class SttInputStage:
         轉錄在另一個 worker——否則辨識的一秒鐘裡 VAD 是聾的，
         插話偵測會有空窗。
         """
-        preroll: deque[bytes] = deque()
-        preroll_len_s = 0.0
-        buffer = bytearray()
-        partial_mark = 0
-        """buffer 中已切出去做增量轉錄的位元組數。turn 結束時只送殘餘。"""
-        speech_start_clock: float | None = None
-        """語音起點的**音訊時鐘**。時間標記一律用音訊時鐘回推、共用同一個
-        牆鐘錨點——混用兩種時鐘在比即時快的來源（測試、檔案）下會讓
-        started_at / ended_at 順序反轉。"""
-        speech_in_turn_s = 0.0
-        last_speech_clock: float | None = None
-        gen_seen = self._generation
+        channel = _Channel(self.vad, self.turn_detector, self)
+        channel.gen = self._generation
 
         try:
             async for chunk in source.stream(token):
@@ -299,126 +263,19 @@ class SttInputStage:
                     continue
 
                 # discard_current 把世代推前了：手上的累積全是被丟棄的輸入
-                if self._generation != gen_seen:
-                    gen_seen = self._generation
-                    buffer.clear()
-                    partial_mark = 0
-                    preroll.clear()
-                    preroll_len_s = 0.0
-                    speech_start_clock = None
-                    speech_in_turn_s = 0.0
-                    last_speech_clock = None
-                    self.turn_detector.reset()
+                if self._generation != channel.gen:
+                    channel.gen = self._generation
+                    channel.reset()
 
-                event = self.vad.process(chunk)
-                if self.on_voice_event is not None:
-                    try:
-                        self.on_voice_event(event)
-                    except Exception:  # noqa: BLE001 - 訂閱者壞掉不能斷麥克風
-                        pass
-
-                chunk_s = (len(chunk) // 2) / self.vad.sample_rate
-
-                if event.state is VoiceState.SPEECH:
-                    if speech_start_clock is None:
-                        speech_start_clock = self.vad.clock_s - event.duration_s
-                        # 補前導：語音其實在 VAD 反應之前就開始了
-                        buffer.extend(b"".join(preroll))
-                        preroll.clear()
-                        preroll_len_s = 0.0
-                    buffer.extend(chunk)
-                    speech_in_turn_s += chunk_s
-                    last_speech_clock = self.vad.clock_s
-                else:
-                    preroll.append(chunk)
-                    preroll_len_s += chunk_s
-                    while preroll_len_s > self.preroll_s and len(preroll) > 1:
-                        dropped = preroll.popleft()
-                        preroll_len_s -= (len(dropped) // 2) / self.vad.sample_rate
-
-                    # 增量切分：講話中的自然停頓就先切一段去轉錄，
-                    # 不等整個 turn。條件是「停頓夠久 + 未轉錄的語音夠多」——
-                    # 同一次停頓切完 partial_mark 追上 buffer，不會重複觸發。
-                    pending_s = (len(buffer) - partial_mark) / 2 / self.vad.sample_rate
-                    if (
-                        self.on_partial is not None
-                        and buffer
-                        and event.duration_s >= self.partial_silence_s
-                        and pending_s >= self.partial_min_speech_s
-                    ):
-                        anchor = time.perf_counter()
-                        clock = self.vad.clock_s
-                        end_clock = (
-                            last_speech_clock if last_speech_clock is not None else clock
-                        )
-                        stamp = anchor - max(0.0, clock - end_clock)
-                        piece = bytes(buffer[partial_mark:])
-                        partial_mark = len(buffer)
-                        await segments.put(
-                            _Segment(piece, stamp, stamp, final=False, gen=gen_seen)
-                        )
-
-                decision = self.turn_detector.evaluate(event)
-                if decision.is_end_of_turn and buffer:
-                    # 兩個標記共用同一個牆鐘錨點，再各自用音訊時鐘回推。
-                    # ended_at 回推到語音實際停止的時刻——靜音等待是
-                    # turn 判定的成本，不是使用者的說話時間。
-                    anchor = time.perf_counter()
-                    clock = self.vad.clock_s
-                    end_clock = last_speech_clock if last_speech_clock is not None else clock
-                    start_clock = (
-                        speech_start_clock if speech_start_clock is not None else end_clock
-                    )
-                    # 增量切過的部分不重轉——final 段只帶殘餘，
-                    # 時間標記仍代表整個 turn
-                    segment = _Segment(
-                        pcm=bytes(buffer[partial_mark:]),
-                        started_at=anchor - max(0.0, clock - start_clock),
-                        ended_at=anchor - max(0.0, clock - end_clock),
-                        final=True,
-                        gen=gen_seen,
-                    )
-                    buffer.clear()
-                    partial_mark = 0
-                    speech_start_clock = None
-                    speech_in_turn_s = 0.0
-                    last_speech_clock = None
-                    self.turn_detector.reset()
+                for segment in channel.push(chunk, time.perf_counter()):
                     await segments.put(segment)
-                elif (
-                    buffer
-                    and event.state is VoiceState.SILENCE
-                    and event.duration_s >= self.policy.silence_threshold_s
-                    and speech_in_turn_s < self.policy.min_utterance_s
-                ):
-                    # 太短不成 turn（咳嗽、關門聲）且靜音已足：丟掉。
-                    # 不丟的話這段噪音會黏在下一個 turn 的開頭一起送去轉錄。
-                    buffer.clear()
-                    partial_mark = 0
-                    speech_start_clock = None
-                    speech_in_turn_s = 0.0
-                    last_speech_clock = None
 
             # source 正常結束（檔案播完 / 麥克風關閉）：flush 殘餘。
             # 世代對不上代表殘餘是被丟棄的輸入——停止前按了捨棄，不該補送
-            if (
-                buffer
-                and self._generation == gen_seen
-                and speech_in_turn_s >= self.policy.min_utterance_s
-            ):
-                anchor = time.perf_counter()
-                clock = self.vad.clock_s
-                end_clock = last_speech_clock if last_speech_clock is not None else clock
-                start_clock = speech_start_clock if speech_start_clock is not None else end_clock
-                await segments.put(
-                    _Segment(
-                        bytes(buffer[partial_mark:]),
-                        anchor - max(0.0, clock - start_clock),
-                        anchor - max(0.0, clock - end_clock),
-                        final=True,
-                        gen=gen_seen,
-                    )
-                )
+            if self._generation == channel.gen:
+                tail = channel.flush(time.perf_counter())
+                if tail is not None:
+                    await segments.put(tail)
         except CancelledError:
             return
         finally:
@@ -467,6 +324,7 @@ class SttInputStage:
                 if segment.gen != parts_gen:
                     parts = []  # 上一個世代殘留的增量結果一併作廢
                     parts_gen = segment.gen
+                final_started = time.perf_counter()
                 result = (
                     await loop.run_in_executor(
                         None, self._backend.transcribe, segment.pcm, self.vad.sample_rate
@@ -484,22 +342,28 @@ class SttInputStage:
 
                 if not parts:
                     continue  # 整個 turn 都是雜訊
-                texts = [r.text.strip() for r in parts]
-                total_chars = sum(len(t) for t in texts) or 1
-                confidence = (
-                    sum(r.confidence * len(r.text.strip()) for r in parts) / total_chars
-                )
-                language = next((r.language for r in parts if r.language), None)
+                text, confidence, language = merge_parts(parts)
+                n_parts = len(parts)
                 parts = []
+                done_ts = time.perf_counter()
                 await out.put(
                     Utterance(
-                        text=" ".join(texts),
+                        text=text,
                         turn_id=new_turn_id(),
                         is_final=True,
                         confidence=confidence,
                         language=language,
                         started_at=segment.started_at,
                         ended_at=segment.ended_at,
+                        metadata={
+                            "speech_start_ts": segment.started_at,
+                            "speech_end_ts": segment.ended_at,
+                            "turn_end_ts": segment.turn_end_ts,
+                            "stt_done_ts": done_ts,
+                            "stt_ms": (done_ts - final_started) * 1000.0,
+                            "queue_ms": max(0.0, final_started - segment.turn_end_ts) * 1000.0,
+                            "channel_segments": n_parts,
+                        },
                     )
                 )
         except CancelledError:
