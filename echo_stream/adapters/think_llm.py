@@ -932,7 +932,9 @@ class LLMThinkStage:
         if self.tracer is not None:
             self.tracer.mark(utterance.turn_id, MARK_MEMORY_START)
         try:
-            result = await memory.retrieve(query)
+            # 宿主可經 metadata 帶引擎參數（如共享輪次 shared_turn=True）；沒帶就維持舊呼叫
+            extra = utterance.metadata.get("memory_retrieve_kwargs") or {}
+            result = await (memory.retrieve(query, **extra) if extra else memory.retrieve(query))
             if result:
                 self._pending_by_scope[self._slot(scope)] = result
             self._retrieved = (utterance.turn_id, self._slot(scope), query)
