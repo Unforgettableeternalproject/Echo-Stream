@@ -108,9 +108,14 @@ class VoiceChannel:
         self.turn_detector.reset()
 
     def discard(self) -> None:
-        """世代 +1 並清空本地狀態：此前累積與已切出的段全部作廢。"""
+        """世代 +1 並清空本地狀態：此前累積與已切出的段全部作廢。
+
+        VAD 也一併回到靜音——否則 hangover 期的靜音會被當成「被丟棄那段語音的延續」，
+        帶著舊語音的時長湊出一個假 turn（多聲道的 discard 會在說話中途發生）。
+        """
         self.gen += 1
         self.reset()
+        self.vad.reset()
 
     # --- 推進 ---
 
@@ -122,8 +127,11 @@ class VoiceChannel:
         sample_rate = self.vad.sample_rate
 
         event = self.vad.process(chunk)
+        event.is_voiced = event.state is VoiceState.SPEECH
         if self.speaker_id is not None:
+            # 多聲道：帶上說話者，時間戳改用呼叫端的牆鐘（宿主用它累積讓位／插話秒數）
             event.speaker_id = self.speaker_id
+            event.timestamp = now
         callback = cfg.on_voice_event
         if callback is not None:
             try:
