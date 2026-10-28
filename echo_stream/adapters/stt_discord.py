@@ -544,7 +544,7 @@ class DiscordAudioSource:
         self,
         stage: MultiChannelStageLike,
         *,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] | None = None,
         on_leave: Callable[[str], None] | None = None,
     ) -> None:
         self._stage = stage
@@ -552,6 +552,11 @@ class DiscordAudioSource:
         self._on_leave = on_leave
         self._members: dict[str, _Member] = {}
         self._members_lock = threading.Lock()
+
+    def _stamp(self, ts: float | None) -> float | None:
+        if ts is not None or self._clock is None:
+            return ts
+        return self._clock()
 
     def _member(self, member_id: str) -> _Member:
         with self._members_lock:
@@ -561,12 +566,16 @@ class DiscordAudioSource:
             return m
 
     def feed(self, member_id: str, pcm48k_stereo: bytes, ts: float | None = None) -> None:
-        """餵一個 chunk（任意大小）。``ts`` 預設用本地時鐘。"""
+        """餵一個 chunk（任意大小）。
+
+        ``ts`` 為 None 且未注入 ``clock`` 時原樣傳 None，由 stage 用自己的時鐘蓋時間戳——
+        ``ts`` 必須與 stage 的時鐘同一時域，否則 speech_*_ts 與 TTFA 無法相減。
+        """
         m = self._member(member_id)
         with m.lock:
             out = m.resampler.process(pcm48k_stereo)
             if out:
-                self._stage.feed(member_id, out, self._clock() if ts is None else ts)
+                self._stage.feed(member_id, out, self._stamp(ts))
 
     def join(self, member_id: str) -> None:
         """成員加入：重取樣器歸零（重連後不沿用舊濾波歷史）。"""
@@ -584,7 +593,7 @@ class DiscordAudioSource:
                 tail = m.resampler.flush() if flush else b""
                 m.resampler.reset()
                 if tail:
-                    self._stage.feed(member_id, tail, self._clock())
+                    self._stage.feed(member_id, tail, self._stamp(None))
         self._stage.leave(member_id, flush=flush)
         if self._on_leave is not None:
             self._on_leave(member_id)
