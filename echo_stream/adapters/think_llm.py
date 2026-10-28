@@ -454,6 +454,9 @@ class LLMThinkStage:
     async def prepare(self) -> None:
         _ = self.backend  # 提早建立，讓設定錯誤在暖機階段就爆而不是第一句話
 
+    supports_turn_context = True
+    """宿主能力探測用：``Utterance.metadata["turn_context"]`` 會附在本輪 user 訊息、不進歷史。"""
+
     # --- prompt 快取預熱 ---
 
     PREWARM_DEDUP_S = 60.0

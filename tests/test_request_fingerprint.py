@@ -142,3 +142,6 @@ async def test_turn_context_附在本輪user開頭且不進歷史():
     await stage.commit(utt.turn_id, "好", "好")
     assert all("在場" not in m["content"] for m in stage.history)
     assert stage._build_messages("再見")[-1]["content"] == "再見"
+
+def test_supports_turn_context_旗標():
+    assert LLMThinkStage.supports_turn_context is True
