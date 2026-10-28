@@ -66,6 +66,21 @@ async def test_retrieve_丟棄圖擴散漏過門檻的episode():
     assert await adapter.retrieve("問題") == "攀岩:0.62"
 
 
+async def test_retrieve_透傳引擎參數_舊引擎略過不認得的():
+    ctx = _Ctx(episodes=[_Ep("a", "攀岩")], similarities={"a": 0.9})
+    eng = _Engine(ctx)
+    await EchoMemoryAdapter(engine=eng).retrieve("問題", shared_turn=True)
+    assert eng.calls[-1]["shared_turn"] is True
+
+    class _OldEngine(_Engine):
+        def retrieve(self, text, *, top_k=None, min_similarity=None, exclude_session_id=None):
+            self.calls.append({"top_k": top_k})
+            return self._ctx
+
+    old = _OldEngine(ctx)
+    assert await EchoMemoryAdapter(engine=old).retrieve("問題", shared_turn=True) == "攀岩:0.90"
+
+
 async def test_retrieve_全部低於門檻回None():
     ctx = _Ctx(episodes=[_Ep("b", "深藍色")], similarities={"b": 0.31})
     adapter = EchoMemoryAdapter(engine=_Engine(ctx))

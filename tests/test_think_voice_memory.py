@@ -104,6 +104,20 @@ async def test_memory_query_優先於_text():
     assert mem.queries == ["嗨", "沒有 metadata"]
 
 
+async def test_memory_retrieve_kwargs_透傳給記憶retrieve():
+    seen: list[dict] = []
+
+    class KwMemory(FakeMemory):
+        async def retrieve(self, text, **kw):
+            seen.append(kw)
+            return await super().retrieve(text)
+
+    stage = LLMThinkStage(FakeBackend(delay_s=0.001), memory=KwMemory())
+    await _run_turn(stage, "嗨", None, metadata={"memory_retrieve_kwargs": {"shared_turn": True}})
+    await _run_turn(stage, "再嗨", None)
+    assert seen == [{"shared_turn": True}, {}]
+
+
 async def test_同turn_id重生成_沿用注入且不重複retrieve():
     backend = FakeBackend(delay_s=0.001)
     mem = FakeMemory()

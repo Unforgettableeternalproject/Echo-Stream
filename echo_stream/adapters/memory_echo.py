@@ -514,14 +514,18 @@ class EchoMemoryAdapter:
 
     # --- 管線介面 ---
 
-    async def retrieve(self, text: str) -> str | None:
+    async def retrieve(self, text: str, **engine_kwargs: Any) -> str | None:
         """檢索相關記憶，回傳可塞進 prompt 的文字；沒撈到就 None。
 
         同步引擎丟 executor——EcphoryRAG 的向量搜尋 + 圖擴散是 CPU 工作，
         不能讓它擋住 event loop 上正在流的音訊。
+
+        ``engine_kwargs``（例如 M5 的 ``shared_turn=True``）原樣透傳給 ``engine.retrieve``；
+        引擎簽名不認得的參數會略過並記 debug，舊版引擎照常運作。
         """
         if not text or not text.strip():
             return None
+        extra = self._accepted_kwargs(getattr(self.engine, "retrieve", None), engine_kwargs)
 
         def _work() -> str | None:
             context = self.engine.retrieve(
@@ -529,6 +533,7 @@ class EchoMemoryAdapter:
                 top_k=self.top_k,
                 min_similarity=self.min_match,
                 exclude_session_id=self._session_id,
+                **extra,
             )
             # 第二道門檻：EcphoryRAG 圖擴散出來的 episode 在 similarity_to_query
             # 回 None 時不會被 min_similarity 擋（2026-08-22 實測注入了 30-36%
@@ -561,6 +566,23 @@ class EchoMemoryAdapter:
             return rendered
 
         return await self._run(_work)
+
+    @staticmethod
+    def _accepted_kwargs(fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """只留下 ``fn`` 簽名接受的 kwargs（有 ``**kwargs`` 就全收）；簽名讀不到時全收。"""
+        if not kwargs:
+            return {}
+        try:
+            params = inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            return dict(kwargs)
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return dict(kwargs)
+        kept = {k: v for k, v in kwargs.items() if k in params}
+        dropped = set(kwargs) - set(kept)
+        if dropped:
+            logger.debug("memory retrieve：引擎不支援參數 %s，略過", sorted(dropped))
+        return kept
 
     _CONTEXT_KEEP = 8
 
