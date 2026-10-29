@@ -181,14 +181,6 @@ async def test_正常播完_spoken等於generated_且drain前不結算() -> None
     assert env.think.history[-1] == {"role": "assistant", "content": RESPONSE}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "PipelineRunner._resolve_spoken 的註解與 docstring 都說「部分播出一律算作已播出」，"
-        "但比較的是 chunk 的『結尾』累積時長（cumulative <= played）而非起點，"
-        "播到句中的那一句會被算成沒聽到——LLM 下一輪會重複講已經講過的半句。"
-    ),
-)
 @pytest.mark.parametrize(
     ("played", "expected"),
     [(0.4, S0), (1.5, S0 + S1)],
