@@ -12,6 +12,7 @@ import time
 from collections.abc import AsyncIterator
 
 from ..contracts.cancellation import CancellationToken
+from ..contracts.output import PlayedEvidence
 from ..contracts.types import STT_SAMPLE_RATE, TTS_SAMPLE_RATE, AudioChunk
 
 
@@ -122,6 +123,27 @@ class FakeAudioSink:
             return self.written_duration_s
         elapsed = time.perf_counter() - self._start_at
         return min(self.written_duration_s, elapsed)
+
+    # --- 選用能力（見 contracts.output.OptionalSinkCapabilities）---
+
+    played_evidence = PlayedEvidence.PLAYBACK_CONFIRMED
+    """fake 以真實時間模擬播放游標，視同播放確認。"""
+
+    @property
+    def first_frame_at(self) -> float | None:
+        """第一個 chunk 寫入的時刻；尚未寫入為 None。"""
+        return self._start_at
+
+    @property
+    def is_active(self) -> bool:
+        """已開始出聲、未被 stop、且緩衝尚未播完。"""
+        if self._stopped or self._start_at is None:
+            return False
+        return self._compute_played() < self.written_duration_s
+
+    async def confirm_stopped(self) -> None:
+        """fake 的 stop 當下就確定播放量，無需等待。"""
+        return
 
     def reset(self) -> None:
         self.chunks.clear()
