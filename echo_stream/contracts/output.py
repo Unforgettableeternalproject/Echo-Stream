@@ -31,7 +31,7 @@ T-07b PR ①：只定義型別、Protocol 與常數，**不含執行機制**—�
 from __future__ import annotations
 
 import time
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol
@@ -97,6 +97,11 @@ class SkipReason:
     TTS_NOT_READY = "tts_not_ready"
     DROPPED_BUSY = "dropped_busy"
     VOIDED = "voided"
+    MODE_SILENT = "mode_silent"
+    """``ModeFlags.speak`` 為 False：這一輪只產文字、不出聲。"""
+
+    NO_AUDIO = "no_audio"
+    """有可唸文字但一個音訊 chunk 都沒產出（TTS 失敗或空輸出）。"""
 
 
 class CommitMode(str, Enum):
@@ -218,6 +223,10 @@ class ModeFlags:
     barge_in: bool = True
     """False = 這一輪不可被插話打斷。"""
 
+    supersede_same_owner: bool = True
+    """True = 同一 owner、同 ``reply_mode`` 的新回覆會取代這個 owner 還沒結束的舊回覆。
+    ES 不認得 ``reply_mode`` 的語意（例如 passive），由宿主的 ModeRules 決定哪些模式參與取代。"""
+
 
 class ModeRules(Protocol):
     """``reply_mode``（不透明字串）→ 機制旗標。同步、純計算，建立 turn 時評估一次。"""
@@ -294,6 +303,9 @@ class TurnView(Protocol):
     behind_playing: bool
     """前一輪正在出聲。"""
 
+    sink_active: bool
+    """這一輪的 sink 已開始出聲且未結束（barge-in 武裝條件）。排隊中為 False。"""
+
     barge_users: set[str]
     """可打斷這一輪的說話者；宿主可在生成中動態加入。"""
 
@@ -367,6 +379,10 @@ class TurnRequest:
     ticket: TurnTicket
     utterance: Utterance
     sink_factory: SinkFactory
+    barge_users: Collection[str] = ()
+    """可打斷這一輪的說話者初值（宿主通常放 owner 與回覆對象）。空 = 不限制說話者
+    （僅限快照未過期時；過期則沒有人能插話）。生成中可再用 ``handle.add_barge_user`` 追加。"""
+
     spoken_rule: SpokenRule = SpokenRule.AUTO
     commit_mode: CommitMode = CommitMode.SETTLED
     text_filter: SpeechTextFilter | None = None
@@ -397,6 +413,11 @@ class TurnOutcome(TurnResult):
 
     status: OutcomeStatus = OutcomeStatus.COMPLETED
     """結束路徑；每個 submit 恰好一個 outcome。"""
+
+    spoken_known: bool = True
+    """``spoken_text`` 是否為確知資料。False = 沒有可推算的進度資訊（整句制無資料時），
+    此時 ``spoken_text`` 為空字串但語意是「未知」，不等於「什麼都沒播」——
+    宿主的補傳邏輯（例如 None → 補全文）靠這個欄位區分。"""
 
     barge_in: bool = False
     superseded: bool = False

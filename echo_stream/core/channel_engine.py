@@ -128,6 +128,7 @@ class VoiceChannel:
 
         event = self.vad.process(chunk)
         event.is_voiced = event.state is VoiceState.SPEECH
+        event.chunk_s = (len(chunk) // 2) / sample_rate
         if self.speaker_id is not None:
             # 多聲道：帶上說話者，時間戳改用呼叫端的牆鐘（宿主用它累積讓位／插話秒數）
             event.speaker_id = self.speaker_id

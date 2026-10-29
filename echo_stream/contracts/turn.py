@@ -80,6 +80,10 @@ class VoiceEvent:
     is_voiced: bool = False
     """VAD 對此 chunk 的判定（狀態為 SPEECH）。多聲道宿主據此累積說話秒數。"""
 
+    chunk_s: float = 0.0
+    """這個事件涵蓋的音訊秒數（**增量**，與 ``duration_s`` 的「狀態已持續多久」不同）。
+    累積式 barge-in 加總的是這個值；0 = 未提供（策略退回用時間戳差推算）。"""
+
 
 @dataclass(slots=True)
 class TurnDecision:
