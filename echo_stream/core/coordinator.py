@@ -97,6 +97,9 @@ _END = object()
 _CANCELLED = object()
 """句子佇列的內部標記：結束、取消。"""
 
+TEXT_TIMEOUT_S = 30.0
+"""結算前等 ``on_sentence`` 送完文字的上限（逾時就放棄剩餘句子，不擋 outcome）。"""
+
 REASON_CASCADE = "cascade"
 REASON_OWNER = "superseded_by_owner"
 REASON_YIELDED = "yielded"
@@ -289,6 +292,7 @@ class TurnCoordinator:
         cascade_cancel_queued: bool = True,
         play_timeout_s: float = PLAY_TIMEOUT_S,
         idle_timeout_s: float = IDLE_TIMEOUT_S,
+        text_timeout_s: float = TEXT_TIMEOUT_S,
         clock: Callable[[], float] = time.perf_counter,
     ) -> None:
         self.think = think_stage
@@ -303,6 +307,7 @@ class TurnCoordinator:
         self._cascade = cascade_cancel_queued
         self._play_timeout_s = play_timeout_s
         self._idle_timeout_s = idle_timeout_s
+        self._text_timeout_s = text_timeout_s
         self._clock = clock
 
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -439,7 +444,7 @@ class TurnCoordinator:
             tasks = [t._task for t in list(self._live) if t._task is not None]
             if not tasks:
                 return
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.wait(tasks)  # 不用 gather：外層被取消時不該連帶取消各輪 task
 
     async def aclose(self) -> None:
         self.cancel_all("shutdown")
@@ -603,14 +608,15 @@ class TurnCoordinator:
             if not acq.done():
                 acq.cancel()
             await asyncio.gather(acq, cancel, return_exceptions=True)
-        got = acq.done() and not acq.cancelled() and acq.exception() is None
-        if got:
-            t._lock_state = "held"
-            if t._root.is_cancelled:
-                self._lock_done(t)
-                return False
-            return True
-        return False
+            if acq.done() and not acq.cancelled() and acq.exception() is None:
+                # 就算這裡正被外層取消，已拿到的鎖也要記帳，_run 的 finally 才會放掉
+                t._lock_state = "held"
+        if t._lock_state != "held":
+            return False
+        if t._root.is_cancelled:
+            self._lock_done(t)
+            return False
+        return True
 
     def _lock_done(self, t: TurnHandle) -> None:
         """離開 think 鎖系統（釋放或放棄等待），冪等。"""
@@ -741,9 +747,10 @@ class TurnCoordinator:
                     return "barged"
                 raise
         finally:
-            await self._close_attempt(att, feed, chunk_stream)
+            await self._close_attempt(t, att, feed, chunk_stream)
 
-    async def _close_attempt(self, att: _Attempt, feed, chunk_stream) -> None:
+    async def _close_attempt(self, t: TurnHandle, att: _Attempt, feed, chunk_stream) -> None:
+        root_cancelled = t._root.is_cancelled
         for stream in (chunk_stream, feed):
             aclose = getattr(stream, "aclose", None)
             if aclose is not None:
@@ -755,11 +762,33 @@ class TurnCoordinator:
                 await asyncio.gather(task, return_exceptions=True)
         worker = att.text_worker
         if worker is not None:
-            if att.regen_utt is not None:
-                worker.cancel()  # 被丟棄的趟：還沒送出的文字不送
+            if att.regen_utt is not None or root_cancelled:
+                # 被丟棄的趟、整輪作廢（取代／讓位／shutdown）：還沒送出的文字不送
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
             elif att.text_q is not None:
+                # 正常結束與 barge-in 要把文字送完，但不在這裡等：
+                # 排空放到釋放播放位置與鎖之後（見 _drain_text）
                 att.text_q.put_nowait(None)
-            await asyncio.gather(worker, return_exceptions=True)
+
+    async def _drain_text(self, t: TurnHandle, att: _Attempt) -> None:
+        """等文字回呼送完剩餘句子（有逾時；整輪被作廢則放棄）。"""
+        worker = att.text_worker
+        if worker is None or worker.done():
+            return
+        canceller = asyncio.ensure_future(t._root.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {worker, canceller}, timeout=self._text_timeout_s,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if worker not in done:
+                if canceller not in done:
+                    _log.warning("on_sentence 逾時（%.0fs），放棄剩餘句子", self._text_timeout_s)
+                worker.cancel()
+        finally:
+            canceller.cancel()
+            await asyncio.gather(worker, canceller, return_exceptions=True)
 
     # --- 生成端 ---
 
@@ -876,6 +905,14 @@ class TurnCoordinator:
         if att.text_q is None:
             att.text_q = asyncio.Queue()
             att.text_worker = asyncio.ensure_future(self._text_worker(t, att, callback))
+            worker = att.text_worker
+
+            def _stop_text(reason: CancelReason) -> None:
+                # 整輪作廢（取代／讓位／shutdown）或 regen 丟棄：立刻停止送出剩餘句子
+                if reason is not CancelReason.UPSTREAM_ERROR:
+                    worker.cancel()
+
+            att.token.on_cancel(_stop_text)
         att.text_q.put_nowait(sentence)
 
     @staticmethod
@@ -1058,7 +1095,10 @@ class TurnCoordinator:
         elif req.commit_mode is CommitMode.SETTLED:
             with contextlib.suppress(Exception):
                 await self.think.commit(tid, spoken, generated)
-        elif req.history_spoken_only and t._eager_committed and settle is not None:
+        elif (
+            req.history_spoken_only and t._eager_committed and settle is not None
+            and known and att.wrote_any  # 未出聲或進度未知時不改寫，免得把整輪 assistant 項刪掉
+        ):
             with contextlib.suppress(Exception):
                 await settle(tid, spoken, generated)
 
@@ -1118,7 +1158,8 @@ class TurnCoordinator:
             attempt_id=t._attempt_no,
             snapshot_version=t._snapshot_version,
         )
-        self._lock_done(t)  # SETTLED：commit 完才放鎖
+        self._lock_done(t)  # SETTLED：commit 完才放鎖（播放位置早已讓出）
+        await self._drain_text(t, att)
         self._deliver(t, outcome)
 
     # --- outcome 出口 ---

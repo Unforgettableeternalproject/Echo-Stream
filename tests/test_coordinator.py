@@ -795,3 +795,113 @@ async def test_whole_turn_cancel_after_barge_in_still_works() -> None:
     assert h.token.is_cancelled and out.cancel_reason == CancelReason.SHUTDOWN.value
     assert out.generated_text != FULL
     mid.set()
+
+
+# ───────────────────────── on_sentence 文字回呼的排空 ─────────────────────────
+
+
+async def test_whole_turn_cancel_stops_pending_text_delivery() -> None:
+    env = build()
+    block = asyncio.Event()
+    sent: list[str] = []
+
+    async def on_sentence(_view, sentence: Sentence) -> None:
+        sent.append(sentence.text)
+        await block.wait()  # 第一句卡住（例如平台限流），其餘句子排在佇列裡
+
+    r, sink = env.req("A", on_sentence=on_sentence)
+    h = env.co.submit(r)
+    await playing(sink)
+    await until(lambda: len(sent) == 1)
+    env.co.cancel_all("left")  # 整輪作廢：剩餘句子不再送出
+    block.set()
+    out = await settled(h)
+    assert out.cancel_reason == CancelReason.SHUTDOWN.value
+    assert sent == [S0]
+
+
+async def test_barge_in_still_delivers_all_text() -> None:
+    env = build()
+    block = asyncio.Event()
+    sent: list[str] = []
+
+    async def on_sentence(_view, sentence: Sentence) -> None:
+        sent.append(sentence.text)
+        await block.wait()
+
+    r, sink = env.req("A", on_sentence=on_sentence)
+    h = env.co.submit(r)
+    await playing(sink)
+    await until(lambda: len(sent) == 1)
+    for k in range(4):
+        env.co.on_voice_event(voiced(1.0 + 0.5 * k))
+    block.set()
+    out = await settled(h)
+    assert out.barge_in and "".join(sent) == RESPONSE  # 補傳需要完整文字
+
+
+async def test_stuck_on_sentence_does_not_block_next_turn_or_lock() -> None:
+    env = build()
+    block = asyncio.Event()
+
+    async def on_sentence(_view, _sentence: Sentence) -> None:
+        await block.wait()
+
+    ra, sink_a = env.req("A", owner="u1", on_sentence=on_sentence, commit=CommitMode.SETTLED)
+    ha = env.co.submit(ra)
+    rb, sink_b = env.req("B", owner="u2", barge=("u2",))
+    hb = env.co.submit(rb)
+    await playing(sink_a)
+    sink_a.finish()  # A 播完；文字回呼還卡著
+    await until(lambda: len(env.commits) == 1)  # SETTLED 已 commit、放鎖，B 開始生成
+    await playing(sink_b)  # B 不被 A 卡住的文字回呼擋住
+    assert not ha.settled.done()  # A 的 outcome 還在等文字送完
+    block.set()
+    assert (await settled(ha)).status is OutcomeStatus.COMPLETED
+    sink_b.finish()
+    await settled(hb)
+
+
+async def test_text_timeout_gives_up_remaining_sentences() -> None:
+    env = build(text_timeout_s=0.01)
+
+    async def on_sentence(_view, _sentence: Sentence) -> None:
+        await asyncio.Event().wait()
+
+    r, sink = env.req("A", on_sentence=on_sentence)
+    h = env.co.submit(r)
+    await playing(sink)
+    sink.finish()
+    assert (await settled(h)).status is OutcomeStatus.COMPLETED
+
+
+async def test_history_spoken_only_does_not_erase_when_progress_unknown() -> None:
+    env = build()
+    class NoProgressSink(ManualSink):
+        @property
+        def played_duration_s(self):  # type: ignore[override]
+            return None  # 沒有實播進度
+
+    sink = NoProgressSink(env.log)
+    ra, _ = env.req("A", sink=sink, history_spoken_only=True)
+    ha = env.co.submit(ra)
+    await playing(sink)  # 整句制拿不到進度 -> spoken_known=False
+    for k in range(4):
+        env.co.on_voice_event(voiced(1.0 + 0.5 * k))
+    out = await settled(ha)
+    assert out.barge_in and not out.spoken_known
+    assert env.think.history[-1] == {"role": "assistant", "content": RESPONSE}  # 沒有被刪掉
+
+
+async def test_join_cancellation_does_not_cancel_turns() -> None:
+    env = build()
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    await playing(sink)
+    joiner = asyncio.ensure_future(env.co.join())
+    await asyncio.sleep(0)
+    joiner.cancel()
+    await asyncio.gather(joiner, return_exceptions=True)
+    assert not h.token.is_cancelled and not h._task.cancelled()
+    sink.finish()
+    assert (await settled(h)).status is OutcomeStatus.COMPLETED
