@@ -51,6 +51,7 @@ from typing import Any
 
 from .. import config, defaults
 from ..contracts.cancellation import CancellationToken, CancelledError, CancelReason
+from ..contracts.output import PlayedEvidence
 from ..contracts.style import EMOTION_DIMENSIONS, SpeechStyle
 from ..contracts.types import STT_SAMPLE_RATE, AudioChunk, Utterance
 from ..core import emotion
@@ -1760,13 +1761,32 @@ class _EmitSink:
         self._stop_confirm_timeout_s = stop_confirm_timeout_s
         self.written_duration_s = 0.0
         self._stopped = False
+        self._drained = False
+        self._first_frame_at: float | None = None
         self._seen_sentences: set[int] = set()
+
+    # --- 選用能力（見 contracts.output.OptionalSinkCapabilities）---
+
+    played_evidence = PlayedEvidence.PLAYBACK_CONFIRMED
+    """played_duration_s 取自瀏覽器 ACK 的實播量。"""
+
+    @property
+    def first_frame_at(self) -> float | None:
+        """第一段音訊送進 HTTP response 的時刻；尚未寫入為 None。"""
+        return self._first_frame_at
+
+    @property
+    def is_active(self) -> bool:
+        """已送出首段音訊、未被 stop、且 drain 尚未結束。"""
+        return self._first_frame_at is not None and not self._stopped and not self._drained
 
     async def write(self, chunk: AudioChunk) -> None:
         if self._stopped:
             return
         index = self._playback.add_chunk(chunk.duration_s)
         self.written_duration_s += chunk.duration_s
+        if self._first_frame_at is None:
+            self._first_frame_at = time.perf_counter()
         if index == 0:
             await _emit(self._emit, json_frame(FRAME_AUDIO_BEGIN, {
                 "generation": self._playback.generation,
@@ -1794,7 +1814,10 @@ class _EmitSink:
             if self._flush_after_end
             else None
         )
-        await self._playback.drain(self._emit, timeout_s, flush)
+        try:
+            await self._playback.drain(self._emit, timeout_s, flush)
+        finally:
+            self._drained = True
 
     async def confirm_stopped(self) -> None:
         """停止後等前端確認最終實播量（有時限）；PipelineRunner 在推算

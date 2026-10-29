@@ -145,6 +145,16 @@ class TurnPhase(str, Enum):
     FAILED = "failed"
 
 
+@dataclass(frozen=True, slots=True)
+class SentenceSpan:
+    """一句話在實播時間軸上的區間（秒）。"""
+
+    index: int
+    text: str
+    start_s: float
+    end_s: float
+
+
 @dataclass(slots=True)
 class TurnResult:
     """一個 turn 結束後的摘要。
@@ -167,3 +177,20 @@ class TurnResult:
     cancel_reason: str | None = None
     error: str | None = None
     metadata: dict = field(default_factory=dict)
+
+    # --- 輸出端協調（T-07b）追加欄位：全是加法，預設值不影響既有呼叫 ---
+
+    skipped_reason: str | None = None
+    """這一輪沒出聲的原因（pass / no_spoken_text / tts_not_ready ...）。None = 有進入播放。"""
+
+    cut_short: bool = False
+    """播放被中途截斷（spoken 少於 generated）。"""
+
+    audio_started: bool = False
+    """是否已有真音訊交給 sink。"""
+
+    first_audio_at: float | None = None
+    """首個真音訊 frame 的 perf_counter 時刻；取不到為 None。"""
+
+    sentence_spans: list[SentenceSpan] = field(default_factory=list)
+    """各句在實播時間軸上的區間，供記憶層自行計算已播範圍。"""
