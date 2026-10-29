@@ -367,12 +367,15 @@ class PipelineRunner:
                 )
 
         max_index = -1
+        chunk_start = 0.0
         for sentence_index, cumulative in timeline:
             # 只要這個 chunk 的起點在播放範圍內，就算聽到了一部分
-            if cumulative - 1e-9 <= played or sentence_index <= max_index:
+            # （timeline 記的是 chunk 結尾累積時長，起點 = 前一個 chunk 的結尾）
+            if chunk_start + 1e-9 < played or sentence_index <= max_index:
                 max_index = max(max_index, sentence_index)
             else:
                 break
+            chunk_start = cumulative
 
         if max_index < 0:
             return "", played
