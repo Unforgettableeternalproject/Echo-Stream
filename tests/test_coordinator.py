@@ -165,9 +165,9 @@ async def test_barge_in_cascades_to_queued_unstarted_turns() -> None:
     # barge-in 只累積 A 的指定使用者；1.5s 不停、2.0s 停
     for k in range(3):
         env.co.on_voice_event(voiced(1.0 + 0.5 * k))
-    assert not ha.token.is_cancelled
+    assert not ha.voice_token.is_cancelled
     env.co.on_voice_event(voiced(2.5))
-    assert ha.token.is_cancelled
+    assert ha.voice_token.is_cancelled and not ha.token.is_cancelled  # 只停語音，think 不取消
 
     out_a, out_b = await settled(ha), await settled(hb)
     assert out_a.status is OutcomeStatus.CANCELLED and out_a.barge_in and out_a.cut_short
@@ -287,7 +287,7 @@ async def test_on_voice_event_from_other_threads_stops_sync_and_cancels_once() -
     await playing(sink)
 
     cancels: list[int] = []
-    ha.token.on_cancel(lambda _r: cancels.append(threading.get_ident()))
+    ha.voice_token.on_cancel(lambda _r: cancels.append(threading.get_ident()))
     loop_thread = threading.get_ident()
     caller_threads: list[int] = []
 
@@ -302,7 +302,7 @@ async def test_on_voice_event_from_other_threads_stops_sync_and_cancels_once() -
     )
     # stop 在「第一個命中的呼叫執行緒」同步發生（早於 token 取消回到 loop）
     assert sink.stop_threads[0] in caller_threads and sink.stop_threads[0] != loop_thread
-    await until(lambda: ha.token.is_cancelled)
+    await until(lambda: ha.voice_token.is_cancelled)
     assert cancels == [loop_thread]  # token 只取消一次，且在 loop 內
     out = await settled(ha)
     assert out.barge_in
@@ -692,3 +692,106 @@ async def test_yield_policy_is_called_and_stale_snapshot_disables_it() -> None:
     out = await settled(h)
     assert out.metadata["reason_code"] == "yielded"
     gate.set()
+
+
+# ───────────────────────── barge-in 只停語音、不停生成 ─────────────────────────
+
+
+class SplitBackend(ScriptBackend):
+    """第一句之後卡在閘門上，用來把「生成途中」與「播放中」重疊。"""
+
+    def __init__(self, mid: asyncio.Event) -> None:
+        super().__init__(("",))
+        self.mid = mid
+
+    async def stream_query(self, messages, system_instruction=None, **kwargs):
+        self.calls.append(list(messages))
+        for ch in SENTENCES[0]:
+            yield ch
+        await self.mid.wait()
+        for ch in "".join(SENTENCES[1:3]):
+            yield ch
+
+
+def build_split(**kw) -> tuple[Env, asyncio.Event]:
+    mid = asyncio.Event()
+    env = build(**kw)
+    backend = SplitBackend(mid)
+    backend.stage = env.think
+    env.think._backend = backend
+    env.backend = backend
+    return env, mid
+
+
+FULL = "".join(SENTENCES[:3])
+
+
+@pytest.mark.parametrize("mode", [CommitMode.EAGER, CommitMode.SETTLED])
+async def test_barge_in_stops_voice_but_think_runs_to_completion(mode: CommitMode) -> None:
+    env, mid = build_split()
+    r, sink = env.req("A", commit=mode)
+    h = env.co.submit(r)
+    await until(lambda: len(sink.chunks) == 1)  # 第一句已在播，其餘文字還沒生成
+    sink.play(1.0)
+    for k in range(4):
+        env.co.on_voice_event(voiced(1.0 + 0.5 * k))
+    assert h.voice_token.is_cancelled and sink.stopped
+    assert not h.token.is_cancelled  # think 不受影響
+    assert not h.generation_done.done()
+    mid.set()  # 之後的文字照常生成
+    out = await settled(h)
+    assert out.barge_in and out.status is OutcomeStatus.CANCELLED and out.cut_short
+    assert out.generated_text == FULL  # 完整文字可供補傳
+    # 整句制：被打斷時唯一一句的後半不確知（後面沒有別句音訊），不算已播
+    assert out.spoken_text == "" and out.spoken_known
+    assert len(sink.chunks) == 1 and sink.writes_after_stop == 0  # 不再 write
+    assert env.speak.seen == [0]  # TTS 不再被拉取
+    _tid, spoken, generated = env.commits[0]
+    assert generated == FULL
+    assert spoken == (FULL if mode is CommitMode.EAGER else "")  # EAGER 文字完成即 commit 全文
+    assert len(env.commits) == 1
+
+
+@pytest.mark.parametrize("how", ["void", "cancel_all", "owner"])
+async def test_whole_turn_cancels_still_stop_think(how: str) -> None:
+    env, mid = build_split()
+    r, sink = env.req("A", owner="u1")
+    h = env.co.submit(r)
+    await until(lambda: len(sink.chunks) == 1)
+    if how == "void":
+        # 讓位只作用於未開播的輪；這裡改用還沒出聲的第二輪驗證 think 被停
+        env2, mid2 = build_split()
+        r2, sink2 = env2.req("B")
+        env2.speak.open_all = False
+        h2 = env2.co.submit(r2)
+        await until(lambda: len(env2.backend.calls) == 1)
+        assert env2.co.void(h2.turn_id) is True
+        out2 = await settled(h2)
+        assert h2.token.is_cancelled and out2.generated_text != FULL
+        assert sink2.chunks == []
+        mid2.set()
+        env.co.cancel_all()
+    elif how == "cancel_all":
+        env.co.cancel_all("left")
+    else:
+        r3, _ = env.req("二", owner="u1")
+        env.co.submit(r3)
+    out = await settled(h)
+    assert h.token.is_cancelled and out.generated_text != FULL  # think 被停在中途
+    assert out.status is OutcomeStatus.CANCELLED
+    mid.set()
+
+
+async def test_whole_turn_cancel_after_barge_in_still_works() -> None:
+    env, mid = build_split()
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    await until(lambda: len(sink.chunks) == 1)
+    for k in range(4):
+        env.co.on_voice_event(voiced(1.0 + 0.5 * k))
+    assert h.voice_token.is_cancelled and not h.token.is_cancelled
+    env.co.cancel_all("left")  # barge-in 之後仍可整輪作廢
+    out = await settled(h)
+    assert h.token.is_cancelled and out.cancel_reason == CancelReason.SHUTDOWN.value
+    assert out.generated_text != FULL
+    mid.set()

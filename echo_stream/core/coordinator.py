@@ -16,12 +16,15 @@
 
 ## 取消（見草案 §7）
 
-任何取消都先「認領」（per turn 只成功一次），再同步 ``sink.stop()``，最後取消 token：
+每輪有兩層 token：整輪 token（think 用）與其下游的語音 token（speak／sink 用）。
+取消先「認領」（per turn 只成功一次），再同步 ``sink.stop()``，最後取消 token：
 
-* barge-in：``BARGE_IN``；排在後面還沒開播的輪連帶取消（detail ``cascade``）
+* barge-in：``BARGE_IN``，**只取消語音 token**（停播、停 TTS），think 照常生成到完，
+  完整文字在 outcome 供補傳（同 bot 的 ``token.child()``）；排在後面還沒開播的輪
+  的語音連帶取消（detail ``cascade``）。barge-in 之後仍可再整輪作廢
 * 讓位 ``void()``：``SUPERSEDED`` + detail ``yielded``；已開播的輪不處理（回 False）
 * 同 owner 新回覆：``SUPERSEDED`` + detail ``superseded_by_owner``
-* ``cancel_all()``：``SHUTDOWN``，不 commit、不 settle
+* ``cancel_all()``：``SHUTDOWN``，整輪作廢（think 也停），不 commit、不 settle
 
 ## 執行緒
 
@@ -110,16 +113,22 @@ class _Attempt:
     """一趟生成（regen 時同一輪會有多趟）。每趟有自己的 sink、token 與記帳。"""
 
     __slots__ = (
-        "utterance", "token", "sink", "attempt_id", "direct",
+        "utterance", "token", "voice", "sink", "attempt_id", "direct",
         "generated", "voiced", "sent_audio", "timeline", "emitted",
         "buffer", "first_write_at", "wrote_any", "idle_done",
         "passed", "regen_utt", "flusher", "text_q", "text_worker",
         "pump", "pump_error",
     )
 
-    def __init__(self, utterance, token, sink, attempt_id: int, direct: bool) -> None:
+    def __init__(self, utterance, token, voice, sink, attempt_id: int, direct: bool) -> None:
         self.utterance = utterance
         self.token: CancellationToken = token
+        """整輪 token（think 用）：取代、讓位、shutdown 等整輪作廢時取消。"""
+
+        self.voice: CancellationToken = voice
+        """語音 token（speak、sink、drain 用），是整輪 token 的下游：
+        barge-in 只取消它——停播與 TTS，但 think 照常生成到完（同 bot 的 token.child()）。"""
+
         self.sink: AudioSink | None = sink
         self.attempt_id = attempt_id
         self.direct = direct
@@ -181,6 +190,9 @@ class TurnHandle:
         self._snapshot_version = snapshot_version
         self._stale = stale
         self._root = CancellationToken()
+        self._voice_root = CancellationToken(parent=self._root)
+        self._voice_claimed = False
+        self._voice_detail = ""
         self._att: _Attempt | None = None
         self._first_sink: AudioSink | None = None
         self._skip_reason: str | None = None
@@ -219,7 +231,7 @@ class TurnHandle:
         att = self._att
         if att is None or att.sink is None:
             return False
-        fallback = att.first_write_at is not None and not att.token.is_cancelled
+        fallback = att.first_write_at is not None and not att.voice.is_cancelled
         return sink_is_active(att.sink, fallback=fallback)
 
     @property
@@ -240,6 +252,11 @@ class TurnHandle:
     def token(self) -> CancellationToken:
         """目前這趟生成的 token（regen 時每趟新建）。"""
         return self._att.token if self._att is not None else self._root
+
+    @property
+    def voice_token(self) -> CancellationToken:
+        """目前這趟的語音 token（barge-in 只取消它；think 用 :attr:`token`）。"""
+        return self._att.voice if self._att is not None else self._voice_root
 
     def add_barge_user(self, user_id: str) -> None:
         """生成中追加可打斷這輪的說話者（對應 bot 的 addressee_ids）。"""
@@ -368,7 +385,7 @@ class TurnCoordinator:
         if not live:
             return
         for t in live:
-            if t._cancel_claimed or not t.flags.barge_in:
+            if t._cancel_claimed or t._voice_claimed or not t.flags.barge_in:
                 continue
             try:
                 decision = self._barge.on_voiced(t, ev)
@@ -461,21 +478,45 @@ class TurnCoordinator:
         if cascade and self._cascade:
             self._cancel_queued_after(t)
 
+    def _claim_voice(self, t: TurnHandle, detail: str) -> bool:
+        """認領語音取消權（barge-in）：每輪只成功一次，與整輪取消的認領互不影響。"""
+        with t._cancel_lock:
+            if t._voice_claimed or t._cancel_claimed:
+                return False
+            t._voice_claimed = True
+            t._voice_detail = detail
+        return True
+
     def _barge_in(self, t: TurnHandle) -> None:
-        if not self._claim(t, CancelReason.BARGE_IN, "voice"):
+        """插話：呼叫執行緒同步停 sink，語音 token 取消回 loop；think 不受影響。"""
+        if not self._claim_voice(t, "voice"):
             return
-        self._dispatch(t, cascade=True)
+        if self._on_loop_thread():
+            self._cancel_voice_in_loop(t, True)
+            return
+        att = t._att
+        _stop_sink(att.sink if att is not None else t._first_sink)
+        loop = self._loop
+        if loop is not None:
+            loop.call_soon_threadsafe(self._cancel_voice_in_loop, t, True)
+
+    def _cancel_voice_in_loop(self, t: TurnHandle, cascade: bool) -> None:
+        att = t._att
+        _stop_sink(att.sink if att is not None else t._first_sink)
+        t._voice_root.cancel(CancelReason.BARGE_IN, t._voice_detail)
+        if cascade and self._cascade:
+            self._cancel_queued_after(t)
 
     def _cancel_queued_after(self, interrupted: TurnHandle) -> None:
-        """正在播的輪被插話：排在後面、還沒開播的輪一併取消（在 loop 內執行）。"""
+        """正在播的輪被插話：排在後面、還沒開播的輪的語音一併取消（文字照常生成）。"""
         if interrupted not in self._live:
             return
         later = self._live[self._live.index(interrupted) + 1:]
         for o in later:
             if o._done or o._play_done.is_set() or o.audio_started:
                 continue
-            if self._claim(o, CancelReason.BARGE_IN, REASON_CASCADE):
-                self._cancel_in_loop(o, False)
+            if self._claim_voice(o, REASON_CASCADE):
+                self._cancel_voice_in_loop(o, False)
 
     def _supersede_owner(self, new: TurnHandle) -> None:
         if not (self._supersede_same_owner and new.flags.supersede_same_owner):
@@ -591,7 +632,9 @@ class TurnCoordinator:
             t._skip_reason = skip
         pred = t._predecessor
         direct = pred is None or pred._play_done.is_set()
-        return _Attempt(utterance, t._root.child(), sink, t._attempt_no, direct)
+        return _Attempt(
+            utterance, t._root.child(), t._voice_root.child(), sink, t._attempt_no, direct
+        )
 
     async def _produce(self, t: TurnHandle) -> None:
         req = t.request
@@ -609,7 +652,10 @@ class TurnCoordinator:
             while True:
                 att = self._new_attempt(t, utt)
                 t._att = att
-                if await self._run_attempt(t, att) != "regen":
+                result = await self._run_attempt(t, att)
+                if result == "barged":
+                    phase = TurnPhase.CANCELLED  # 語音被插話截斷，文字已生成完
+                if result != "regen":
                     break
                 _stop_sink(att.sink)
                 t.regenerated += 1
@@ -626,18 +672,6 @@ class TurnCoordinator:
                 self._cancel_in_loop(t, False)
 
         assert att is not None
-        if (
-            phase is TurnPhase.CANCELLED
-            and req.commit_mode is CommitMode.EAGER
-            and not t._eager_committed
-            and t._cancel_reason is CancelReason.BARGE_IN
-        ):
-            # 生成途中被插話：文字只生成到一半，已送出的部分照 EAGER 語意先寫進歷史
-            generated = self._generated_text(att)
-            t._eager_committed = True
-            with contextlib.suppress(Exception):
-                await self.think.commit(tid, generated, generated)
-
         if req.commit_mode is CommitMode.EAGER:
             self._lock_done(t)  # EAGER：commit 之後下一輪就能開始生成
         self._resolve_gen_done(t)
@@ -652,7 +686,7 @@ class TurnCoordinator:
         下一輪的 LLM 不必等這一輪的合成與播放。
         """
         tid = t.turn_id
-        token = att.token
+        token = att.voice
         sink = att.sink
         if sink is not None:
             token.on_cancel(lambda _r, s=sink: _stop_sink(s))
@@ -690,11 +724,21 @@ class TurnCoordinator:
                 if att.wrote_any:
                     await self._drain(t, att)
                 return "done"
-            except CancelledError:
+            except CancelledError as exc:
                 if att.regen_utt is not None and not t._root.is_cancelled:
                     return "regen"
                 if att.pump_error is not None:
                     raise att.pump_error from None
+                if not t._root.is_cancelled and token.is_cancelled and att.pump is not None:
+                    # barge-in 只停語音：讓 think 生成到完（EAGER 在此 commit 全文、釋放鎖）
+                    await att.pump
+                    if att.pump_error is not None:
+                        raise att.pump_error from None
+                    if t._root.is_cancelled:
+                        raise CancelledError(
+                            t._root.reason or exc.reason, t._root.detail
+                        ) from None
+                    return "barged"
                 raise
         finally:
             await self._close_attempt(att, feed, chunk_stream)
@@ -728,7 +772,7 @@ class TurnCoordinator:
                 return
             if item is _CANCELLED:
                 raise CancelledError(
-                    att.token.reason or CancelReason.SHUTDOWN, att.token.detail
+                    att.voice.reason or CancelReason.SHUTDOWN, att.voice.detail
                 )
             if isinstance(item, BaseException):
                 raise item
@@ -742,7 +786,9 @@ class TurnCoordinator:
         except Exception as exc:  # noqa: BLE001 - 含管線自己的 CancelledError
             if not isinstance(exc, CancelledError):
                 att.pump_error = exc
-                att.token.cancel(CancelReason.UPSTREAM_ERROR, f"{type(exc).__name__}: {exc}")
+                msg = f"{type(exc).__name__}: {exc}"
+                att.token.cancel(CancelReason.UPSTREAM_ERROR, msg)
+                att.voice.cancel(CancelReason.UPSTREAM_ERROR, msg)
             queue.put_nowait(exc)
             return
         queue.put_nowait(_END)
@@ -761,7 +807,9 @@ class TurnCoordinator:
                 self.tracer.count_sentence(tid, sentence.split_reason)
 
                 voiced: Sentence | None = sentence
-                if filt is not None and speaking:
+                if att.voice.is_cancelled:
+                    voiced = None  # 語音已被截斷：文字照常記帳，但不再餵語音支線
+                elif filt is not None and speaking:
                     try:
                         text = filt.feed(sentence.text)
                         passed = bool(filt.passed)
@@ -805,6 +853,7 @@ class TurnCoordinator:
                 # 沿用同一 turn_id；舊趟語音由 token 取消停掉，不 commit
                 att.regen_utt = dataclasses.replace(fresh, turn_id=req.utterance.turn_id)
                 att.token.cancel(CancelReason.SUPERSEDED, "regenerated")
+                att.voice.cancel(CancelReason.SUPERSEDED, "regenerated")
                 return
         await self._finish_generation(t, att)
 
@@ -845,7 +894,7 @@ class TurnCoordinator:
 
     async def _flush(self, t: TurnHandle, att: _Attempt) -> None:
         """等前一輪播完，把緩衝的音訊塊依序寫出，然後切成直寫模式。"""
-        token = att.token
+        token = att.voice
         pred = t._predecessor
         started = self._clock()
         if pred is not None and not pred._play_done.is_set():
@@ -911,7 +960,7 @@ class TurnCoordinator:
         """等 sink 播完，但保持可被取消；逾時視為 TIMEOUT 取消。"""
         sink = att.sink
         assert sink is not None
-        token = att.token
+        token = att.voice
         drain_task = asyncio.ensure_future(sink.drain())
         cancel_task = asyncio.ensure_future(token.wait())
         try:
@@ -975,8 +1024,13 @@ class TurnCoordinator:
         tid = t.turn_id
         sink = att.sink
         cancelled = phase is TurnPhase.CANCELLED
-        reason = t._cancel_reason if cancelled else None
-        detail = t._cancel_detail if cancelled else ""
+        reason: CancelReason | None = None
+        detail = ""
+        if cancelled:
+            if t._cancel_claimed:
+                reason, detail = t._cancel_reason, t._cancel_detail
+            elif t._voice_claimed:
+                reason, detail = CancelReason.BARGE_IN, t._voice_detail
         barge_in = reason is CancelReason.BARGE_IN
         superseded = cancelled and detail == REASON_OWNER
         aborted = cancelled and not (barge_in and detail != REASON_CASCADE)
