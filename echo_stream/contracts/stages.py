@@ -209,6 +209,19 @@ class ThinkStage(Protocol):
 
 
 @runtime_checkable
+class SettleCapable(Protocol):
+    """ThinkStage 的選用 hook：播放結算後修正已提交的歷史。
+
+    與 ``commit`` 搭配的兩階段模式（``CommitMode.EAGER``）：文字生成完先
+    ``commit(generated, generated)``，播放結算後再 ``settle`` 成實際聽到的內容。
+    不放進 :class:`ThinkStage` 本體——那會讓既有 stage 驗不過 isinstance。
+    呼叫端用 ``getattr(think, "settle", None)`` 探測，缺少即不修正歷史。
+    """
+
+    async def settle(self, turn_id: str, spoken_text: str, generated_text: str) -> None: ...
+
+
+@runtime_checkable
 class SpeakStage(Protocol):
     """句子流 → 音訊塊流。
 
