@@ -782,10 +782,16 @@ class TurnCoordinator:
                 {worker, canceller}, timeout=self._text_timeout_s,
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if worker not in done:
-                if canceller not in done:
-                    _log.warning("on_sentence 逾時（%.0fs），放棄剩餘句子", self._text_timeout_s)
-                worker.cancel()
+            if worker in done:
+                return
+            if canceller in done and t._root.reason is CancelReason.UPSTREAM_ERROR:
+                # 生成出錯不是「整輪作廢」：已生成的句子照樣送完（仍受逾時限制）
+                done, _ = await asyncio.wait({worker}, timeout=self._text_timeout_s)
+                if worker in done:
+                    return
+            if canceller not in done or t._root.reason is CancelReason.UPSTREAM_ERROR:
+                _log.warning("on_sentence 逾時（%.0fs），放棄剩餘句子", self._text_timeout_s)
+            worker.cancel()
         finally:
             canceller.cancel()
             await asyncio.gather(worker, canceller, return_exceptions=True)

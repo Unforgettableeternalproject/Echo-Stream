@@ -905,3 +905,35 @@ async def test_join_cancellation_does_not_cancel_turns() -> None:
     assert not h.token.is_cancelled and not h._task.cancelled()
     sink.finish()
     assert (await settled(h)).status is OutcomeStatus.COMPLETED
+
+
+async def test_failed_generation_still_delivers_generated_sentences() -> None:
+    """生成中途出錯（FAILED）不是整輪作廢：已生成的句子要照樣送完，即使回呼很慢。"""
+
+    class FailingBackend(ScriptBackend):
+        async def stream_query(self, messages, system_instruction=None, **kwargs):
+            self.calls.append(list(messages))
+            for ch in "".join(SENTENCES[:3]):
+                yield ch
+            raise RuntimeError("backend boom")
+
+    env = build()
+    backend = FailingBackend()
+    backend.stage = env.think
+    env.think._backend = backend
+    release = asyncio.Event()
+    sent: list[str] = []
+
+    async def on_sentence(_view, sentence: Sentence) -> None:
+        await release.wait()  # 慢回呼：句子都排在佇列裡時就遇到錯誤
+        sent.append(sentence.text)
+
+    r, _ = env.req("A", on_sentence=on_sentence)
+    h = env.co.submit(r)
+    await until(lambda: len(backend.calls) == 1)
+    await until(lambda: h._att is not None and h._att.pump is not None and h._att.pump.done())
+    release.set()
+    out = await settled(h)
+    assert out.status is OutcomeStatus.FAILED and "backend boom" in (out.error or "")
+    assert out.generated_text and out.generated_text in "".join(sent)
+    assert "".join(sent).startswith(SENTENCES[0])
