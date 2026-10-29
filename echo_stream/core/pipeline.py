@@ -127,8 +127,8 @@ class PipelineRunner:
         """被插話後的冷卻：等到 backoff 結束才開始這一輪（可被取消中斷）。
 
         語意取自 Vapi ``backoffSeconds``：被插話後機器人隔 N 秒才再開口。
-        放在 turn 起點而非首個音訊前，因為墊片音也是「開口」；代價是
-        這段時間 LLM 也不會先跑，只在剛被插話的下一輪發生。
+        只擋「開口」（墊片音啟動、第一個送進 sink 的音訊），LLM／TTS 照常
+        開跑，首音時間 = max(原本, 冷卻剩餘)，不犧牲 TTFA。
         """
         remaining = self._backoff_remaining_s()
         if remaining <= 0:
@@ -181,10 +181,8 @@ class PipelineRunner:
         error: str | None = None
 
         gap = self.gap_filler
-        try:
-            # 被插話後的冷卻：墊片音也算開口，所以排在墊片啟動之前
-            await self._wait_backoff(token)
 
+        def start_gap() -> None:
             # 墊片音：STT 完成就開始計時，真音訊來之前排進 sink（排隊，不打斷）
             if gap is not None:
                 gap.start(
@@ -195,6 +193,18 @@ class PipelineRunner:
                     language=utterance.language,
                 )
 
+        async def open_gate() -> None:
+            await self._wait_backoff(token)
+            start_gap()
+
+        # 被插話後的冷卻只擋「開口」：墊片音與第一個音訊 chunk 的 sink 寫入。
+        # 冷卻中 LLM／TTS 照常跑（產出的 chunk 由通道背壓暫存）
+        gate: asyncio.Future | None = None
+        if self._backoff_remaining_s() > 0:
+            gate = asyncio.ensure_future(open_gate())
+        else:
+            start_gap()
+        try:
             sentence_stream = self._trace_sentences(
                 self.think_stage.stream(utterance, token), turn_id, sentences
             )
@@ -202,6 +212,10 @@ class PipelineRunner:
 
             async for chunk in chunk_stream:
                 token.raise_if_cancelled()
+                if gate is not None:
+                    # 冷卻未結束就不碰 sink；等待中被取消會在此拋 CancelledError
+                    await gate
+                    gate = None
                 if gap is not None:
                     # 寫第一段真音訊之前先收掉墊片——它正在寫的那段要寫完，
                     # 之後不能再追加，否則 sink 裡會倒序
@@ -232,6 +246,9 @@ class PipelineRunner:
             error = f"{type(exc).__name__}: {exc}"
             token.cancel(CancelReason.UPSTREAM_ERROR, error)
         finally:
+            if gate is not None:
+                gate.cancel()
+                await asyncio.gather(gate, return_exceptions=True)
             if gap is not None:
                 await gap.stop()
             self._current_token = None

@@ -347,17 +347,33 @@ async def _interrupt_first_turn(runner: PipelineRunner, reason: CancelReason) ->
     await runner.run_turn(Utterance(text="你好"))
 
 
-async def test_backoff_期間內下一輪會被延後():
+async def test_backoff_冷卻只延後首個音訊_think_照常開跑():
     clock = FakeClock()
     runner = build_backoff_runner(2.0, clock)
     await _interrupt_first_turn(runner, CancelReason.BARGE_IN)
-    clock.now += 1.95  # 還剩 0.05s
-    assert 0.0 < runner._backoff_remaining_s() <= 0.05 + 1e-9
+    clock.now += 1.8  # 還剩 0.2s
+    sink = runner.sink
+    sink.chunks.clear()
 
     loop = asyncio.get_event_loop()
     t0 = loop.time()
-    await runner.run_turn(Utterance(text="再來"))
-    assert loop.time() - t0 >= 0.05
+    first_write_at: list[float] = []
+    orig_write = sink.write
+
+    async def spy_write(chunk):
+        first_write_at.append(loop.time() - t0)
+        await orig_write(chunk)
+
+    sink.write = spy_write
+    result = await runner.run_turn(Utterance(text="再來"))
+    trace = runner.tracer.get(result.turn_id)
+
+    assert result.phase is TurnPhase.DONE
+    assert first_write_at and first_write_at[0] >= 0.2 - 0.02
+    # think 在冷卻期間就已產出首字，沒有被延後
+    think_at = trace.marks[MARK_THINK_FIRST_TOKEN]
+    speak_at = trace.marks[MARK_SPEAK_FIRST_CHUNK]
+    assert speak_at - think_at >= 0.15
 
 
 async def test_backoff_已過期則不延後():
