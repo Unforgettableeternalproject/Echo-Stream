@@ -4,7 +4,9 @@
 """
 
 from .channel import ChannelClosed, StreamChannel
+from .coordinator import TurnCoordinator, TurnHandle
 from .pipeline import PipelineRunner
+from .policies import AcceptAllAdmission, AccumulatingBargeIn, NeverYield
 from .splitter import SentenceSplitter, SplitPolicy, char_weight, text_weight
 from .tracer import BUDGET_MS, LatencyTracer, TurnTrace
 from .turn_detector import (
@@ -17,6 +19,11 @@ __all__ = [
     "ChannelClosed",
     "StreamChannel",
     "PipelineRunner",
+    "TurnCoordinator",
+    "TurnHandle",
+    "AcceptAllAdmission",
+    "AccumulatingBargeIn",
+    "NeverYield",
     "SentenceSplitter",
     "SplitPolicy",
     "char_weight",

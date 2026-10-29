@@ -145,6 +145,7 @@ class FakeThinkStage:
         Web 前端的會話切換才能在無 GPU 環境下驗證。"""
 
         self._pending_user_text = ""
+        self._assistant_by_turn: dict[str, dict[str, str]] = {}
 
     async def prepare(self) -> None:
         return
@@ -207,8 +208,26 @@ class FakeThinkStage:
         if self._pending_user_text:
             self.history.append({"role": "user", "content": self._pending_user_text})
         if spoken_text:
-            self.history.append({"role": "assistant", "content": spoken_text})
+            item = {"role": "assistant", "content": spoken_text}
+            self.history.append(item)
+            self._assistant_by_turn[turn_id] = item
         self._pending_user_text = ""
+
+    async def settle(self, turn_id: str, spoken_text: str, generated_text: str = "") -> bool:
+        """commit 之後任意時間，依 turn_id 改寫該輪的 assistant 歷史項。
+
+        ``spoken_text`` 非空 = 換成這段文字（例如私訊占位、之後再回填可透露的版本）；
+        空字串 = 移除該 assistant 項。找不到（沒 commit 過、已被修剪出歷史）回 False，不報錯。
+        """
+        item = self._assistant_by_turn.get(turn_id)
+        if item is None or not any(h is item for h in self.history):
+            return False
+        if spoken_text:
+            item["content"] = spoken_text
+        else:
+            self.history[:] = [h for h in self.history if h is not item]
+            self._assistant_by_turn.pop(turn_id, None)
+        return True
 
 
 class FakeSpeakStage:

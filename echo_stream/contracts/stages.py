@@ -218,7 +218,11 @@ class SettleCapable(Protocol):
     呼叫端用 ``getattr(think, "settle", None)`` 探測，缺少即不修正歷史。
     """
 
-    async def settle(self, turn_id: str, spoken_text: str, generated_text: str) -> None: ...
+    async def settle(
+        self, turn_id: str, spoken_text: str, generated_text: str = ""
+    ) -> bool | None:
+        """依 turn_id 改寫已 commit 的 assistant 歷史項。找不到回 False，不報錯。"""
+        ...
 
 
 @runtime_checkable

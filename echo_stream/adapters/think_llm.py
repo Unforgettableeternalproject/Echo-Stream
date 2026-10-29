@@ -414,6 +414,9 @@ class LLMThinkStage:
         ``cached_tokens``。宿主（bot）可取用印到自己的 log；不參與邏輯。"""
 
         self.history: list[dict[str, str]] = []
+        self._assistant_by_turn: dict[str, dict[str, str]] = {}
+        """turn_id -> 該輪寫進 history 的 assistant 項（同一個 dict 物件）。
+        只存參照、不在 history 項上加欄位，所以送 API 的 messages 與 prompt cache 前綴不受影響。"""
         self._pending_user_text = ""
         self._prewarm_sent: dict[str, float] = {}
         """預熱去重：前綴 hash -> 送出時間（monotonic）。"""
@@ -1100,8 +1103,32 @@ class LLMThinkStage:
         if self._pending_user_text:
             self.history.append({"role": "user", "content": self._pending_user_text})
         if spoken_text:
-            self.history.append({"role": "assistant", "content": spoken_text})
+            item = {"role": "assistant", "content": spoken_text}
+            self.history.append(item)
+            if turn_id:
+                self._assistant_by_turn[turn_id] = item
+                if len(self._assistant_by_turn) > 4 * max(1, self.history_limit):
+                    alive = {id(h) for h in self.history}
+                    self._assistant_by_turn = {
+                        k: v for k, v in self._assistant_by_turn.items() if id(v) in alive
+                    }
         self._pending_user_text = ""
+
+    async def settle(self, turn_id: str, spoken_text: str, generated_text: str = "") -> bool:
+        """commit 之後任意時間，依 turn_id 改寫該輪的 assistant 歷史項。
+
+        ``spoken_text`` 非空 = 換成這段文字（例如私訊占位、之後再回填可透露的版本）；
+        空字串 = 移除該 assistant 項。找不到（沒 commit 過、已被修剪出歷史）回 False，不報錯。
+        """
+        item = self._assistant_by_turn.get(turn_id)
+        if item is None or not any(h is item for h in self.history):
+            return False
+        if spoken_text:
+            item["content"] = spoken_text
+        else:
+            self.history[:] = [h for h in self.history if h is not item]
+            self._assistant_by_turn.pop(turn_id, None)
+        return True
 
 
 __all__ = [
