@@ -252,14 +252,6 @@ async def test_首token之前插話_首token一到就結束且不產句() -> Non
     assert env.think.history == [{"role": "user", "content": "你好"}]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "首 token 之前的取消不是搶佔式：LLMThinkStage._tokens 只在『收到 token 後』"
-        "才檢查 token，backend 卡在網路上時 run_turn 一直等到首 token 才結束"
-        "（實測首 token ~2.6s，期間下一輪無法開始）。"
-    ),
-)
 async def test_首token之前插話_不必等LLM回應() -> None:
     gate = asyncio.Event()  # 永遠不打開：模擬 LLM 網路卡住
     env = make_env(gate=gate)

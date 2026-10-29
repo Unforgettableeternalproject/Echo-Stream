@@ -217,6 +217,44 @@ def build_backend(
     return BackendRegistry.default().create(name, cfg)
 
 
+
+async def _preemptible(source: AsyncIterator[Any], token: CancellationToken) -> AsyncIterator[Any]:
+    """把 backend 串流包成可搶佔的：等下一個 token 的同時也盯著取消。
+
+    只在「收到 token 後」才檢查取消，backend 卡在等首 token（網路、prefill）時
+    插話要等到首 token 才生效。這裡讓 ``__anext__`` 與 ``token.wait()`` 賽跑，
+    取消時立刻中止等待、關閉底層串流（請求）並拋 :class:`CancelledError`。
+    """
+    cancel_task = asyncio.ensure_future(token.wait())
+    try:
+        while True:
+            token.raise_if_cancelled()
+            next_task = asyncio.ensure_future(source.__anext__())
+            try:
+                await asyncio.wait({next_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED)
+            except BaseException:
+                # 外層被取消：不留懸掛的 __anext__ task
+                next_task.cancel()
+                raise
+            if not next_task.done():
+                next_task.cancel()
+                with contextlib.suppress(BaseException):
+                    await next_task
+                token.raise_if_cancelled()
+            try:
+                piece = next_task.result()
+            except StopAsyncIteration:
+                return
+            token.raise_if_cancelled()
+            yield piece
+    finally:
+        cancel_task.cancel()
+        aclose = getattr(source, "aclose", None)
+        if aclose is not None:
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await aclose()
+
+
 def to_messages(pairs: Sequence[dict[str, str]]) -> list[Any]:
     """把 ``{"role", "content"}`` 轉成 SessionControl 的 Message。
 
@@ -744,10 +782,12 @@ class LLMThinkStage:
             calls: list[Any] = []
             round_text: list[str] = []
 
-            async for piece in self.backend.stream_query(
-                messages, system_instruction=system, **kwargs, **self._cache_kwargs()
+            async for piece in _preemptible(
+                self.backend.stream_query(
+                    messages, system_instruction=system, **kwargs, **self._cache_kwargs()
+                ),
+                token,
             ):
-                token.raise_if_cancelled()
                 if _is_tool_call(piece):
                     calls.append(piece)
                     continue
