@@ -67,16 +67,16 @@ def test_format_略過無名稱與非dict項目():
     assert _format_activity_line([{"name": ""}, "oops", {"name": "A"}]) == "常玩：A"
 
 
-async def test_profile_有資料附在尾端(monkeypatch):
+async def test_profile_有資料放在開頭(monkeypatch):
     monkeypatch.setenv("ECHO_STREAM_MEMORY_ACTIVITY_TOP_N", "3")
     _, adapter = _adapter(rows=_rows())
-    assert await adapter.profile() == f"喜歡貓\n{_LINE}"
+    assert await adapter.profile() == f"{_LINE}\n喜歡貓"
 
 
 async def test_profile_top_n限制筆數(monkeypatch):
     monkeypatch.setenv("ECHO_STREAM_MEMORY_ACTIVITY_TOP_N", "1")
     _, adapter = _adapter(rows=_rows())
-    assert (await adapter.profile()).endswith("\n常玩：Deadlock（最近 10/27）")
+    assert (await adapter.profile()).startswith("常玩：Deadlock（最近 10/27）\n")
 
 
 async def test_profile_無遊玩資料原樣回傳():
@@ -118,7 +118,7 @@ async def test_profile_總長不超過上限且activity優先(monkeypatch):
     engine, adapter = _adapter(profile_text="長" * 500, rows=_rows())
     out = await adapter.profile()
     assert len(out) == limit
-    assert out.endswith(_LINE)
+    assert out.startswith(_LINE)
     assert engine.get_profile_calls == [limit - len(_LINE) - 1]
 
 

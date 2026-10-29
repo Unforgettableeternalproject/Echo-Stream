@@ -867,7 +867,8 @@ class EchoMemoryAdapter:
         常駐脈絡，不是檢索結果——server 在暖機與每次 dream 後刷新一次，
         不在每輪熱路徑呼叫。
 
-        常玩行（``ECHO_STREAM_MEMORY_ACTIVITY_TOP_N``，0 停用）附在 concept 文字尾端。
+        常玩行（``ECHO_STREAM_MEMORY_ACTIVITY_TOP_N``，0 停用）放在 profile 開頭：
+        下游（如 bot 端 profile_max_chars）可能從頭截斷，放尾端會先被截掉。
         長度策略：activity 行短且資訊密度高，優先保留——傳給 ``get_profile`` 的
         ``max_chars`` 先扣掉 activity 行長度（含換行），總長不超過
         ``ECHO_STREAM_MEMORY_PROFILE_MAX_CHARS``。引擎沒有 get_profile 時，
@@ -891,7 +892,7 @@ class EchoMemoryAdapter:
             base = await self._run(lambda: get_profile(max_chars=budget) or "")
         if not line:
             return base
-        return f"{base}\n{line}" if base else line
+        return f"{line}\n{base}" if base else line
 
     async def activity_profile(self, top_n: int = 3) -> list[dict[str, Any]]:
         """遊玩紀錄摘要（依累計時長排序）：[{name, play_count, total_minutes, last_played}]。
