@@ -397,6 +397,9 @@ class LLMThinkStage:
         """上一輪 retrieve 的結果，這一輪注入，依 scope 分槽。§7.4：late-context 注入
         結構上不可能（KV cache 無法換前綴），所以是「下一輪生效」。
         沒設 ``memory_resolver`` 時所有 scope 共用 None 槽（與單例時代相同）。"""
+        self._discard_gen: int = 0
+        """``discard_pending`` 的世代計數。``_retrieve`` 起跑時記下，寫回槽前若已變動
+        就是「清除前發起的 retrieve」，結果作廢不寫回。"""
         self._last_build: tuple[str, str | None, str | None] | None = None
         """最近一次組 messages 的 ``(turn_id, slot, 注入文字)``——同 turn_id 重生成時沿用。"""
         self._retrieved: tuple[str, str | None, str] | None = None
@@ -435,6 +438,34 @@ class LLMThinkStage:
             return False
         self._pending_by_scope[slot] = text
         return True
+
+    def discard_pending(self, scope: str | None = None, *, all_scopes: bool = False) -> int:
+        """丟棄待注入的記憶（成員離場隱私用）。
+
+        槽內存的是已渲染的文字，共享輪次時可能含其他成員的共享投影；成員離開後
+        無法事後依在場名單過濾，只能整槽丟棄，避免下一輪仍把已離場者的內容注入。
+
+        ``scope`` 同 ``seed_pending``（經 ``_slot()`` 轉槽 key）；``all_scopes=True`` 清全部槽。
+        同時處理：
+        - ``_last_build``：同 turn_id 重生成會沿用它的注入文字，被清的槽與之相符時一併清掉。
+        - 進行中的 retrieve：世代 +1，清除前發起的 retrieve 晚到時結果作廢、不寫回槽。
+        - ``_retrieved`` 去重記錄刻意保留：清除後同 turn_id 重生成不會重跑 retrieve
+          （重跑會拿宿主可能已過期的 kwargs 再產一份投影）。
+
+        回傳實際清掉的槽數。
+        """
+        self._discard_gen += 1
+        if all_scopes:
+            cleared = len(self._pending_by_scope)
+            self._pending_by_scope.clear()
+            slot = None
+        else:
+            slot = self._slot(scope)
+            cleared = 1 if self._pending_by_scope.pop(slot, None) is not None else 0
+        build = self._last_build
+        if build is not None and build[2] is not None and (all_scopes or build[1] == slot):
+            self._last_build = (build[0], build[1], None)
+        return cleared
 
     def _slot(self, scope: str | None) -> str | None:
         """待注入記憶的槽 key。沒設 resolver 就不分 scope（維持舊行為）。"""
@@ -931,11 +962,13 @@ class LLMThinkStage:
         """
         if self.tracer is not None:
             self.tracer.mark(utterance.turn_id, MARK_MEMORY_START)
+        gen = self._discard_gen
         try:
             # 宿主可經 metadata 帶引擎參數（如共享輪次 shared_turn=True）；沒帶就維持舊呼叫
             extra = utterance.metadata.get("memory_retrieve_kwargs") or {}
             result = await (memory.retrieve(query, **extra) if extra else memory.retrieve(query))
-            if result:
+            # 期間被 discard_pending 清過（成員離場）→ 結果可能含已離場者的投影，作廢
+            if result and gen == self._discard_gen:
                 self._pending_by_scope[self._slot(scope)] = result
             self._retrieved = (utterance.turn_id, self._slot(scope), query)
         except (CancelledError, Exception):  # noqa: B014 - 旁路，失敗不該炸管線
