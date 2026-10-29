@@ -30,7 +30,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 
 from ..contracts.cancellation import CancellationToken, CancelledError, CancelReason
 from ..contracts.stages import AudioSink, AudioSource, SpeakStage, ThinkStage
@@ -61,6 +61,7 @@ class PipelineRunner:
         tracer: LatencyTracer | None = None,
         policy: TurnPolicy | None = None,
         gap_filler: GapFiller | None = None,
+        clock: Callable[[], float] = time.perf_counter,
     ) -> None:
         self.input_stage = input_stage
         self.think_stage = think_stage
@@ -73,7 +74,9 @@ class PipelineRunner:
 
         self._current_token: CancellationToken | None = None
         self._current_turn_id: str | None = None
-        self._last_interrupt_at: float = 0.0
+        self._clock = clock
+        """可注入的時鐘，測試用；backoff 的時間差都由它計算。"""
+        self._last_interrupt_at: float | None = None
 
     # --- 生命週期 ---
 
@@ -101,15 +104,38 @@ class PipelineRunner:
         判定成立時呼叫。sink 的 ``stop()`` 是**同步立即**執行的——
         等 event loop 排程會讓機器人多講半秒，體感上就是「叫不停」。
         """
-        if self.policy.interruption_backoff_s > 0:
-            self._last_interrupt_at = time.perf_counter()
         token = self._current_token
         if token is None or token.is_cancelled:
             return False
         if self.sink is not None:
             self.sink.stop()
         token.cancel(reason)
+        # 只有「真的被使用者插話中止」才起算 backoff；SHUTDOWN／SUPERSEDED
+        # 等原因不是使用者在搶話，不該讓下一輪被延後
+        if reason is CancelReason.BARGE_IN:
+            self._last_interrupt_at = self._clock()
         return True
+
+    def _backoff_remaining_s(self) -> float:
+        """距離 backoff 結束還剩幾秒；0 表示可以開口。"""
+        backoff = self.policy.interruption_backoff_s
+        if backoff <= 0 or self._last_interrupt_at is None:
+            return 0.0
+        return max(0.0, backoff - (self._clock() - self._last_interrupt_at))
+
+    async def _wait_backoff(self, token: CancellationToken) -> None:
+        """被插話後的冷卻：等到 backoff 結束才開始這一輪（可被取消中斷）。
+
+        語意取自 Vapi ``backoffSeconds``：被插話後機器人隔 N 秒才再開口。
+        放在 turn 起點而非首個音訊前，因為墊片音也是「開口」；代價是
+        這段時間 LLM 也不會先跑，只在剛被插話的下一輪發生。
+        """
+        remaining = self._backoff_remaining_s()
+        if remaining <= 0:
+            return
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(token.wait(), timeout=remaining)
+        token.raise_if_cancelled()
 
     # --- 執行 ---
 
@@ -154,16 +180,21 @@ class PipelineRunner:
         cancel_reason: str | None = None
         error: str | None = None
 
-        # 墊片音：STT 完成就開始計時，真音訊來之前排進 sink（排隊，不打斷）
         gap = self.gap_filler
-        if gap is not None:
-            gap.start(
-                self.sink, turn_id, token,
-                on_first_audio=lambda: self.tracer.mark(turn_id, marks.MARK_GAP_FIRST_AUDIO),
-                language=utterance.language,
-            )
-
         try:
+            # 被插話後的冷卻：墊片音也算開口，所以排在墊片啟動之前
+            await self._wait_backoff(token)
+
+            # 墊片音：STT 完成就開始計時，真音訊來之前排進 sink（排隊，不打斷）
+            if gap is not None:
+                gap.start(
+                    self.sink, turn_id, token,
+                    on_first_audio=lambda: self.tracer.mark(
+                        turn_id, marks.MARK_GAP_FIRST_AUDIO
+                    ),
+                    language=utterance.language,
+                )
+
             sentence_stream = self._trace_sentences(
                 self.think_stage.stream(utterance, token), turn_id, sentences
             )

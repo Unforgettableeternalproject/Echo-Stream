@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 
 from echo_stream.contracts.cancellation import CancelReason
+from echo_stream.contracts.turn import TurnPolicy
 from echo_stream.contracts.types import TurnPhase, Utterance
 from echo_stream.core.pipeline import PipelineRunner
 from echo_stream.core.splitter import SplitPolicy
@@ -315,3 +316,90 @@ async def test_stage_拋錯不會拖垮_session():
 
     assert result.phase is TurnPhase.FAILED
     assert "TTS 爆了" in (result.error or "")
+
+
+# --- interruption_backoff_s ---
+
+
+class FakeClock:
+    """可手動撥動的時鐘，backoff 的時間差不靠真實 sleep 推進。"""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def build_backoff_runner(backoff_s: float, clock: FakeClock) -> PipelineRunner:
+    runner, _, _, _ = build_runner(realtime=True, rtf=0.05)
+    runner.policy = TurnPolicy(interruption_backoff_s=backoff_s)
+    runner._clock = clock
+    return runner
+
+
+async def _interrupt_first_turn(runner: PipelineRunner, reason: CancelReason) -> None:
+    async def interrupt_soon():
+        await asyncio.sleep(0.1)
+        runner.interrupt(reason)
+
+    asyncio.ensure_future(interrupt_soon())
+    await runner.run_turn(Utterance(text="你好"))
+
+
+async def test_backoff_期間內下一輪會被延後():
+    clock = FakeClock()
+    runner = build_backoff_runner(2.0, clock)
+    await _interrupt_first_turn(runner, CancelReason.BARGE_IN)
+    clock.now += 1.95  # 還剩 0.05s
+    assert 0.0 < runner._backoff_remaining_s() <= 0.05 + 1e-9
+
+    loop = asyncio.get_event_loop()
+    t0 = loop.time()
+    await runner.run_turn(Utterance(text="再來"))
+    assert loop.time() - t0 >= 0.05
+
+
+async def test_backoff_已過期則不延後():
+    clock = FakeClock()
+    runner = build_backoff_runner(2.0, clock)
+    await _interrupt_first_turn(runner, CancelReason.BARGE_IN)
+    clock.now += 2.0
+    assert runner._backoff_remaining_s() == 0.0
+
+
+async def test_backoff_為_0_時行為不變():
+    clock = FakeClock()
+    runner = build_backoff_runner(0.0, clock)
+    await _interrupt_first_turn(runner, CancelReason.BARGE_IN)
+    assert runner._backoff_remaining_s() == 0.0
+
+
+async def test_非_barge_in_原因不起算_backoff():
+    clock = FakeClock()
+    for reason in (CancelReason.SHUTDOWN, CancelReason.SUPERSEDED):
+        runner = build_backoff_runner(2.0, clock)
+        await _interrupt_first_turn(runner, reason)
+        assert runner._backoff_remaining_s() == 0.0
+
+
+async def test_沒有進行中的_turn_時插話不起算_backoff():
+    clock = FakeClock()
+    runner = build_backoff_runner(2.0, clock)
+    assert runner.interrupt(CancelReason.BARGE_IN) is False
+    assert runner._backoff_remaining_s() == 0.0
+
+
+async def test_backoff_等待中仍可被取消():
+    clock = FakeClock()
+    runner = build_backoff_runner(60.0, clock)
+    await _interrupt_first_turn(runner, CancelReason.BARGE_IN)
+
+    async def shutdown_soon():
+        await asyncio.sleep(0.05)
+        runner.interrupt(CancelReason.SHUTDOWN)
+
+    asyncio.ensure_future(shutdown_soon())
+    result = await asyncio.wait_for(runner.run_turn(Utterance(text="再來")), timeout=2)
+    assert result.phase is TurnPhase.CANCELLED
+    assert result.cancel_reason == CancelReason.SHUTDOWN.value
