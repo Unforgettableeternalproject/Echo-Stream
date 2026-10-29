@@ -925,13 +925,17 @@ async def test_failed_generation_still_delivers_generated_sentences() -> None:
     sent: list[str] = []
 
     async def on_sentence(_view, sentence: Sentence) -> None:
-        await release.wait()  # 慢回呼：句子都排在佇列裡時就遇到錯誤
+        await release.wait()  # 每句都慢：由測試決定何時放行
         sent.append(sentence.text)
 
     r, _ = env.req("A", on_sentence=on_sentence)
     h = env.co.submit(r)
-    await until(lambda: len(backend.calls) == 1)
-    await until(lambda: h._att is not None and h._att.pump is not None and h._att.pump.done())
+    # 等到出錯處理已把 root 取消（UPSTREAM_ERROR）、播放位置讓出，且 _conclude 走進 _drain_text
+    # 時佇列仍有多句沒送——這正是舊缺陷（worker 被誤當整輪作廢而取消）發生的時點
+    await until(lambda: h._root.is_cancelled and h._play_done.is_set())
+    for _ in range(50):
+        await asyncio.sleep(0)
+    assert sent == [] and not h.settled.done()
     release.set()
     out = await settled(h)
     assert out.status is OutcomeStatus.FAILED and "backend boom" in (out.error or "")
