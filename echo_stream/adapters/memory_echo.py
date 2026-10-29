@@ -80,6 +80,50 @@ llm = SubconsciousAssessor 打一次 LLM（背景，不在熱路徑）；
 heuristic = echo_memory 的文字啟發式，零 token；off = 全部 0.5（Phase 4a 行為）。"""
 
 
+def _parse_top_n(raw: Any) -> int:
+    """解析常玩筆數設定；非數字或負數一律視為停用（0）。"""
+    try:
+        return max(0, int(str(raw).strip()))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _format_last_played(value: Any) -> str:
+    """last_played（datetime／ISO 字串／None）→ ``MM/DD``；無法解析回空字串。"""
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%m/%d")
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ""
+        try:
+            # Python 3.10 的 fromisoformat 不吃結尾 Z
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).strftime("%m/%d")
+        except ValueError:
+            return ""
+    return ""
+
+
+def _format_activity_line(items: Iterable[dict[str, Any]] | None) -> str:
+    """把 activity_profile 的結果格式化成一行；沒有有效項目回空字串。
+
+    例：``常玩：Deadlock（最近 10/27）、Minecraft（最近 10/20）``。
+    last_played 缺漏或無法解析時省略括號。
+    """
+    parts: list[str] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        date = _format_last_played(item.get("last_played"))
+        parts.append(f"{name}（最近 {date}）" if date else name)
+    return f"常玩：{'、'.join(parts)}" if parts else ""
+
+
 def _coerce_evidence(item: Any) -> Any:
     """dict → ``EvidenceInput``；已是 ``EvidenceInput`` 原樣回傳。"""
     from echo_memory.schemas.evidence import EvidenceInput, SourceRef, TextSpan
@@ -818,17 +862,37 @@ class EchoMemoryAdapter:
             return None
 
     async def profile(self) -> str:
-        """使用者 profile 文字（subject=user 的 concept 全列）。沒有就空字串。
+        """使用者 profile 文字（subject=user 的 concept 全列）+ 常玩遊戲一行。沒有就空字串。
 
         常駐脈絡，不是檢索結果——server 在暖機與每次 dream 後刷新一次，
         不在每輪熱路徑呼叫。
+
+        常玩行（``ECHO_STREAM_MEMORY_ACTIVITY_TOP_N``，0 停用）放在 profile 開頭：
+        下游（如 bot 端 profile_max_chars）可能從頭截斷，放尾端會先被截掉。
+        長度策略：activity 行短且資訊密度高，優先保留——傳給 ``get_profile`` 的
+        ``max_chars`` 先扣掉 activity 行長度（含換行），總長不超過
+        ``ECHO_STREAM_MEMORY_PROFILE_MAX_CHARS``。引擎沒有 get_profile 時，
+        有遊玩資料仍只回 activity 行；activity 失敗只降級為不附加。
         """
         max_chars = int(config.get("ECHO_STREAM_MEMORY_PROFILE_MAX_CHARS", "800"))
+        top_n = _parse_top_n(config.get("ECHO_STREAM_MEMORY_ACTIVITY_TOP_N", "3"))
+        line = ""
+        if top_n > 0:
+            line = _format_activity_line(await self.activity_profile(top_n=top_n))
+            line = line[:max_chars]
+        # 扣掉 activity 行與分隔換行後，剩餘預算才給 concept 文字
+        budget = max_chars - (len(line) + 1 if line else 0)
         get_profile = getattr(self.engine, "get_profile", None)
         if get_profile is None:
-            logger.warning("echo_memory 沒有 get_profile——分支太舊，profile 停用")
-            return ""
-        return await self._run(lambda: get_profile(max_chars=max_chars) or "")
+            logger.warning("echo_memory 沒有 get_profile——分支太舊，concept profile 停用")
+            base = ""
+        elif budget <= 0:
+            base = ""
+        else:
+            base = await self._run(lambda: get_profile(max_chars=budget) or "")
+        if not line:
+            return base
+        return f"{line}\n{base}" if base else line
 
     async def activity_profile(self, top_n: int = 3) -> list[dict[str, Any]]:
         """遊玩紀錄摘要（依累計時長排序）：[{name, play_count, total_minutes, last_played}]。
