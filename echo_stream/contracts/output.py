@@ -384,6 +384,10 @@ OnSentence = Callable[[TurnView, Sentence], Awaitable[None]]
 OnThinkStart = Callable[[TurnView, int], Awaitable[None]]
 """取得 think 鎖之後、每一趟生成開始之前呼叫（第二參數是 ``attempt_id``，regen 每趟都呼叫）。"""
 
+OnGenerationDone = Callable[[TurnView, bool], "Awaitable[None] | None"]
+"""think 生成結束時呼叫一次（第二參數 ``ok``：True = 正常完成，含 PASS；False = think 出錯
+或整輪取消中止了生成）。同步或非同步皆可。"""
+
 
 # ─────────────────────────── 請求與結果 ───────────────────────────
 
@@ -421,6 +425,13 @@ class TurnRequest:
     """Q3：已 eager commit 的輪次被讓位時是否撤回整輪歷史。預設 False = 維持現況。"""
 
     meta: dict = field(default_factory=dict)
+
+    on_generation_done: OnGenerationDone | None = None
+    """think 生成結束時呼叫一次 ``hook(view, ok)``：``ok=True`` 正常完成（含 PASS；只停語音的
+    barge-in／語音出錯，生成仍照常完成，也是 True）；``ok=False`` 是 think 出錯，或整輪被取消
+    （讓位／取代／shutdown…）而中止生成。早於該輪的 outcome（同步回呼保證；非同步回呼在
+    outcome 之前啟動，不等它完成）。沒有進入生成的輪（等鎖期間作廢、DROPPED_BUSY、關閉後的
+    submit）不呼叫。回呼例外吞掉並記 warning，不影響 outcome；回呼在 loop 內執行，須快速。"""
 
     on_think_start: OnThinkStart | None = None
     """取得 think 鎖（``MARK_QUEUE_ACQUIRED``）之後、每一趟 attempt 開始生成前呼叫
@@ -467,6 +478,7 @@ __all__ = [
     "CommitMode",
     "ModeFlags",
     "ModeRules",
+    "OnGenerationDone",
     "OnSentence",
     "OnThinkStart",
     "OutcomeStatus",

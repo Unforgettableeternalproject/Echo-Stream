@@ -54,6 +54,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import inspect
 import logging
 import threading
 import time
@@ -255,6 +256,9 @@ class TurnHandle:
         self._voice_kind: str | None = None
         self._voice_error: str | None = None
         self._hook_error: str | None = None
+        self._gen_started = False
+        """think 已開始生成（進過 ``_generate``）；``on_generation_done`` 只對有生成的輪呼叫。"""
+
         self._voice_settled = False
         """語音已播完（drain 返回）：之後 voice_cancel／voice_error 不能再認領。"""
 
@@ -378,6 +382,9 @@ class TurnCoordinator:
         """:meth:`aclose` 之後為 True：不再接新輪，跨執行緒入口一律 no-op。"""
 
         self._live: list[TurnHandle] = []
+        self._bg_tasks: set[asyncio.Future] = set()
+        """非同步 ``on_generation_done`` 的強參照（避免被 GC 掉）。"""
+
         self._think_lock = asyncio.Lock()
         self._lock_users = 0
         """持有或等待 think 鎖的輪數（admission 的 busy／waiting 依此）。"""
@@ -838,7 +845,7 @@ class TurnCoordinator:
         assert att is not None
         if req.commit_mode is CommitMode.EAGER:
             self._lock_done(t)  # EAGER：commit 之後下一輪就能開始生成
-        self._resolve_gen_done(t)
+        self._resolve_gen_done(t, phase is TurnPhase.DONE)
         self._mark_play_done(t)
         await self._conclude(t, att, phase, error)
 
@@ -1096,6 +1103,7 @@ class TurnCoordinator:
         tid = t.turn_id
         filt = req.text_filter
         speaking = emit is not None
+        t._gen_started = True
         stream = self.think.stream(att.utterance, att.token)
         try:
             async for sentence in stream:
@@ -1164,7 +1172,7 @@ class TurnCoordinator:
                 await self.think.commit(t.turn_id, generated, generated)
         if req.commit_mode is CommitMode.EAGER:
             self._lock_done(t)  # commit 之後才放鎖：下一輪的 prompt 才看得到這一輪
-        self._resolve_gen_done(t)
+        self._resolve_gen_done(t, True)
 
     def _push_text(self, t: TurnHandle, att: _Attempt, sentence: Sentence) -> None:
         """句子交給宿主的文字回呼：丟進佇列由 worker 依序處理，不阻塞 TTS。"""
@@ -1417,6 +1425,8 @@ class TurnCoordinator:
         self.tracer.finish(tid, phase, cancel_value, error)
 
         meta = self._outcome_meta(t, reason, kind, detail)
+        if phase is TurnPhase.FAILED:
+            meta.setdefault("reason_code", CancelReason.UPSTREAM_ERROR.value)
         if t._hook_error is not None:
             meta["on_think_start_error"] = t._hook_error
         if voice_error is not None:
@@ -1561,9 +1571,30 @@ class TurnCoordinator:
             snapshot_version=t._snapshot_version,
         ))
 
-    def _resolve_gen_done(self, t: TurnHandle) -> None:
-        if not t.generation_done.done():
-            t.generation_done.set_result(None)
+    def _resolve_gen_done(self, t: TurnHandle, ok: bool = False) -> None:
+        """生成結束（冪等，先到先贏）：resolve future，並對有生成的輪呼叫一次宿主回呼。"""
+        if t.generation_done.done():
+            return
+        t.generation_done.set_result(None)
+        callback = t.request.on_generation_done
+        if callback is None or not t._gen_started:
+            return
+        try:
+            result = callback(t, ok)
+        except Exception:  # noqa: BLE001 - 宿主回呼壞掉不影響 outcome
+            _log.warning("on_generation_done 失敗（turn %s）", t.turn_id, exc_info=True)
+            return
+        if inspect.isawaitable(result):
+            task = asyncio.ensure_future(self._await_generation_cb(t, result))
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
+
+    @staticmethod
+    async def _await_generation_cb(t: TurnHandle, awaitable) -> None:
+        try:
+            await awaitable
+        except Exception:  # noqa: BLE001
+            _log.warning("on_generation_done 失敗（turn %s）", t.turn_id, exc_info=True)
 
     def _mark_play_done(self, t: TurnHandle) -> None:
         """這一輪的播放位置讓出來。必須等前一輪也結束：被取消的排隊輪

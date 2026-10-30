@@ -1836,3 +1836,135 @@ async def test_cross_thread_entries_after_aclose_are_noops_returning_false() -> 
         return [env.co.void(h.turn_id), env.co.cancel_voice(h.turn_id)]
 
     assert await loop.run_in_executor(None, poke) == [False, False]
+
+
+class _FailingBackend(ScriptBackend):
+    async def stream_query(self, messages, system_instruction=None, **kwargs):
+        self.calls.append(list(messages))
+        yield SENTENCES[0]
+        raise RuntimeError("backend boom")
+
+
+def _fail_think(env: Env) -> None:
+    backend = _FailingBackend()
+    backend.stage = env.think
+    env.think._backend = backend
+
+
+async def test_failed_outcome_carries_upstream_error_reason_code() -> None:
+    env = build()
+    _fail_think(env)
+    r, _ = env.req("A")
+    out = await settled(env.co.submit(r))
+    assert out.status is OutcomeStatus.FAILED
+    assert out.metadata["reason_code"] == "upstream_error"
+
+
+class GenDoneSpy:
+    def __init__(self, env: Env) -> None:
+        self.calls: list[tuple[str, bool, int]] = []  # (turn_id, ok, 呼叫當下的 outcome 數)
+        self.env = env
+
+    def __call__(self, view, ok: bool) -> None:
+        self.calls.append((view.turn_id, ok, len(self.env.outcomes)))
+
+
+async def test_on_generation_done_ok_true_before_outcome_on_normal_completion() -> None:
+    env = build()
+    spy = GenDoneSpy(env)
+    r, sink = env.req("A", on_generation_done=spy)
+    h = env.co.submit(r)
+    await playing(sink)
+    sink.finish()
+    out = await settled(h)
+    assert out.status is OutcomeStatus.COMPLETED
+    assert spy.calls == [(h.turn_id, True, 0)]  # 一次、ok、早於 outcome
+
+
+async def test_on_generation_done_ok_true_on_pass_and_barge_in() -> None:
+    env = build()
+    spy = GenDoneSpy(env)
+    r, sink = env.req("A", on_generation_done=spy, text_filter=PassOnFirst())
+    h = env.co.submit(r)
+    out = await settled(h)
+    assert out.skipped_reason == SkipReason.PASS
+    assert spy.calls == [(h.turn_id, True, 0)]
+
+    env2, mid = build_split()
+    spy2 = GenDoneSpy(env2)
+    r2, sink2 = env2.req("B", on_generation_done=spy2)
+    h2 = env2.co.submit(r2)
+    await until(lambda: len(sink2.chunks) == 1)
+    sink2.play(1.0)
+    for k in range(4):
+        env2.co.on_voice_event(voiced(1.0 + 0.5 * k))
+    assert spy2.calls == []  # think 還沒生成完
+    mid.set()
+    out2 = await settled(h2)
+    assert out2.barge_in
+    assert spy2.calls == [(h2.turn_id, True, 0)]  # 只停語音，生成仍正常完成
+
+
+async def test_on_generation_done_ok_false_on_think_error_and_whole_turn_cancel() -> None:
+    env = build()
+    _fail_think(env)
+    spy = GenDoneSpy(env)
+    r, _ = env.req("A", on_generation_done=spy)
+    h = env.co.submit(r)
+    out = await settled(h)
+    assert out.status is OutcomeStatus.FAILED
+    assert spy.calls == [(h.turn_id, False, 0)]
+
+    env2, mid = build_split()
+    spy2 = GenDoneSpy(env2)
+    r2, sink2 = env2.req("B", on_generation_done=spy2)
+    h2 = env2.co.submit(r2)
+    await until(lambda: len(sink2.chunks) == 1)
+    env2.co.cancel_all("left")
+    out2 = await settled(h2)
+    assert out2.status is OutcomeStatus.CANCELLED
+    assert spy2.calls == [(h2.turn_id, False, 0)]
+    mid.set()
+
+
+async def test_on_generation_done_exception_is_swallowed_and_async_supported(caplog) -> None:
+    env = build()
+
+    def boom(_view, _ok) -> None:
+        raise RuntimeError("cb boom")
+
+    r, sink = env.req("A", on_generation_done=boom)
+    with caplog.at_level("WARNING"):
+        h = env.co.submit(r)
+        await playing(sink)
+        sink.finish()
+        out = await settled(h)
+    assert out.status is OutcomeStatus.COMPLETED and out.error is None
+    assert any("on_generation_done" in rec.getMessage() for rec in caplog.records)
+
+    seen: list[bool] = []
+
+    async def acb(_view, ok: bool) -> None:
+        seen.append(ok)
+
+    r2, sink2 = env.req("B", owner="u2", on_generation_done=acb)
+    h2 = env.co.submit(r2)
+    await playing(sink2)
+    sink2.finish()
+    await settled(h2)
+    await until(lambda: seen == [True])
+
+
+async def test_on_generation_done_not_called_when_generation_never_started() -> None:
+    gate = asyncio.Event()
+    env = build(gate=gate)
+    spy = GenDoneSpy(env)
+    ra, _ = env.req("A")
+    rb, _ = env.req("B", owner="u2", on_generation_done=spy)
+    env.co.submit(ra)
+    hb = env.co.submit(rb)
+    env.co.void(hb.turn_id)  # 等鎖期間作廢：沒有生成
+    out = await settled(hb)
+    assert out.status is OutcomeStatus.VOIDED
+    assert spy.calls == []
+    gate.set()
