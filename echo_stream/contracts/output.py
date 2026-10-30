@@ -103,6 +103,10 @@ class SkipReason:
     NO_AUDIO = "no_audio"
     """有可唸文字但一個音訊 chunk 都沒產出（TTS 失敗或空輸出）。"""
 
+    VOICE_ERROR = "voice_error"
+    """語音側（TTS／sink 寫入／drain）出錯：只關這一輪的語音，think 照常跑完、文字照常 commit。
+    例外摘要在 ``metadata["voice_error"]``；``phase`` 為 DONE、``error`` 為 None。"""
+
 
 class CommitMode(str, Enum):
     """歷史寫回時機。"""

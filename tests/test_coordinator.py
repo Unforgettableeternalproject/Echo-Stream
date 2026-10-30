@@ -1271,3 +1271,131 @@ async def test_cancel_during_on_think_start_ends_turn_without_thinking(how: str)
     await playing(s2)
     s2.finish()
     assert (await settled(h2)).status is OutcomeStatus.COMPLETED
+
+
+# ───────────────────────── 語音側出錯：只停語音、think 照常跑完 ─────────────────────────
+
+
+class FlakySpeak(GateSpeak):
+    """第一次 stream 在產出 ``after`` 個音訊塊後拋例外，之後恢復正常。"""
+
+    def __init__(self, after: int = 1) -> None:
+        super().__init__(open_all=True)
+        self.after = after
+        self.streams = 0
+
+    async def stream(self, sentences, token):
+        self.streams += 1
+        fail = self.streams == 1
+        n = 0
+        async for chunk in super().stream(sentences, token):
+            yield chunk
+            n += 1
+            if fail and n >= self.after:
+                raise RuntimeError("tts boom")
+
+
+class FailingWriteSink(ManualSink):
+    async def write(self, chunk) -> None:
+        raise OSError("sink write boom")
+
+
+class FailingDrainSink(ManualSink):
+    async def drain(self) -> None:
+        self.draining.set()
+        raise OSError("sink drain boom")
+
+
+def assert_voice_error_outcome(out: TurnOutcome, needle: str) -> None:
+    assert out.status is OutcomeStatus.SKIPPED and out.skipped_reason == SkipReason.VOICE_ERROR
+    assert out.phase.value == "done" and out.error is None  # think 沒事，不是 FAILED
+    assert needle in out.metadata["voice_error"]
+    assert not out.barge_in and not out.aborted and not out.superseded and out.cut_short
+    assert out.cancel_reason is None
+    assert "reason_code" not in out.metadata  # 不誤標 barge_in 等取消原因
+
+
+@pytest.mark.parametrize("mode", [CommitMode.EAGER, CommitMode.SETTLED])
+async def test_tts_error_stops_voice_only_and_think_finishes(mode: CommitMode) -> None:
+    env, mid = build_split()
+    env.co.speak = FlakySpeak(after=1)
+    sent: list[str] = []
+
+    async def on_sentence(_view, sentence: Sentence) -> None:
+        sent.append(sentence.text)
+
+    r, sink = env.req("A", commit=mode, on_sentence=on_sentence)
+    h = env.co.submit(r)
+    await until(lambda: sink.stopped)  # TTS 出錯 -> 語音被關
+    assert h.voice_token.is_cancelled and not h.token.is_cancelled  # think 不受影響
+    assert not h.generation_done.done()
+    mid.set()  # 之後的文字照常生成
+    out = await settled(h)
+    assert_voice_error_outcome(out, "tts boom")
+    assert out.generated_text == FULL
+    assert "".join(sent) == FULL  # 文字照常送出
+    assert len(env.commits) == 1 and env.commits[0][2] == FULL
+    assert env.commits[0][1] == (FULL if mode is CommitMode.EAGER else "")
+    # 下一輪不受影響（FlakySpeak 只壞第一次）
+    r2, s2 = env.req("B", owner="u2")
+    h2 = env.co.submit(r2)
+    await until(lambda: len(s2.chunks) == 3 and s2.draining.is_set())
+    s2.finish()
+    out2 = await settled(h2)
+    assert out2.status is OutcomeStatus.COMPLETED and out2.generated_text == FULL
+
+
+@pytest.mark.parametrize("which", ["write", "drain"])
+async def test_sink_error_stops_voice_only_and_text_still_commits(which: str) -> None:
+    env = build()
+    sink = (FailingWriteSink if which == "write" else FailingDrainSink)(env.log)
+    sent: list[str] = []
+
+    async def on_sentence(_view, sentence: Sentence) -> None:
+        sent.append(sentence.text)
+
+    r, _ = env.req("A", sink=sink, commit=CommitMode.SETTLED, on_sentence=on_sentence)
+    h = env.co.submit(r)
+    out = await settled(h)
+    assert_voice_error_outcome(out, "sink " + which + " boom")
+    assert out.generated_text == RESPONSE and "".join(sent) == RESPONSE
+    assert len(env.commits) == 1 and env.commits[0][2] == RESPONSE
+    assert sink.stopped
+    r2, s2 = env.req("B", owner="u2")
+    h2 = env.co.submit(r2)
+    await playing(s2)
+    s2.finish()
+    assert (await settled(h2)).status is OutcomeStatus.COMPLETED
+
+
+async def test_queued_turn_flush_error_does_not_touch_predecessor() -> None:
+    env = build()
+    ra, sa = env.req("A")
+    rb, _ = env.req("B", owner="u2", sink=FailingWriteSink(env.log))
+    ha = env.co.submit(ra)
+    hb = env.co.submit(rb)
+    await playing(sa)
+    sa.finish()  # 前一輪播完，B 的緩衝才開始寫出 -> 寫入失敗
+    out_a = await settled(ha)
+    out_b = await settled(hb)
+    assert out_a.status is OutcomeStatus.COMPLETED
+    assert_voice_error_outcome(out_b, "sink write boom")
+    assert out_b.generated_text == RESPONSE
+
+
+async def test_think_error_is_still_failed_not_voice_error() -> None:
+    class FailingBackend(ScriptBackend):
+        async def stream_query(self, messages, system_instruction=None, **kwargs):
+            self.calls.append(list(messages))
+            for ch in SENTENCES[0]:
+                yield ch
+            raise RuntimeError("backend boom")
+
+    env = build()
+    backend = FailingBackend()
+    backend.stage = env.think
+    env.think._backend = backend
+    r, _ = env.req("A")
+    out = await settled(env.co.submit(r))
+    assert out.status is OutcomeStatus.FAILED and "backend boom" in (out.error or "")
+    assert "voice_error" not in out.metadata
