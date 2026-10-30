@@ -1724,3 +1724,464 @@ async def test_cancel_during_on_think_start_of_regen_second_attempt() -> None:
     assert out.status is OutcomeStatus.CANCELLED and out.regenerated == 1
     assert hook_cancelled.is_set() and len(env.backend.calls) == 1
     assert env.commits == []
+
+
+
+# ───────────────────── S3：bind_loop／關閉後 submit／reason_code／生成完成 ─────────────────────
+
+
+def test_bind_loop_rejects_submit_from_another_loop() -> None:
+    env = build()
+    loop_a = asyncio.new_event_loop()
+    try:
+        env.co.bind_loop(loop_a)
+
+        async def go() -> None:
+            r, _ = env.req("A")
+            with pytest.raises(RuntimeError):
+                env.co.submit(r)
+
+        asyncio.run(go())  # 另一個 loop
+    finally:
+        loop_a.close()
+
+
+async def test_bind_loop_same_loop_submit_ok_and_unbound_keeps_lazy_capture() -> None:
+    env = build()
+    env.co.bind_loop(asyncio.get_running_loop())
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    await playing(sink)
+    sink.finish()
+    assert (await settled(h)).status is OutcomeStatus.COMPLETED
+    # 未綁定：維持首次 submit 擷取
+    env2 = build()
+    assert env2.co._loop is None
+    r2, sink2 = env2.req("B")
+    h2 = env2.co.submit(r2)
+    assert env2.co._loop is asyncio.get_running_loop()
+    await playing(sink2)
+    sink2.finish()
+    await settled(h2)
+
+
+async def test_cross_thread_entries_after_bind_loop_before_first_submit_are_safe() -> None:
+    env = build()
+    loop = asyncio.get_running_loop()
+    results: list[object] = []
+
+    def poke() -> None:
+        env.co.bind_loop(loop)  # 從其他執行緒綁定
+        env.co.on_voice_event(voiced(0.0))
+        results.append(env.co.void("nope"))
+        results.append(env.co.cancel_voice("nope"))
+        env.co.cancel_all("early")
+
+    await loop.run_in_executor(None, poke)
+    assert results == [False, False]
+    assert env.co._loop is loop
+    # 之後第一輪照常（早先的 cancel_all 沒有殘留影響）
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    await playing(sink)
+    sink.finish()
+    assert (await settled(h)).status is OutcomeStatus.COMPLETED
+
+
+async def test_bound_loop_cross_thread_cancel_all_cancels_live_turn() -> None:
+    env, mid = build_split()
+    env.co.bind_loop(asyncio.get_running_loop())
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    await until(lambda: len(sink.chunks) == 1)
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, env.co.cancel_all, "left")
+    out = await settled(h)
+    assert out.status is OutcomeStatus.CANCELLED
+    mid.set()
+
+
+async def test_submit_after_aclose_is_voided_shutdown_and_never_speaks() -> None:
+    env = build()
+    await env.co.aclose()
+    factory_calls: list[int] = []
+    r, sink = env.req("A")
+    r.sink_factory = lambda _v: factory_calls.append(1) or sink
+    h = env.co.submit(r)
+    out = await settled(h)
+    assert out.status is OutcomeStatus.VOIDED
+    assert out.skipped_reason == SkipReason.SHUTDOWN == "shutdown"
+    assert out.metadata["reason_code"] == "shutdown"
+    assert out.turn_id == h.turn_id
+    assert factory_calls == [] and sink.chunks == [] and env.backend.calls == []
+    assert env.commits == []
+    assert [o.turn_id for o in env.outcomes] == [h.turn_id]  # on_turn_ended 恰一次
+    assert h.generation_done.done()
+    assert env.co.live_turns() == [] and not env.co.busy
+
+
+async def test_cross_thread_entries_after_aclose_are_noops_returning_false() -> None:
+    env, mid = build_split()
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    await until(lambda: len(sink.chunks) == 1)
+    mid.set()
+    await env.co.aclose()
+    assert (await settled(h)).status is OutcomeStatus.CANCELLED
+    loop = asyncio.get_running_loop()
+
+    def poke() -> list[object]:
+        env.co.on_voice_event(voiced(0.0))
+        env.co.cancel_all("again")
+        return [env.co.void(h.turn_id), env.co.cancel_voice(h.turn_id)]
+
+    assert await loop.run_in_executor(None, poke) == [False, False]
+
+
+class _FailingBackend(ScriptBackend):
+    async def stream_query(self, messages, system_instruction=None, **kwargs):
+        self.calls.append(list(messages))
+        yield SENTENCES[0]
+        raise RuntimeError("backend boom")
+
+
+def _fail_think(env: Env) -> None:
+    backend = _FailingBackend()
+    backend.stage = env.think
+    env.think._backend = backend
+
+
+async def test_failed_outcome_carries_upstream_error_reason_code() -> None:
+    env = build()
+    _fail_think(env)
+    r, _ = env.req("A")
+    out = await settled(env.co.submit(r))
+    assert out.status is OutcomeStatus.FAILED
+    assert out.metadata["reason_code"] == "upstream_error"
+
+
+class GenDoneSpy:
+    def __init__(self, env: Env) -> None:
+        self.calls: list[tuple[str, bool, int]] = []  # (turn_id, ok, 呼叫當下的 outcome 數)
+        self.env = env
+
+    def __call__(self, view, ok: bool) -> None:
+        self.calls.append((view.turn_id, ok, len(self.env.outcomes)))
+
+
+async def test_on_generation_done_ok_true_before_outcome_on_normal_completion() -> None:
+    env = build()
+    spy = GenDoneSpy(env)
+    r, sink = env.req("A", on_generation_done=spy)
+    h = env.co.submit(r)
+    await playing(sink)
+    sink.finish()
+    out = await settled(h)
+    assert out.status is OutcomeStatus.COMPLETED
+    assert spy.calls == [(h.turn_id, True, 0)]  # 一次、ok、早於 outcome
+
+
+async def test_on_generation_done_ok_true_on_pass_and_barge_in() -> None:
+    env = build()
+    spy = GenDoneSpy(env)
+    r, sink = env.req("A", on_generation_done=spy, text_filter=PassOnFirst())
+    h = env.co.submit(r)
+    out = await settled(h)
+    assert out.skipped_reason == SkipReason.PASS
+    assert spy.calls == [(h.turn_id, True, 0)]
+
+    env2, mid = build_split()
+    spy2 = GenDoneSpy(env2)
+    r2, sink2 = env2.req("B", on_generation_done=spy2)
+    h2 = env2.co.submit(r2)
+    await until(lambda: len(sink2.chunks) == 1)
+    sink2.play(1.0)
+    for k in range(4):
+        env2.co.on_voice_event(voiced(1.0 + 0.5 * k))
+    assert spy2.calls == []  # think 還沒生成完
+    mid.set()
+    out2 = await settled(h2)
+    assert out2.barge_in
+    assert spy2.calls == [(h2.turn_id, True, 0)]  # 只停語音，生成仍正常完成
+
+
+async def test_on_generation_done_ok_false_on_think_error_and_whole_turn_cancel() -> None:
+    env = build()
+    _fail_think(env)
+    spy = GenDoneSpy(env)
+    r, _ = env.req("A", on_generation_done=spy)
+    h = env.co.submit(r)
+    out = await settled(h)
+    assert out.status is OutcomeStatus.FAILED
+    assert spy.calls == [(h.turn_id, False, 0)]
+
+    env2, mid = build_split()
+    spy2 = GenDoneSpy(env2)
+    r2, sink2 = env2.req("B", on_generation_done=spy2)
+    h2 = env2.co.submit(r2)
+    await until(lambda: len(sink2.chunks) == 1)
+    env2.co.cancel_all("left")
+    out2 = await settled(h2)
+    assert out2.status is OutcomeStatus.CANCELLED
+    assert spy2.calls == [(h2.turn_id, False, 0)]
+    mid.set()
+
+
+async def test_on_generation_done_exception_is_swallowed_and_async_supported(caplog) -> None:
+    env = build()
+
+    def boom(_view, _ok) -> None:
+        raise RuntimeError("cb boom")
+
+    r, sink = env.req("A", on_generation_done=boom)
+    with caplog.at_level("WARNING"):
+        h = env.co.submit(r)
+        await playing(sink)
+        sink.finish()
+        out = await settled(h)
+    assert out.status is OutcomeStatus.COMPLETED and out.error is None
+    assert any("on_generation_done" in rec.getMessage() for rec in caplog.records)
+
+    seen: list[bool] = []
+
+    async def acb(_view, ok: bool) -> None:
+        seen.append(ok)
+
+    r2, sink2 = env.req("B", owner="u2", on_generation_done=acb)
+    h2 = env.co.submit(r2)
+    await playing(sink2)
+    sink2.finish()
+    await settled(h2)
+    await until(lambda: seen == [True])
+
+
+async def test_on_generation_done_not_called_when_generation_never_started() -> None:
+    gate = asyncio.Event()
+    env = build(gate=gate)
+    spy = GenDoneSpy(env)
+    ra, _ = env.req("A")
+    rb, _ = env.req("B", owner="u2", on_generation_done=spy)
+    env.co.submit(ra)
+    hb = env.co.submit(rb)
+    env.co.void(hb.turn_id)  # 等鎖期間作廢：沒有生成
+    out = await settled(hb)
+    assert out.status is OutcomeStatus.VOIDED
+    assert spy.calls == []
+    gate.set()
+
+
+async def test_submit_warns_when_ticket_and_utterance_turn_ids_differ(caplog) -> None:
+    env = build()
+    r, sink = env.req("A")
+    utt = r.utterance
+    r.ticket = dataclasses.replace(r.ticket, turn_id="turn_core_1", source_turn_id=utt.turn_id)
+    with caplog.at_level("WARNING"):
+        h = env.co.submit(r)
+    assert any("turn_id" in rec.getMessage() for rec in caplog.records)
+    assert h.turn_id == "turn_core_1"  # 行為不變
+    await playing(sink)
+    sink.finish()
+    assert (await settled(h)).status is OutcomeStatus.COMPLETED
+
+
+async def test_submit_does_not_warn_when_turn_ids_equal(caplog) -> None:
+    env = build()
+    r, sink = env.req("A")
+    r.ticket = dataclasses.replace(r.ticket, turn_id=r.utterance.turn_id)
+    with caplog.at_level("WARNING"):
+        h = env.co.submit(r)
+    assert not [rec for rec in caplog.records if "turn_id" in rec.getMessage()]
+    await playing(sink)
+    sink.finish()
+    await settled(h)
+
+
+# ───────────────────── S3 審查追補：fallback 出口／背景回呼／loop 綁定 ─────────────────────
+
+
+async def test_fallback_failed_outcome_has_upstream_error_and_gen_done_before_outcome() -> None:
+    env = build()
+    spy = GenDoneSpy(env)
+
+    async def bad_produce(t) -> None:
+        t._gen_started = True  # 生成已開始但尚未 resolve，然後 _produce 逃出例外
+        raise RuntimeError("internal bug")
+
+    env.co._produce = bad_produce  # type: ignore[method-assign]
+    r, _ = env.req("A", on_generation_done=spy)
+    h = env.co.submit(r)
+    out = await settled(h)
+    assert out.status is OutcomeStatus.FAILED
+    assert out.metadata["reason_code"] == "upstream_error"
+    assert spy.calls == [(h.turn_id, False, 0)]  # 同步回呼早於 outcome
+
+
+async def test_fallback_task_cancelled_outcome_has_shutdown_and_gen_done_before_outcome() -> None:
+    env, mid = build_split()
+    spy = GenDoneSpy(env)
+    r, sink = env.req("A", on_generation_done=spy)
+    h = env.co.submit(r)
+    await until(lambda: len(sink.chunks) == 1)  # 生成中
+    h._task.cancel()
+    out = await settled(h)
+    assert out.status is OutcomeStatus.CANCELLED
+    assert out.metadata["reason_code"] == "shutdown"
+    assert spy.calls == [(h.turn_id, False, 0)]
+    mid.set()
+
+
+async def test_aclose_cancels_hanging_async_generation_callback() -> None:
+    env = build()
+    started = asyncio.Event()
+
+    async def hang(_view, _ok) -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    r, sink = env.req("A", on_generation_done=hang)
+    h = env.co.submit(r)
+    await playing(sink)
+    sink.finish()
+    await settled(h)
+    await started.wait()
+    assert env.co._bg_tasks
+    await asyncio.wait_for(env.co.aclose(), SAFETY_S)
+    assert not env.co._bg_tasks
+
+
+async def test_bind_different_loop_after_submit_raises() -> None:
+    env = build()
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    other = asyncio.new_event_loop()
+    try:
+        with pytest.raises(RuntimeError):
+            env.co.bind_loop(other)
+        env.co.bind_loop(asyncio.get_running_loop())  # 同一個 loop 可以
+    finally:
+        other.close()
+    await playing(sink)
+    sink.finish()
+    await settled(h)
+
+
+async def test_cross_thread_cancel_on_closed_loop_does_not_raise() -> None:
+    env, mid = build_split()
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    await until(lambda: len(sink.chunks) == 1)
+    real = env.co._loop
+    dead = asyncio.new_event_loop()
+    dead.close()
+    env.co._loop = dead
+    loop = asyncio.get_running_loop()
+    errors: list[BaseException] = []
+
+    def poke() -> None:
+        try:
+            env.co.cancel_all("late")
+            env.co.on_voice_event(voiced(0.0))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    await loop.run_in_executor(None, poke)
+    assert errors == []
+    assert sink.stopped  # 同步 stop 仍然做了
+    env.co._loop = real
+    env.co._cancel_in_loop(h, False)  # 補上被吞掉的 token 取消，讓輪收尾
+    await settled(h)
+    mid.set()
+
+
+async def test_cross_thread_voice_cancel_on_closed_loop_does_not_raise() -> None:
+    env, mid = build_split()
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    await until(lambda: len(sink.chunks) == 1)
+    real = env.co._loop
+    dead = asyncio.new_event_loop()
+    dead.close()
+    env.co._loop = dead
+    loop = asyncio.get_running_loop()
+    assert await loop.run_in_executor(None, env.co.cancel_voice, h.turn_id) is True
+    env.co._loop = real
+    env.co._cancel_voice_in_loop(h, False)
+    mid.set()
+    out = await settled(h)
+    assert out.skipped_reason == SkipReason.VOICE_CANCELLED
+
+
+class SilentReturnThink:
+    """被取消就直接 return 的 think（不拋 CancelledError）。"""
+
+    name = "silent_return"
+
+    def __init__(self) -> None:
+        self.commits: list[tuple[str, str, str]] = []
+        self.waiting = asyncio.Event()
+
+    async def stream(self, utterance, token):
+        yield Sentence(text=S0, turn_id=utterance.turn_id, index=0, is_first=True)
+        self.waiting.set()
+        await token.wait()
+        return
+
+    async def commit(self, turn_id, spoken, generated):
+        self.commits.append((turn_id, spoken, generated))
+
+
+async def test_gen_done_ok_false_when_think_returns_silently_after_cancel() -> None:
+    env = build()
+    think = SilentReturnThink()
+    env.co.think = think  # type: ignore[assignment]
+    spy = GenDoneSpy(env)
+    r, _ = env.req("A", on_generation_done=spy)
+    r.sink_factory = lambda _v: "no_voice"  # 沒有語音支線：_generate 直接在主流程跑
+    h = env.co.submit(r)
+    await asyncio.wait_for(think.waiting.wait(), SAFETY_S)
+    env.co.cancel_all("left")
+    out = await settled(h)
+    assert out.status is OutcomeStatus.CANCELLED
+    assert spy.calls == [(h.turn_id, False, 0)]
+    assert think.commits == []  # 被取消的輪不 commit
+
+
+async def test_gen_done_called_once_across_regen() -> None:
+    env = build(("甲甲甲。", "乙乙乙。"), open_all=False)
+    spy = GenDoneSpy(env)
+    regen = OnceRegen("你好", times=1)
+    r, _ = env.req("你好", regen=regen, max_regenerate=1, on_generation_done=spy)
+    made: list[ManualSink] = []
+
+    def factory(_v) -> ManualSink:
+        s = ManualSink(env.log)
+        made.append(s)
+        return s
+
+    r.sink_factory = factory
+    h = env.co.submit(r)
+    await until(lambda: len(made) == 2)
+    assert spy.calls == []  # 被丟棄的第一趟不算生成結束
+    env.speak.open(0)
+    await until(lambda: len(made[1].chunks) == 1 and made[1].draining.is_set())
+    made[1].finish()
+    out = await settled(h)
+    assert out.regenerated == 1
+    assert spy.calls == [(h.turn_id, True, 0)]
+
+
+async def test_submit_during_aclose_is_voided_shutdown() -> None:
+    env, mid = build_split()
+    r, sink = env.req("A")
+    ha = env.co.submit(r)
+    await until(lambda: len(sink.chunks) == 1)
+    closing = asyncio.ensure_future(env.co.aclose())
+    await asyncio.sleep(0)  # aclose 已設 _closed，正在等 A 收尾
+    rb, sinkb = env.req("B", owner="u2")
+    hb = env.co.submit(rb)
+    outb = await settled(hb)
+    assert outb.status is OutcomeStatus.VOIDED and outb.skipped_reason == SkipReason.SHUTDOWN
+    assert sinkb.chunks == []
+    mid.set()
+    await asyncio.wait_for(closing, SAFETY_S)
+    assert (await settled(ha)).status is OutcomeStatus.CANCELLED
