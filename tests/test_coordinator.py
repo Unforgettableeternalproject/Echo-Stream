@@ -2185,3 +2185,282 @@ async def test_submit_during_aclose_is_voided_shutdown() -> None:
     mid.set()
     await asyncio.wait_for(closing, SAFETY_S)
     assert (await settled(ha)).status is OutcomeStatus.CANCELLED
+
+
+# ───────────────────────── cancel_turn：宿主單輪整輪取消 ─────────────────────────
+
+
+async def test_cancel_turn_before_generation_is_voided_with_reason_code() -> None:
+    gate = asyncio.Event()
+    env = build(gate=gate)
+    ra, _ = env.req("A", owner="u1")
+    ha = env.co.submit(ra)
+    await until(lambda: len(env.backend.calls) == 1)
+    rb, sink_b = env.req("B", owner="u2")
+    hb = env.co.submit(rb)  # 排隊中：還沒拿到 think 鎖
+    assert env.co.cancel_turn(hb.turn_id, reason_code="global_stop", detail="d1") is True
+    out_b = await settled(hb)
+    assert out_b.status is OutcomeStatus.VOIDED and out_b.aborted
+    assert out_b.metadata["reason_code"] == "global_stop"
+    assert out_b.metadata["cancel_detail"] == "d1"
+    assert not out_b.barge_in and not out_b.superseded
+    assert len(env.backend.calls) == 1 and sink_b.chunks == []
+    assert not ha.token.is_cancelled and not ha.voice_token.is_cancelled  # 不連帶前面的輪
+    gate.set()
+    await playing(env.sinks[0])
+    env.sinks[0].finish()
+    assert (await settled(ha)).status is OutcomeStatus.COMPLETED
+
+
+async def test_cancel_turn_default_reason_code_is_host_cancelled() -> None:
+    gate = asyncio.Event()
+    env = build(gate=gate)
+    r, _ = env.req("A")
+    h = env.co.submit(r)
+    await until(lambda: len(env.backend.calls) == 1)
+    assert env.co.cancel_turn(h.turn_id) is True
+    out = await settled(h)
+    assert out.metadata["reason_code"] == "host_cancelled" and out.metadata["cancel_detail"] == ""
+    gate.set()
+
+
+async def test_cancel_turn_after_audio_started_stops_think_and_sink() -> None:
+    env, mid = build_split()
+    spy = GenDoneSpy(env)
+    r, sink = env.req("A", commit=CommitMode.SETTLED, on_generation_done=spy)
+    h = env.co.submit(r)
+    await until(lambda: len(sink.chunks) == 1)  # 第一句已在播，其餘文字還沒生成
+    assert h.audio_started
+    assert env.co.cancel_turn(h.turn_id, reason_code="presence_lost", detail="gone") is True
+    out = await settled(h)
+    assert h.token.is_cancelled and sink.stopped  # think 與 sink 都被停
+    assert out.status is OutcomeStatus.CANCELLED and out.phase.name == "CANCELLED"
+    assert out.audio_started and out.aborted and out.cut_short
+    assert not out.barge_in and not out.superseded
+    assert out.metadata["reason_code"] == "presence_lost"
+    assert out.metadata["cancel_detail"] == "gone"
+    assert out.generated_text != FULL  # think 被停在中途
+    assert env.commits == []  # 結算不 commit
+    assert spy.calls == [(h.turn_id, False, 0)]  # 生成被中止：ok=False，早於 outcome
+    mid.set()
+
+
+async def test_cancel_turn_default_keeps_eager_commit_and_none_retracts_it() -> None:
+    # EAGER 且生成已完成：完整生成文字早已 commit；default 保留，none 由 coordinator 撤回
+    env = build((RESPONSE, "戊戊戊。"))
+    ra, sink_a = env.req("A")
+    ha = env.co.submit(ra)
+    await playing(sink_a)
+    assert any(h["content"] == RESPONSE for h in env.think.history)
+    assert env.co.cancel_turn(ha.turn_id, reason_code="global_stop") is True
+    out_a = await settled(ha)
+    assert out_a.metadata["reason_code"] == "global_stop"
+    assert len(env.commits) == 1  # 只有生成完成時的 EAGER commit，結算沒有再 commit
+    assert any(h["content"] == RESPONSE for h in env.think.history)  # default：留在歷史
+
+    rb, sink_b = env.req("B", owner="u2")
+    hb = env.co.submit(rb)
+    await asyncio.wait_for(hb.generation_done, SAFETY_S)  # 生成完才有 EAGER commit
+    assert env.co.cancel_turn(hb.turn_id, reason_code="global_stop", commit="none") is True
+    await settled(hb)
+    assert all(h["content"] != "戊戊戊。" for h in env.think.history)  # none：撤回
+
+
+async def test_cancel_turn_settled_mode_never_commits_for_either_commit_arg() -> None:
+    env = build()
+    r, sink = env.req("A", commit=CommitMode.SETTLED)
+    h = env.co.submit(r)
+    await playing(sink)
+    assert env.co.cancel_turn(h.turn_id, commit="none") is True
+    await settled(h)
+    assert env.commits == [] and env.think.history == []
+
+
+async def test_cancel_turn_none_without_settle_does_not_error() -> None:
+    env = build()
+    env.co.think = NoSettleThink(env.think)  # type: ignore[assignment]
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    await playing(sink)
+    assert env.co.cancel_turn(h.turn_id, commit="none") is True
+    assert (await settled(h)).status is OutcomeStatus.CANCELLED
+
+
+async def test_cancel_turn_does_not_cascade_to_queued_turns() -> None:
+    env = build()
+    ra, sink_a = env.req("A", owner="u1")
+    ha = env.co.submit(ra)
+    rb, sink_b = env.req("B", owner="u2")
+    hb = env.co.submit(rb)
+    await asyncio.wait_for(hb.generation_done, SAFETY_S)  # B 已生成完，排隊等播
+    await playing(sink_a)
+    assert env.co.cancel_turn(ha.turn_id) is True
+    await settled(ha)
+    assert not hb.token.is_cancelled and not hb.voice_token.is_cancelled
+    await until(lambda: len(sink_b.chunks) == 4)
+    sink_b.finish()
+    out_b = await settled(hb)
+    assert out_b.status is OutcomeStatus.COMPLETED
+
+
+async def test_cancel_turn_works_on_non_interruptible_turn() -> None:
+    class Rules:
+        def flags_for(self, reply_mode):
+            return ModeFlags(barge_in=False)
+
+    env = build()
+    env.co.policy_source = StaticPolicySource(PolicySnapshot(mode_rules=Rules()))
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    await playing(sink)
+    assert h.flags.barge_in is False
+    assert env.co.cancel_turn(h.turn_id, reason_code="global_stop") is True
+    out = await settled(h)
+    assert out.status is OutcomeStatus.CANCELLED and sink.stopped
+
+
+async def test_cancel_turn_after_barge_in_or_cancel_voice_still_works() -> None:
+    env, mid = build_split()
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    await until(lambda: len(sink.chunks) == 1)
+    assert env.co.cancel_voice(h.turn_id) is True
+    assert env.co.cancel_turn(h.turn_id, reason_code="global_stop") is True
+    out = await settled(h)
+    assert out.status is OutcomeStatus.CANCELLED and not out.barge_in and out.aborted
+    assert out.metadata["reason_code"] == "global_stop" and h.token.is_cancelled
+    mid.set()
+
+
+async def test_cancel_turn_returns_false_when_unknown_finished_repeated_or_claimed() -> None:
+    env = build()
+    assert env.co.cancel_turn("nope") is False
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    await playing(sink)
+    assert env.co.cancel_turn(h.turn_id, reason_code="first") is True
+    assert env.co.cancel_turn(h.turn_id, reason_code="second") is False  # 同一輪只成功一次
+    out = await settled(h)
+    assert out.metadata["reason_code"] == "first"
+    assert env.co.cancel_turn(h.turn_id) is False  # 已結束
+
+    rb, sink_b = env.req("B")
+    hb = env.co.submit(rb)
+    await playing(sink_b)
+    sink_b.finish()
+    await settled(hb)
+    assert env.co.cancel_turn(hb.turn_id) is False  # 正常結束的輪
+
+    rc, sink_c = env.req("C")
+    hc = env.co.submit(rc)
+    await playing(sink_c)
+    env.co.cancel_all("x")
+    assert env.co.cancel_turn(hc.turn_id) is False  # 已被整輪認領
+    assert (await settled(hc)).metadata["reason_code"] == "shutdown"
+
+
+async def test_cancel_turn_loses_to_earlier_void_and_blocks_later_void() -> None:
+    gate = asyncio.Event()
+    env = build(gate=gate)
+    ra, _ = env.req("A", owner="u1")
+    env.co.submit(ra)
+    await until(lambda: len(env.backend.calls) == 1)
+    rb, _ = env.req("B", owner="u2")
+    hb = env.co.submit(rb)
+    rc, _ = env.req("C", owner="u3")
+    hc = env.co.submit(rc)
+    assert env.co.void(hb.turn_id) is True
+    assert env.co.cancel_turn(hb.turn_id) is False
+    assert env.co.cancel_turn(hc.turn_id, reason_code="global_stop") is True
+    assert env.co.void(hc.turn_id) is False
+    assert (await settled(hb)).metadata["reason_code"] == "yielded"
+    assert (await settled(hc)).metadata["reason_code"] == "global_stop"
+    gate.set()
+
+
+async def test_cancel_turn_after_aclose_is_false() -> None:
+    env = build()
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    await playing(sink)
+    await env.co.aclose()
+    assert env.co.cancel_turn(h.turn_id) is False
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"reason_code": ""}, "reason_code"),
+        ({"reason_code": "   "}, "reason_code"),
+        ({"reason_code": None}, "reason_code"),
+        ({"reason_code": 7}, "reason_code"),
+        ({"commit": "all"}, "commit"),
+    ],
+)
+async def test_cancel_turn_rejects_invalid_arguments(kwargs: dict, message: str) -> None:
+    env = build()
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    await playing(sink)
+    with pytest.raises(ValueError, match=message):
+        env.co.cancel_turn(h.turn_id, **kwargs)
+    assert not h.token.is_cancelled  # 驗證失敗不會認領
+
+
+async def test_cancel_turn_from_other_threads_stops_sync_and_wins_once() -> None:
+    env, mid = build_split()
+    sink = ThreadSpySink(env.log)
+    r, _ = env.req("A", sink=sink)
+    h = env.co.submit(r)
+    await until(lambda: len(sink.chunks) == 1)
+    cancels: list[int] = []
+    h.token.on_cancel(lambda _r: cancels.append(threading.get_ident()))
+    loop_thread = threading.get_ident()
+    caller_threads: list[int] = []
+    results: list[bool] = []
+
+    def call(code: str) -> None:
+        caller_threads.append(threading.get_ident())
+        results.append(env.co.cancel_turn(h.turn_id, reason_code=code))
+
+    def mixed() -> None:
+        results.append(env.co.void(h.turn_id))  # 已開播：一律 False
+        env.co.cancel_all("late")  # 與 cancel_turn 搶同一個認領
+
+    loop = asyncio.get_running_loop()
+    await asyncio.gather(
+        *(loop.run_in_executor(None, call, f"code{i}") for i in range(4)),
+        loop.run_in_executor(None, mixed),
+    )
+    # cancel_turn 與 cancel_all 搶同一個認領，只有一個贏；void 對已開播輪恆為 False
+    assert results.count(True) <= 1
+    assert sink.stop_threads[0] in caller_threads and sink.stop_threads[0] != loop_thread
+    await until(lambda: h.token.is_cancelled)
+    assert cancels == [loop_thread]  # token 只取消一次，且在 loop 內
+    mid.set()
+    out = await settled(h)
+    winner = out.metadata["reason_code"]
+    if results.count(True) == 1:
+        assert winner.startswith("code")
+    else:
+        assert winner == "shutdown"  # cancel_all 搶先
+    assert [o.turn_id for o in env.outcomes].count(h.turn_id) == 1
+
+
+async def test_cancel_turn_cross_thread_on_closed_loop_does_not_raise() -> None:
+    env, mid = build_split()
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    await until(lambda: len(sink.chunks) == 1)
+    real = env.co._loop
+    dead = asyncio.new_event_loop()
+    dead.close()
+    env.co._loop = dead
+    loop = asyncio.get_running_loop()
+    assert await loop.run_in_executor(None, env.co.cancel_turn, h.turn_id) is True
+    assert sink.stopped  # 同步 stop 仍然做了
+    env.co._loop = real
+    env.co._cancel_in_loop(h, False)  # 補上被吞掉的 token 取消，讓輪收尾
+    out = await settled(h)
+    assert out.metadata["reason_code"] == "host_cancelled"
+    mid.set()

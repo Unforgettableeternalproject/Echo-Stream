@@ -36,12 +36,21 @@
 * 讓位 ``void()``：``SUPERSEDED`` + detail ``yielded``；已開播的輪不處理（回 False）
 * 同 owner 新回覆：``SUPERSEDED`` + detail ``superseded_by_owner``
 * ``cancel_all()``：``SHUTDOWN``，整輪作廢（think 也停），不 commit、不 settle
+* 宿主單輪整輪取消 ``cancel_turn()``：kind ``host``，整輪作廢（think 也停），已開播也可、
+  不看 ``flags.barge_in``、不連帶取消後面排隊的輪（同 ``cancel_voice``）。token 原因用
+  ``SHUTDOWN``（不 commit、不 settle，同 ``cancel_all``），``metadata["reason_code"]`` 是宿主傳入值
+  （建議 ``host_cancelled``／``global_stop``／``presence_lost``）、``cancel_detail`` 為 detail；
+  不標 ``barge_in``／``superseded``，``aborted=True``。等鎖期間被取消同其他整輪取消為 ``VOIDED``。
+  歷史：預設與 ``cancel_all`` 相同，結算不 commit；EAGER 且生成已完成的輪，完整生成文字早已
+  commit 並留在歷史（宿主可接著 ``think.settle(turn_id, "")`` 移除）。``commit="none"`` 則由
+  coordinator 在結算時對已 EAGER commit 的輪呼叫 ``settle(turn_id, "", generated)`` 撤回
 
 ## 執行緒契約
 
 | 入口 | 執行緒 | 備註 |
 | --- | --- | --- |
-| ``on_voice_event`` / ``void`` / ``cancel_voice`` / ``cancel_all`` | 任何執行緒 | 同步 stop |
+| ``on_voice_event`` / ``void`` / ``cancel_voice`` | 任何執行緒 | 同步 stop |
+| ``cancel_turn`` / ``cancel_all`` | 任何執行緒 | 同步 stop |
 | ``bind_loop`` | 任何執行緒 | 須在第一次 ``submit`` 之前 |
 | ``busy`` / ``waiting`` / ``live_turns`` | 建議 loop 內 | 其他執行緒讀到瞬時快照 |
 | ``submit`` / ``join`` / ``aclose`` | 只能 loop 內 | loop 須與 ``bind_loop`` 一致 |
@@ -64,11 +73,12 @@
   的邊角（此時 ``cancel_reason`` 仍為 None，認領的種類不反映在 reason_code）。
 * ``_closed`` 永久，``aclose`` 之後不能 reopen。
 
-``void`` / ``cancel_all`` / ``on_voice_event`` 會**無鎖**讀 ``_live`` 的快照與 ``audio_started``。
+``void`` / ``cancel_turn`` / ``cancel_all`` / ``on_voice_event`` 會**無鎖**讀 ``_live`` 的快照
+與 ``audio_started``。
 非 loop 執行緒可能讀到過渡狀態（例如某輪恰好此刻開播，``void`` 因而回 False 而不是 True），
 這個競態可接受：後果只是「這次讓位沒成功」，不會重複取消、不會漏掉 outcome；真正的狀態改變
 （認領）仍由鎖保護、每輪恰好一次。
-:meth:`aclose` 之後這些入口全部 no-op（``void`` / ``cancel_voice`` 回 False）。
+:meth:`aclose` 之後這些入口全部 no-op（``void`` / ``cancel_voice`` / ``cancel_turn`` 回 False）。
 
 ## 不做的事
 
@@ -87,6 +97,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Sequence
+from typing import Literal
 
 from ..contracts.cancellation import CancellationToken, CancelledError, CancelReason
 from ..contracts.output import (
@@ -158,9 +169,14 @@ KIND_BARGE_IN = "barge_in"
 KIND_CASCADE = "cascade"
 KIND_VOICE_ERROR = "voice_error"
 KIND_VOICE_CANCEL = "voice_cancel"
+KIND_HOST = "host"
 """取消種類（認領時記錄，決定 reason_code／superseded／cascade 旗標；``detail`` 只是自由字串）。
 其餘種類沿用 ``CancelReason.value``（shutdown、timeout、upstream_error…）。"""
 
+
+REASON_HOST_CANCELLED = "host_cancelled"
+"""``cancel_turn`` 的預設 ``reason_code``。
+其餘建議值 ``global_stop``／``presence_lost``（不限制值域）。"""
 
 _SOFT_VOICE_KINDS = (KIND_VOICE_ERROR, KIND_VOICE_CANCEL)
 """只關語音、輪本身仍以 DONE 結算的語音取消種類（與 barge-in／cascade 的 CANCELLED 區分）。"""
@@ -283,6 +299,8 @@ class TurnHandle:
         self._cancel_reason: CancelReason | None = None
         self._cancel_detail = ""
         self._cancel_kind: str | None = None
+        self._host_reason_code: str | None = None
+        self._host_commit = "default"
         self._voice_kind: str | None = None
         self._voice_error: str | None = None
         self._hook_error: str | None = None
@@ -610,6 +628,56 @@ class TurnCoordinator:
             return True
         return False
 
+    def cancel_turn(
+        self,
+        turn_id: str,
+        *,
+        reason_code: str = REASON_HOST_CANCELLED,
+        detail: str = "",
+        commit: Literal["default", "none"] = "default",
+    ) -> bool:
+        """取消單一輪的**整輪**（含已開播；think 也停）。任何執行緒皆可。
+
+        宿主的明確指令（例如 Core 拒絕該輪：``global_stop``／``presence_lost``／管制）：
+        呼叫執行緒同步 ``sink.stop()``，token 取消經 ``call_soon_threadsafe`` 回 loop。
+        **不看 ``flags.barge_in``**，不可打斷的輪也能取消；**不連帶**取消後面排隊的輪
+        （與 :meth:`cancel_voice` 一致，要取消多輪請逐輪呼叫或用 :meth:`cancel_all`）。
+
+        outcome：``CANCELLED``（等鎖期間被取消則同其他整輪取消為 ``VOIDED``）、
+        ``metadata["reason_code"]`` = ``reason_code``、``metadata["cancel_detail"]`` = ``detail``、
+        ``aborted=True``，不標 ``barge_in``／``superseded``；``outcome.cancel_reason`` 沿用
+        ``"shutdown"``（內部 token 原因），請以 ``reason_code`` 區分。已生成但未結束的輪，
+        ``on_generation_done`` 以 ``ok=False`` 觸發。
+
+        歷史（commit）：與 :meth:`cancel_all`／``void`` 一致，結算時**不 commit**。但 EAGER 模式下
+        生成已完成的輪，完整生成文字在生成完成時就已 commit，不會自動消失；
+        ``commit="default"`` 保留它（宿主可接著 ``think.settle(turn_id, "")`` 移除），
+        ``commit="none"`` 則由 coordinator 在結算時對已 EAGER commit 的輪呼叫
+        ``settle(turn_id, "", generated)`` 撤回（think 沒有 ``settle`` 時無法撤回）。
+        SETTLED 模式兩者相同：本來就不會 commit。
+
+        ``reason_code`` 須為非空字串（值域不限）、``commit`` 須為 ``"default"``／``"none"``，
+        否則 ``ValueError``。成功認領回 True；``turn_id`` 不存在、輪已結束、已被整輪認領取消
+        （讓位、同 owner 取代、``cancel_all``、另一次 ``cancel_turn``）、或 coordinator 已
+        關閉回 False。已被 barge-in／``cancel_voice`` 取消語音的輪仍可整輪取消。
+        """
+        if not isinstance(reason_code, str) or not reason_code.strip():
+            raise ValueError("reason_code 必須是非空字串")
+        if commit not in ("default", "none"):
+            raise ValueError(f"commit 必須是 'default' 或 'none'，收到 {commit!r}")
+        if self._closed:
+            return False
+        for t in list(self._live):
+            if t.turn_id != turn_id:
+                continue
+            if t._done or t._play_done.is_set():
+                return False
+            if not self._claim_host(t, reason_code, detail, commit):
+                return False
+            self._dispatch(t)
+            return True
+        return False
+
     def cancel_all(self, reason: str = "shutdown") -> None:
         """取消所有進行中與排隊中的輪（SHUTDOWN）：停播、不 commit、不 settle。
 
@@ -669,6 +737,19 @@ class TurnCoordinator:
             t._cancel_reason = reason
             t._cancel_detail = detail
             t._cancel_kind = kind or reason.value
+        return True
+
+    def _claim_host(self, t: TurnHandle, reason_code: str, detail: str, commit: str) -> bool:
+        """認領宿主的整輪取消（同鎖內一併記下 reason_code／commit，結算時才讀得到）。"""
+        with t._cancel_lock:
+            if t._cancel_claimed:
+                return False
+            t._cancel_claimed = True
+            t._cancel_reason = CancelReason.SHUTDOWN
+            t._cancel_detail = detail
+            t._cancel_kind = KIND_HOST
+            t._host_reason_code = reason_code
+            t._host_commit = commit
         return True
 
     def _dispatch(self, t: TurnHandle, *, cascade: bool = False) -> None:
@@ -1431,8 +1512,10 @@ class TurnCoordinator:
         settle = getattr(self.think, "settle", None)
         if no_history:
             if (
-                reason is CancelReason.SUPERSEDED
-                and req.retract_on_yield
+                (
+                    (reason is CancelReason.SUPERSEDED and req.retract_on_yield)
+                    or (kind == KIND_HOST and t._host_commit == "none")
+                )
                 and t._eager_committed
                 and settle is not None
             ):
@@ -1535,7 +1618,9 @@ class TurnCoordinator:
     ) -> dict:
         meta: dict = {}
         if reason is not None:
-            if reason is CancelReason.SUPERSEDED:
+            if kind == KIND_HOST and t._host_reason_code:
+                code = t._host_reason_code
+            elif reason is CancelReason.SUPERSEDED:
                 code = REASON_YIELDED if kind == KIND_YIELD else "superseded"
             else:
                 code = reason.value
