@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import threading
 from dataclasses import dataclass, field
 
@@ -176,6 +177,67 @@ async def test_barge_in_cascades_to_queued_unstarted_turns() -> None:
     assert out_b.barge_in and out_b.metadata.get("cascade") is True
     assert out_b.status is OutcomeStatus.CANCELLED
     assert sink_b.chunks == [] and sink_b.stop_calls >= 1
+
+
+async def test_barge_in_cascade_skips_non_interruptible_turns() -> None:
+    class Rules:
+        def flags_for(self, reply_mode):
+            return ModeFlags(barge_in=reply_mode != "locked")
+
+    env = build()
+    env.co.policy_source = StaticPolicySource(PolicySnapshot(mode_rules=Rules()))
+    ra, sink_a = env.req("A", owner="u1")
+    ha = env.co.submit(ra)
+    await playing(sink_a)
+    sink_a.play(1.0)
+    rb, sink_b = env.req("B", owner="u2", barge=("u2",))
+    rb.ticket = dataclasses.replace(rb.ticket, reply_mode="locked")
+    hb = env.co.submit(rb)
+    rc, sink_c = env.req("C", owner="u3", barge=("u3",))
+    hc = env.co.submit(rc)
+    await asyncio.wait_for(hc.generation_done, SAFETY_S)
+
+    for k in range(4):
+        env.co.on_voice_event(voiced(1.0 + 0.5 * k))
+    assert ha.voice_token.is_cancelled
+    out_a, out_c = await settled(ha), await settled(hc)
+    assert out_c.barge_in and out_c.metadata.get("cascade") is True  # 可打斷的輪照常連帶
+    assert not hb.voice_token.is_cancelled and sink_b.stop_calls == 0  # 不可打斷的輪不被連帶
+    await until(lambda: len(sink_b.chunks) == 4)
+    sink_b.finish()
+    out_b = await settled(hb)
+    assert out_a.barge_in and out_b.status is OutcomeStatus.COMPLETED
+    assert not out_b.barge_in and "cascade" not in out_b.metadata
+
+
+async def test_void_custom_reason_keeps_yielded_reason_code() -> None:
+    gate = asyncio.Event()
+    env = build(gate=gate)
+    ra, _ = env.req("A", owner="u1")
+    env.co.submit(ra)
+    await until(lambda: len(env.backend.calls) == 1)
+    rb, _ = env.req("B", owner="u2")
+    hb = env.co.submit(rb)
+    assert env.co.void(hb.turn_id, reason="custom") is True
+    out = await settled(hb)
+    assert out.status is OutcomeStatus.VOIDED
+    assert out.metadata["reason_code"] == "yielded"  # reason_code 看種類，不看 detail 字串
+    assert out.metadata["cancel_detail"] == "custom"
+    assert out.superseded is False
+    gate.set()
+
+
+async def test_owner_supersede_reason_code_is_superseded() -> None:
+    gate = asyncio.Event()
+    env = build(gate=gate)
+    ra, _ = env.req("A", owner="u1")
+    ha = env.co.submit(ra)
+    await until(lambda: len(env.backend.calls) == 1)
+    rb, _ = env.req("B", owner="u1")
+    env.co.submit(rb)
+    out = await settled(ha)
+    assert out.metadata["reason_code"] == "superseded" and out.superseded
+    gate.set()
 
 
 # ───────────────────────── 取消語意表（§7）─────────────────────────

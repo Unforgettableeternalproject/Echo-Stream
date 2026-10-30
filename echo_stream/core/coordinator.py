@@ -104,6 +104,13 @@ REASON_CASCADE = "cascade"
 REASON_OWNER = "superseded_by_owner"
 REASON_YIELDED = "yielded"
 
+KIND_YIELD = "yield"
+KIND_OWNER = "owner"
+KIND_BARGE_IN = "barge_in"
+KIND_CASCADE = "cascade"
+"""取消種類（認領時記錄，決定 reason_code／superseded／cascade 旗標；``detail`` 只是自由字串）。
+其餘種類沿用 ``CancelReason.value``（shutdown、timeout、upstream_error…）。"""
+
 
 def _stop_sink(sink: AudioSink | None) -> None:
     if sink is None:
@@ -211,6 +218,8 @@ class TurnHandle:
         self._cancel_claimed = False
         self._cancel_reason: CancelReason | None = None
         self._cancel_detail = ""
+        self._cancel_kind: str | None = None
+        self._voice_kind: str | None = None
         self._chaining = False
 
     # --- TurnView ---
@@ -420,7 +429,7 @@ class TurnCoordinator:
                 continue
             if t._done or t._play_done.is_set() or t.audio_started:
                 return False
-            if not self._claim(t, CancelReason.SUPERSEDED, reason):
+            if not self._claim(t, CancelReason.SUPERSEDED, reason, KIND_YIELD):
                 return False
             self._dispatch(t)
             return True
@@ -455,14 +464,17 @@ class TurnCoordinator:
     def _on_loop_thread(self) -> bool:
         return threading.get_ident() == self._loop_thread
 
-    def _claim(self, t: TurnHandle, reason: CancelReason, detail: str) -> bool:
-        """認領取消權：每輪只會成功一次（跨執行緒安全）。"""
+    def _claim(
+        self, t: TurnHandle, reason: CancelReason, detail: str, kind: str | None = None
+    ) -> bool:
+        """認領取消權：每輪只會成功一次（跨執行緒安全）。``kind`` 缺省取 ``reason.value``。"""
         with t._cancel_lock:
             if t._cancel_claimed:
                 return False
             t._cancel_claimed = True
             t._cancel_reason = reason
             t._cancel_detail = detail
+            t._cancel_kind = kind or reason.value
         return True
 
     def _dispatch(self, t: TurnHandle, *, cascade: bool = False) -> None:
@@ -483,13 +495,14 @@ class TurnCoordinator:
         if cascade and self._cascade:
             self._cancel_queued_after(t)
 
-    def _claim_voice(self, t: TurnHandle, detail: str) -> bool:
+    def _claim_voice(self, t: TurnHandle, detail: str, kind: str = KIND_BARGE_IN) -> bool:
         """認領語音取消權（barge-in）：每輪只成功一次，與整輪取消的認領互不影響。"""
         with t._cancel_lock:
             if t._voice_claimed or t._cancel_claimed:
                 return False
             t._voice_claimed = True
             t._voice_detail = detail
+            t._voice_kind = kind
         return True
 
     def _barge_in(self, t: TurnHandle) -> None:
@@ -520,7 +533,9 @@ class TurnCoordinator:
         for o in later:
             if o._done or o._play_done.is_set() or o.audio_started:
                 continue
-            if self._claim_voice(o, REASON_CASCADE):
+            if not o.flags.barge_in:
+                continue  # 不可打斷的輪不被連帶取消語音
+            if self._claim_voice(o, REASON_CASCADE, KIND_CASCADE):
                 self._cancel_voice_in_loop(o, False)
 
     def _supersede_owner(self, new: TurnHandle) -> None:
@@ -536,7 +551,7 @@ class TurnCoordinator:
                 or not old.flags.supersede_same_owner
             ):
                 continue
-            if self._claim(old, CancelReason.SUPERSEDED, REASON_OWNER):
+            if self._claim(old, CancelReason.SUPERSEDED, REASON_OWNER, KIND_OWNER):
                 self._dispatch(old)
 
     # ───────────────────────── 快照／旗標 ─────────────────────────
@@ -1070,14 +1085,15 @@ class TurnCoordinator:
         cancelled = phase is TurnPhase.CANCELLED
         reason: CancelReason | None = None
         detail = ""
+        kind: str | None = None
         if cancelled:
             if t._cancel_claimed:
-                reason, detail = t._cancel_reason, t._cancel_detail
+                reason, detail, kind = t._cancel_reason, t._cancel_detail, t._cancel_kind
             elif t._voice_claimed:
-                reason, detail = CancelReason.BARGE_IN, t._voice_detail
+                reason, detail, kind = CancelReason.BARGE_IN, t._voice_detail, t._voice_kind
         barge_in = reason is CancelReason.BARGE_IN
-        superseded = cancelled and detail == REASON_OWNER
-        aborted = cancelled and not (barge_in and detail != REASON_CASCADE)
+        superseded = cancelled and kind == KIND_OWNER
+        aborted = cancelled and not (barge_in and kind != KIND_CASCADE)
         cut_short = barge_in or superseded or aborted or bool(error)
 
         # 被停掉的 sink 可能還有「最後實播位置」在回報路上：先等它確認再推算 spoken
@@ -1152,7 +1168,7 @@ class TurnCoordinator:
             spoken_duration_s=spoken_s,
             cancel_reason=cancel_value,
             error=error,
-            metadata=self._outcome_meta(t, reason, detail),
+            metadata=self._outcome_meta(t, reason, kind, detail),
             skipped_reason=skipped,
             cut_short=cut_short,
             audio_started=t.audio_started,
@@ -1175,16 +1191,18 @@ class TurnCoordinator:
     # --- outcome 出口 ---
 
     @staticmethod
-    def _outcome_meta(t: TurnHandle, reason: CancelReason | None, detail: str) -> dict:
+    def _outcome_meta(
+        t: TurnHandle, reason: CancelReason | None, kind: str | None, detail: str
+    ) -> dict:
         meta: dict = {}
         if reason is not None:
             if reason is CancelReason.SUPERSEDED:
-                code = REASON_YIELDED if detail == REASON_YIELDED else "superseded"
+                code = REASON_YIELDED if kind == KIND_YIELD else "superseded"
             else:
                 code = reason.value
             meta["reason_code"] = code
             meta["cancel_detail"] = detail
-            if detail == REASON_CASCADE:
+            if kind == KIND_CASCADE:
                 meta["cascade"] = True
         if t._stale:
             meta["stale_snapshot"] = True
@@ -1220,6 +1238,7 @@ class TurnCoordinator:
         """等鎖期間被作廢：沒有生成、沒有播放、不 commit。"""
         reason = t._cancel_reason or CancelReason.SHUTDOWN
         detail = t._cancel_detail
+        kind = t._cancel_kind
         barge_in = reason is CancelReason.BARGE_IN
         _stop_sink(t._first_sink)
         self.tracer.finish(t.turn_id, TurnPhase.CANCELLED, reason.value, None)
@@ -1228,13 +1247,13 @@ class TurnCoordinator:
             phase=TurnPhase.CANCELLED,
             utterance_text=t.request.utterance.text,
             cancel_reason=reason.value,
-            metadata=self._outcome_meta(t, reason, detail),
+            metadata=self._outcome_meta(t, reason, kind, detail),
             skipped_reason=SkipReason.VOIDED,
             cut_short=True,
             status=OutcomeStatus.VOIDED,
             barge_in=barge_in,
-            superseded=detail == REASON_OWNER,
-            aborted=not (barge_in and detail != REASON_CASCADE),
+            superseded=kind == KIND_OWNER,
+            aborted=not (barge_in and kind != KIND_CASCADE),
             snapshot_version=t._snapshot_version,
         ))
 
