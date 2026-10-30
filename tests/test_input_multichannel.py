@@ -674,3 +674,26 @@ class TestTranscriberPoolTimeout:
         finally:
             backend.gate.set()
             await asyncio.sleep(0.05)
+
+    def test_loop_關閉後孤兒才結束不拋例外且額度歸還(self, recwarn) -> None:
+        """孤兒執行緒在 loop 關閉後才結束：不可有未處理例外，額度仍要歸還。"""
+        import gc
+
+        backend = _GateBackend(slow={1})
+        loop = asyncio.new_event_loop()
+        pool = TranscriberPool(backend, job_timeout_s=0.1)
+        try:
+            result = loop.run_until_complete(pool.run("A", _pcm(1), SR))
+            assert result.timed_out is True
+            assert pool._orphans == 1
+            pool.close()
+        finally:
+            loop.close()
+        backend.gate.set()  # loop 已關閉，孤兒此時才結束
+        deadline = time.perf_counter() + 2.0
+        while 1 not in backend.finished and time.perf_counter() < deadline:
+            time.sleep(0.01)
+        while pool._orphans and time.perf_counter() < deadline:
+            time.sleep(0.01)
+        gc.collect()
+        assert pool._orphans == 0

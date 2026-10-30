@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import threading
 import time
 from collections import deque
 from collections.abc import AsyncIterator, Callable
@@ -55,6 +56,16 @@ class PoolResult:
 
 _TIMED_OUT = object()
 """``TranscriberPool._await_with_timeout`` 的哨兵：該任務已逾時放棄。"""
+
+
+class _ThreadState:
+    """執行緒端與 loop 端共享的完成／孤兒旗標；由 ``TranscriberPool._orphan_lock`` 保護。"""
+
+    __slots__ = ("finished", "orphaned")
+
+    def __init__(self) -> None:
+        self.finished = False
+        self.orphaned = False
 
 
 class _Job:
@@ -115,6 +126,7 @@ class TranscriberPool:
         self.max_orphans = max_orphans
         self.timeouts = 0
         self._orphans = 0
+        self._orphan_lock = threading.Lock()
         self._clock = clock
         self._queues: dict[str, deque[_Job]] = {}
         self._ring: deque[str] = deque()
@@ -189,8 +201,25 @@ class TranscriberPool:
             return per_channel(speaker_id, pcm, sample_rate)
         return self.backend.transcribe(pcm, sample_rate)
 
+    def _invoke_tracked(
+        self, state: _ThreadState, speaker_id: str, pcm: bytes, sample_rate: int
+    ) -> Any:
+        """在執行緒內呼叫 backend，結束時（無論 loop 是否還活著）歸還孤兒額度。"""
+        try:
+            return self._invoke(speaker_id, pcm, sample_rate)
+        finally:
+            with self._orphan_lock:
+                state.finished = True
+                if state.orphaned:
+                    self._orphans -= 1
+
     async def _await_with_timeout(
-        self, speaker_id: str, job: _Job, fut: asyncio.Future, started: float
+        self,
+        speaker_id: str,
+        job: _Job,
+        fut: asyncio.Future,
+        state: _ThreadState,
+        started: float,
     ) -> Any:
         """等執行緒結果；逾時且孤兒額度有空就放棄它（回傳 ``_TIMED_OUT``）。"""
         audio_s = len(job.pcm) / 2 / max(1, job.sample_rate)
@@ -198,11 +227,18 @@ class TranscriberPool:
         done, _ = await asyncio.wait({fut}, timeout=limit)
         if done:
             return fut.result()
-        if self._orphans >= self.max_orphans:
-            return await fut  # 孤兒額滿：不再放棄，照常等
-        self._orphans += 1
+        with self._orphan_lock:
+            # 剛好在此刻完成、或孤兒額滿：不放棄，照常等
+            if state.finished or self._orphans >= self.max_orphans:
+                abandon = False
+            else:
+                abandon = True
+                state.orphaned = True
+                self._orphans += 1
+        if not abandon:
+            return await fut
         self.timeouts += 1
-        fut.add_done_callback(self._reap_orphan)
+        fut.add_done_callback(self._swallow_orphan)
         elapsed = self._clock() - started
         logger.warning(
             "轉錄逾時：speaker=%s 音訊=%.2fs 已耗時=%.2fs（上限 %.2fs），結果作廢並釋放槽位",
@@ -224,9 +260,10 @@ class TranscriberPool:
             )
         return _TIMED_OUT
 
-    def _reap_orphan(self, fut: asyncio.Future) -> None:
-        """孤兒執行緒終於結束：歸還額度，吞掉結果／例外（不外洩、不產生未取回警告）。"""
-        self._orphans -= 1
+    @staticmethod
+    def _swallow_orphan(fut: asyncio.Future) -> None:
+        """吞掉孤兒的結果／例外（不外洩、不產生未取回警告）。額度由執行緒端歸還，
+        所以 loop 先關閉、callback 永遠不會被呼叫也不影響計數。"""
         if not fut.cancelled():
             fut.exception()
 
@@ -234,11 +271,16 @@ class TranscriberPool:
         loop = asyncio.get_running_loop()
         started = self._clock()
         try:
-            fut = loop.run_in_executor(None, self._invoke, speaker_id, job.pcm, job.sample_rate)
             if self.job_timeout_s is None:
-                result = await fut
+                result = await loop.run_in_executor(
+                    None, self._invoke, speaker_id, job.pcm, job.sample_rate
+                )
             else:
-                result = await self._await_with_timeout(speaker_id, job, fut, started)
+                state = _ThreadState()
+                fut = loop.run_in_executor(
+                    None, self._invoke_tracked, state, speaker_id, job.pcm, job.sample_rate
+                )
+                result = await self._await_with_timeout(speaker_id, job, fut, state, started)
                 if result is _TIMED_OUT:
                     return
         except asyncio.CancelledError:
