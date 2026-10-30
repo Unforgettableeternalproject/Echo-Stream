@@ -1207,9 +1207,11 @@ class LLMThinkStage:
                     self._assistant_by_turn = {
                         k: v for k, v in self._assistant_by_turn.items() if id(v) in alive
                     }
-                    self._user_by_turn = {
-                        k: v for k, v in self._user_by_turn.items() if id(v) in alive
-                    }
+        if len(self._user_by_turn) > 4 * max(1, self.history_limit):
+            alive = {id(h) for h in self.history}
+            self._user_by_turn = {
+                k: v for k, v in self._user_by_turn.items() if id(v) in alive
+            }
         self._pending_user_text = ""
 
     async def settle(self, turn_id: str, spoken_text: str, generated_text: str = "") -> bool:

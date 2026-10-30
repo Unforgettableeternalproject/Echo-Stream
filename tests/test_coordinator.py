@@ -2722,3 +2722,38 @@ async def test_cancel_turn_validates_arguments_even_after_aclose() -> None:
     with pytest.raises(ValueError, match="reason_code"):
         env.co.cancel_turn("t", reason_code="")
     assert env.co.cancel_turn("t") is False
+
+
+async def test_cancel_turn_none_fallback_path_still_retracts_history() -> None:
+    # _conclude 內部拋例外 → 走保底 outcome；EAGER 已 commit 的內容仍要撤回並標記
+    env = build()
+    r, sink = env.req("你好嗎")
+    h = env.co.submit(r)
+    await playing(sink)
+    assert [m["role"] for m in env.think.history] == ["user", "assistant"]
+
+    async def boom(_sink) -> None:
+        raise RuntimeError("confirm boom")
+
+    env.co._confirm_stopped = boom  # type: ignore[method-assign]
+    assert env.co.cancel_turn(h.turn_id, reason_code="global_stop", commit="none") is True
+    out = await settled(h)
+    assert out.status is OutcomeStatus.FAILED and "confirm boom" in (out.error or "")
+    assert out.metadata["reason_code"] == "global_stop"
+    assert env.think.history == []
+    assert out.metadata["history_retracted"] is True
+
+
+async def test_cancel_turn_default_fallback_path_reports_conservative_value() -> None:
+    env = build()
+    r, sink = env.req("你好嗎")
+    h = env.co.submit(r)
+    await playing(sink)
+
+    async def boom(_sink) -> None:
+        raise RuntimeError("confirm boom")
+
+    env.co._confirm_stopped = boom  # type: ignore[method-assign]
+    assert env.co.cancel_turn(h.turn_id) is True
+    out = await settled(h)
+    assert out.metadata["history_retracted"] is False  # EAGER 已 commit，不保證乾淨

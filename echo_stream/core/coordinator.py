@@ -175,9 +175,11 @@ KIND_HOST = "host"
 
 
 REASON_HOST_CANCELLED = "host_cancelled"
-MAX_REASON_CODE_LEN = 64
 """``cancel_turn`` 的預設 ``reason_code``。
 其餘建議值 ``global_stop``／``presence_lost``（不限制值域）。"""
+
+MAX_REASON_CODE_LEN = 64
+"""``cancel_turn`` 的 ``reason_code`` 長度上限（strip 後）。"""
 
 _SOFT_VOICE_KINDS = (KIND_VOICE_ERROR, KIND_VOICE_CANCEL)
 """只關語音、輪本身仍以 DONE 結算的語音取消種類（與 barge-in／cascade 的 CANCELLED 區分）。"""
@@ -902,7 +904,8 @@ class TurnCoordinator:
             raise
         except Exception as exc:  # noqa: BLE001 - 單輪失敗不該拖垮其他輪
             _log.exception("TurnCoordinator 內部錯誤")
-            self._fallback_outcome(t, f"{type(exc).__name__}: {exc}")
+            history_meta = await self._fallback_history(t)
+            self._fallback_outcome(t, f"{type(exc).__name__}: {exc}", history_meta=history_meta)
         finally:
             self._lock_done(t)
             self._resolve_gen_done(t)
@@ -1761,17 +1764,38 @@ class TurnCoordinator:
             snapshot_version=t._snapshot_version,
         ))
 
+    async def _fallback_history(self, t: TurnHandle) -> dict:
+        """保底路徑的歷史處理：宿主取消且 ``commit="none"`` 時補做撤回（例外吞掉）。"""
+        if t._cancel_kind != KIND_HOST:
+            return {}
+        if t._host_commit != "none":
+            return {"history_retracted": not t._eager_committed}
+        try:
+            return await self._retract_history(t)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "history_retracted": False,
+                "history_retract_error": f"{type(exc).__name__}: {exc}",
+            }
+
     @staticmethod
-    def _fallback_meta(t: TurnHandle, cancelled: bool) -> dict:
+    def _fallback_meta(t: TurnHandle, cancelled: bool, history_meta: dict | None = None) -> dict:
         if t._cancel_kind == KIND_HOST and t._host_reason_code:
-            return {"reason_code": t._host_reason_code, "cancel_detail": t._cancel_detail}
+            meta = {"reason_code": t._host_reason_code, "cancel_detail": t._cancel_detail}
+            # 沒機會撤回時給保守值：EAGER 已 commit 就不保證歷史乾淨
+            meta["history_retracted"] = not t._eager_committed
+            meta.update(history_meta or {})
+            return meta
         return {
             "reason_code": (
                 CancelReason.SHUTDOWN.value if cancelled else CancelReason.UPSTREAM_ERROR.value
             ),
         }
 
-    def _fallback_outcome(self, t: TurnHandle, error: str, *, cancelled: bool = False) -> None:
+    def _fallback_outcome(
+        self, t: TurnHandle, error: str, *, cancelled: bool = False,
+        history_meta: dict | None = None,
+    ) -> None:
         """內部錯誤或 task 被外部取消時的保底：確保每個 submit 都有 outcome。"""
         if t._done:
             return
@@ -1784,7 +1808,7 @@ class TurnCoordinator:
             phase=TurnPhase.CANCELLED if cancelled else TurnPhase.FAILED,
             utterance_text=t.request.utterance.text,
             error=error,
-            metadata=self._fallback_meta(t, cancelled),
+            metadata=self._fallback_meta(t, cancelled, history_meta),
             cut_short=True,
             status=OutcomeStatus.CANCELLED if cancelled else OutcomeStatus.FAILED,
             aborted=cancelled,
