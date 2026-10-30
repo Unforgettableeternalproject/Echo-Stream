@@ -38,12 +38,12 @@
 * ``cancel_all()``：``SHUTDOWN``，整輪作廢（think 也停），不 commit、不 settle
 * 宿主單輪整輪取消 ``cancel_turn()``：kind ``host``，整輪作廢（think 也停），已開播也可、
   不看 ``flags.barge_in``、不連帶取消後面排隊的輪（同 ``cancel_voice``）。token 原因用
-  ``SHUTDOWN``（不 commit、不 settle，同 ``cancel_all``），``metadata["reason_code"]`` 是宿主傳入值
+  ``HOST``（不 commit、不 settle，同 ``cancel_all``），``metadata["reason_code"]`` 是宿主傳入值
   （建議 ``host_cancelled``／``global_stop``／``presence_lost``）、``cancel_detail`` 為 detail；
   不標 ``barge_in``／``superseded``，``aborted=True``。等鎖期間被取消同其他整輪取消為 ``VOIDED``。
   歷史：預設與 ``cancel_all`` 相同，結算不 commit；EAGER 且生成已完成的輪，完整生成文字早已
-  commit 並留在歷史（宿主可接著 ``think.settle(turn_id, "")`` 移除）。``commit="none"`` 則由
-  coordinator 在結算時對已 EAGER commit 的輪呼叫 ``settle(turn_id, "", generated)`` 撤回
+  commit 並留在歷史。``commit="none"`` 則由 coordinator 在結算時呼叫 ``think.retract(turn_id)``
+  把整輪（使用者話語與回答）撤出歷史，結果記在 ``metadata["history_retracted"]``
 
 ## 執行緒契約
 
@@ -175,6 +175,7 @@ KIND_HOST = "host"
 
 
 REASON_HOST_CANCELLED = "host_cancelled"
+MAX_REASON_CODE_LEN = 64
 """``cancel_turn`` 的預設 ``reason_code``。
 其餘建議值 ``global_stop``／``presence_lost``（不限制值域）。"""
 
@@ -301,6 +302,8 @@ class TurnHandle:
         self._cancel_kind: str | None = None
         self._host_reason_code: str | None = None
         self._host_commit = "default"
+        self._concluding = False
+        """結算已開始（``_conclude`` 取走取消快照）；之後 ``cancel_turn`` 不再認領。"""
         self._voice_kind: str | None = None
         self._voice_error: str | None = None
         self._hook_error: str | None = None
@@ -645,24 +648,40 @@ class TurnCoordinator:
 
         outcome：``CANCELLED``（等鎖期間被取消則同其他整輪取消為 ``VOIDED``）、
         ``metadata["reason_code"]`` = ``reason_code``、``metadata["cancel_detail"]`` = ``detail``、
-        ``aborted=True``，不標 ``barge_in``／``superseded``；``outcome.cancel_reason`` 沿用
-        ``"shutdown"``（內部 token 原因），請以 ``reason_code`` 區分。已生成但未結束的輪，
-        ``on_generation_done`` 以 ``ok=False`` 觸發。
+        ``aborted=True``，不標 ``barge_in``／``superseded``；``outcome.cancel_reason`` 為
+        ``CancelReason.HOST`` 的值（``"host_cancelled"``），細項請看 ``reason_code``。
+        已生成但未結束的輪，``on_generation_done`` 以 ``ok=False`` 觸發。
+
+        **回 True 即保證** outcome 是這次的宿主取消（含認領落在「生成剛完成、結算尚未開始」的
+        窗口，結算會把它改判為 ``CANCELLED``，不會以 ``COMPLETED`` 收尾）；結算一旦開始
+        （``_conclude`` 取走快照）就不再接受認領，回 False。
 
         歷史（commit）：與 :meth:`cancel_all`／``void`` 一致，結算時**不 commit**。但 EAGER 模式下
-        生成已完成的輪，完整生成文字在生成完成時就已 commit，不會自動消失；
-        ``commit="default"`` 保留它（宿主可接著 ``think.settle(turn_id, "")`` 移除），
-        ``commit="none"`` 則由 coordinator 在結算時對已 EAGER commit 的輪呼叫
-        ``settle(turn_id, "", generated)`` 撤回（think 沒有 ``settle`` 時無法撤回）。
-        SETTLED 模式兩者相同：本來就不會 commit。
+        生成已完成的輪，完整生成文字在生成完成時就已 commit，不會自動消失：
 
-        ``reason_code`` 須為非空字串（值域不限）、``commit`` 須為 ``"default"``／``"none"``，
-        否則 ``ValueError``。成功認領回 True；``turn_id`` 不存在、輪已結束、已被整輪認領取消
-        （讓位、同 owner 取代、``cancel_all``、另一次 ``cancel_turn``）、或 coordinator 已
-        關閉回 False。已被 barge-in／``cancel_voice`` 取消語音的輪仍可整輪取消。
+        * ``commit="default"``：保留（宿主可自行 ``think.retract(turn_id)``）。
+        * ``commit="none"``：coordinator 在結算時優先呼叫 ``think.retract(turn_id)``
+          （移除使用者話語與回答，並讓之後的晚到 commit 被丟棄；SETTLED 也呼叫以防晚到），
+          沒有 ``retract`` 才退回 ``settle(turn_id, "")``——後者只移除 assistant 項，
+          使用者話語會留在歷史，因此仍記為撤回失敗。
+
+        結果記在 ``outcome.metadata["history_retracted"]``：``True`` = 這一輪確定不在歷史中
+        （已撤回，或本來就沒 commit 過）；``False`` = 不保證（``commit="default"`` 且 EAGER
+        已 commit，或撤回失敗）。撤回失敗（回 False、拋例外、think 兩者皆無）時另有
+        ``history_retract_error`` 說明並記 warning。**回 False（輪已結束）不代表歷史乾淨**：
+        宿主需自行呼叫 ``think.retract``。
+
+        ``reason_code`` 去掉前後空白後須為 1～64 字元的非空字串（值域不限）、``commit`` 須為
+        ``"default"``／``"none"``，否則 ``ValueError``；**驗證先於其他檢查**，所以 coordinator
+        已關閉時參數不合法仍丟 ``ValueError``。成功認領回 True；``turn_id`` 不存在、輪已結束、
+        已被整輪認領取消（讓位、同 owner 取代、``cancel_all``、另一次 ``cancel_turn``）、
+        或 coordinator 已關閉回 False。已被 barge-in／``cancel_voice`` 取消語音的輪仍可整輪取消。
         """
         if not isinstance(reason_code, str) or not reason_code.strip():
             raise ValueError("reason_code 必須是非空字串")
+        reason_code = reason_code.strip()
+        if len(reason_code) > MAX_REASON_CODE_LEN:
+            raise ValueError(f"reason_code 不可超過 {MAX_REASON_CODE_LEN} 字元")
         if commit not in ("default", "none"):
             raise ValueError(f"commit 必須是 'default' 或 'none'，收到 {commit!r}")
         if self._closed:
@@ -742,10 +761,10 @@ class TurnCoordinator:
     def _claim_host(self, t: TurnHandle, reason_code: str, detail: str, commit: str) -> bool:
         """認領宿主的整輪取消（同鎖內一併記下 reason_code／commit，結算時才讀得到）。"""
         with t._cancel_lock:
-            if t._cancel_claimed:
-                return False
+            if t._cancel_claimed or t._concluding:
+                return False  # 結算已取走快照：認領了也來不及反映在 outcome
             t._cancel_claimed = True
-            t._cancel_reason = CancelReason.SHUTDOWN
+            t._cancel_reason = CancelReason.HOST
             t._cancel_detail = detail
             t._cancel_kind = KIND_HOST
             t._host_reason_code = reason_code
@@ -1481,6 +1500,12 @@ class TurnCoordinator:
         req = t.request
         tid = t.turn_id
         sink = att.sink
+        with t._cancel_lock:
+            # 取消快照與「停止接受宿主認領」在同一把鎖內：cancel_turn 回 True 的輪一定在這裡被看見
+            t._concluding = True
+            host = t._cancel_claimed and t._cancel_kind == KIND_HOST
+        if host:
+            phase = TurnPhase.CANCELLED  # 認領落在 DONE 決定之後：一律視為整輪取消
         cancelled = phase is TurnPhase.CANCELLED
         # 語音取消的狀態在開頭快照一次：skipped 與 metadata 都用快照，避免 await 期間前後不一致
         voice_kind = t._voice_kind if t._voice_claimed else None
@@ -1508,14 +1533,20 @@ class TurnCoordinator:
         generated = self._generated_text(att)
 
         # --- commit／settle：嚴格排在確認實播量之後（Pipecat #4111）---
-        no_history = reason in (CancelReason.SHUTDOWN, CancelReason.SUPERSEDED)
+        no_history = reason in (
+            CancelReason.SHUTDOWN, CancelReason.SUPERSEDED, CancelReason.HOST
+        )
         settle = getattr(self.think, "settle", None)
+        history_meta: dict = {}
         if no_history:
-            if (
-                (
-                    (reason is CancelReason.SUPERSEDED and req.retract_on_yield)
-                    or (kind == KIND_HOST and t._host_commit == "none")
-                )
+            if host:
+                if t._host_commit == "none":
+                    history_meta = await self._retract_history(t)
+                else:
+                    history_meta = {"history_retracted": not t._eager_committed}
+            elif (
+                reason is CancelReason.SUPERSEDED
+                and req.retract_on_yield
                 and t._eager_committed
                 and settle is not None
             ):
@@ -1571,6 +1602,7 @@ class TurnCoordinator:
         self.tracer.finish(tid, phase, cancel_value, error)
 
         meta = self._outcome_meta(t, reason, kind, detail)
+        meta.update(history_meta)
         if phase is TurnPhase.FAILED:
             meta.setdefault("reason_code", CancelReason.UPSTREAM_ERROR.value)
         if t._hook_error is not None:
@@ -1609,6 +1641,32 @@ class TurnCoordinator:
         self._lock_done(t)  # SETTLED：commit 完才放鎖（播放位置早已讓出）
         await self._drain_text(t, att)
         self._deliver(t, outcome)
+
+    async def _retract_history(self, t: TurnHandle) -> dict:
+        """``commit="none"``：把這一輪整輪撤出歷史，回傳要併進 outcome.metadata 的結果。"""
+        tid = t.turn_id
+        retract = getattr(self.think, "retract", None)
+        settle = getattr(self.think, "settle", None)
+        ok = False
+        error: str | None = None
+        try:
+            if retract is not None:
+                ok = bool(await retract(tid))
+                if not ok:
+                    error = "retract 回傳 False"
+            elif not t._eager_committed:
+                ok = True  # 沒有 retract，但這一輪也沒 commit 過
+            elif settle is not None:
+                await settle(tid, "")
+                error = "think 沒有 retract，只能以 settle 移除 assistant 項；使用者話語仍在歷史"
+            else:
+                error = "think 不支援 retract／settle"
+        except Exception as exc:  # noqa: BLE001 - 撤回失敗不影響 outcome，記錄即可
+            error = f"{type(exc).__name__}: {exc}"
+        if error is not None:
+            _log.warning("撤回歷史失敗（turn %s）：%s", tid, error)
+            return {"history_retracted": False, "history_retract_error": error}
+        return {"history_retracted": ok}
 
     # --- outcome 出口 ---
 
@@ -1683,6 +1741,8 @@ class TurnCoordinator:
         barge_in = reason is CancelReason.BARGE_IN
         _stop_sink(t._first_sink)
         meta = self._outcome_meta(t, reason, kind, detail)
+        if kind == KIND_HOST:
+            meta["history_retracted"] = True  # 還沒生成過：這一輪從沒進過歷史
         if t._skip_reason:
             meta["sink_skip_reason"] = t._skip_reason
         self.tracer.finish(t.turn_id, TurnPhase.CANCELLED, reason.value, None)
@@ -1701,6 +1761,16 @@ class TurnCoordinator:
             snapshot_version=t._snapshot_version,
         ))
 
+    @staticmethod
+    def _fallback_meta(t: TurnHandle, cancelled: bool) -> dict:
+        if t._cancel_kind == KIND_HOST and t._host_reason_code:
+            return {"reason_code": t._host_reason_code, "cancel_detail": t._cancel_detail}
+        return {
+            "reason_code": (
+                CancelReason.SHUTDOWN.value if cancelled else CancelReason.UPSTREAM_ERROR.value
+            ),
+        }
+
     def _fallback_outcome(self, t: TurnHandle, error: str, *, cancelled: bool = False) -> None:
         """內部錯誤或 task 被外部取消時的保底：確保每個 submit 都有 outcome。"""
         if t._done:
@@ -1714,11 +1784,7 @@ class TurnCoordinator:
             phase=TurnPhase.CANCELLED if cancelled else TurnPhase.FAILED,
             utterance_text=t.request.utterance.text,
             error=error,
-            metadata={
-                "reason_code": (
-                    CancelReason.SHUTDOWN.value if cancelled else CancelReason.UPSTREAM_ERROR.value
-                ),
-            },
+            metadata=self._fallback_meta(t, cancelled),
             cut_short=True,
             status=OutcomeStatus.CANCELLED if cancelled else OutcomeStatus.FAILED,
             aborted=cancelled,

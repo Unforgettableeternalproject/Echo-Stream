@@ -243,6 +243,22 @@ class SettleCapable(Protocol):
 
 
 @runtime_checkable
+class RetractCapable(Protocol):
+    """ThinkStage 的選用 hook：把某一輪**整輪**（使用者的話與回答）從歷史撤掉。
+
+    與只動 assistant 項的 ``settle(turn_id, "")`` 不同：``retract`` 兩項都移除，
+    且若該輪尚未 commit，會記為已撤回，之後同一 turn_id 的 ``commit`` 直接丟棄
+    （避免晚到的 commit 又把這一輪寫回去），也清掉該輪的暫存使用者話語。
+    呼叫端用 ``getattr(think, "retract", None)`` 探測。
+    """
+
+    async def retract(self, turn_id: str) -> bool:
+        """撤回這一輪。確定歷史中沒有（已移除或已登記丟棄後續 commit）回 True；
+        無法處理（例如 turn_id 為空）回 False。"""
+        ...
+
+
+@runtime_checkable
 class MemoryRetriever(Protocol):
     """ThinkStage 消費記憶的最小形狀：``await retrieve(query, **kw) -> str | None``。
 
@@ -258,10 +274,10 @@ class MemoryRetriever(Protocol):
 
 
 @runtime_checkable
-class ThinkHostSurface(ThinkStage, SettleCapable, Protocol):
+class ThinkHostSurface(ThinkStage, SettleCapable, RetractCapable, Protocol):
     """ThinkStage 的宿主面：宿主（Discord bot、Core 的 EchoPipelineHost）會直接碰的成員。
 
-    在 :class:`ThinkStage` 與 :class:`SettleCapable` 之上補上實作早已公開、
+    在 :class:`ThinkStage`、:class:`SettleCapable` 與 :class:`RetractCapable` 之上補上實作早已公開、
     但契約沒寫的部分，讓宿主以結構型別檢查取代 ``getattr`` 探測。
     ``reset_context`` 的前置條件：呼叫端保證沒有進行中的 ``stream``，否則實作拋
     ``RuntimeError``；reset 會把 ``profile`` 清成 ``""``，宿主需自行重設。

@@ -429,7 +429,13 @@ class LLMThinkStage:
         self._assistant_by_turn: dict[str, dict[str, str]] = {}
         """turn_id -> 該輪寫進 history 的 assistant 項（同一個 dict 物件）。
         只存參照、不在 history 項上加欄位，所以送 API 的 messages 與 prompt cache 前綴不受影響。"""
+        self._user_by_turn: dict[str, dict[str, str]] = {}
+        """turn_id -> 該輪寫進 history 的 user 項（同一個 dict 物件），給 ``retract`` 用。"""
+        self._retracted_turns: dict[str, None] = {}
+        """已撤回的 turn_id（有序、有上限）：之後同一 turn_id 的 commit 直接丟棄。"""
         self._pending_user_text = ""
+        self._pending_turn_id = ""
+        """暫存使用者話語所屬的 turn_id（最近一次 stream）。"""
         self._context_epoch = 0
         """對話脈絡世代，``reset_context`` 時 +1。commit 比對該輪 stream 開始時的世代，
         不符就是上一群聽眾的晚到結果，丟棄不寫進新 history。"""
@@ -556,7 +562,9 @@ class LLMThinkStage:
         self.profile = ""
         self.history[:] = list(history) if history is not None else []
         self._assistant_by_turn = {}
+        self._user_by_turn = {}
         self._pending_user_text = ""
+        self._pending_turn_id = ""
         self._pending_by_scope.clear()
         self._last_build = None
         self._retrieved = None
@@ -777,6 +785,7 @@ class LLMThinkStage:
         carried: SpeechStyle | None = None
         try:
             self._pending_user_text = utterance.text
+            self._pending_turn_id = utterance.turn_id or ""
             self._pending_epoch = self._context_epoch
             if utterance.turn_id:
                 self._turn_epoch[utterance.turn_id] = self._context_epoch
@@ -1178,8 +1187,16 @@ class LLMThinkStage:
         if epoch is not None and epoch != self._context_epoch:
             logger.info("commit 丟棄：turn %s 屬於 reset_context 之前的脈絡", turn_id)
             return
+        if turn_id and turn_id in self._retracted_turns:
+            logger.info("commit 丟棄：turn %s 已被 retract", turn_id)
+            if self._pending_turn_id == turn_id:
+                self._pending_user_text = ""
+            return
         if self._pending_user_text:
-            self.history.append({"role": "user", "content": self._pending_user_text})
+            user_item = {"role": "user", "content": self._pending_user_text}
+            self.history.append(user_item)
+            if turn_id:
+                self._user_by_turn[turn_id] = user_item
         if spoken_text:
             item = {"role": "assistant", "content": spoken_text}
             self.history.append(item)
@@ -1189,6 +1206,9 @@ class LLMThinkStage:
                     alive = {id(h) for h in self.history}
                     self._assistant_by_turn = {
                         k: v for k, v in self._assistant_by_turn.items() if id(v) in alive
+                    }
+                    self._user_by_turn = {
+                        k: v for k, v in self._user_by_turn.items() if id(v) in alive
                     }
         self._pending_user_text = ""
 
@@ -1210,6 +1230,35 @@ class LLMThinkStage:
         else:
             self.history[:] = [h for h in self.history if h is not item]
             self._assistant_by_turn.pop(turn_id, None)
+        return True
+
+    async def retract(self, turn_id: str) -> bool:
+        """把這一輪整輪撤出歷史：移除該輪的 user 與 assistant 兩項。
+
+        還沒 commit 的輪（或 commit 尚在途）也會登記為已撤回：之後同一 turn_id 的
+        ``commit`` 直接丟棄，並清掉該輪的暫存使用者話語。重複呼叫無害。
+        確定歷史中沒有這一輪（已移除、本來就沒有、或已登記丟棄後續 commit）回 True；
+        ``turn_id`` 為空回 False。
+        """
+        if not turn_id:
+            return False
+        self._retracted_turns[turn_id] = None
+        limit = 8 * max(1, self.history_limit)
+        if len(self._retracted_turns) > limit:
+            for key in list(self._retracted_turns)[: len(self._retracted_turns) // 2]:
+                del self._retracted_turns[key]
+        if self._pending_turn_id == turn_id:
+            self._pending_user_text = ""
+        epoch = self._turn_epoch.get(turn_id)
+        if epoch is not None and epoch != self._context_epoch:
+            return True  # 屬於 reset_context 之前的脈絡：新 history 本來就沒有這一輪
+        items = [
+            i for i in (self._user_by_turn.pop(turn_id, None),
+                        self._assistant_by_turn.pop(turn_id, None))
+            if i is not None
+        ]
+        if items:
+            self.history[:] = [h for h in self.history if not any(h is i for i in items)]
         return True
 
 

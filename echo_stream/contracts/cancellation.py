@@ -42,6 +42,10 @@ class CancelReason(str, Enum):
     SUPERSEDED = "superseded"
     """同一使用者送出新 turn，舊 turn 作廢。"""
 
+    HOST = "host_cancelled"
+    """宿主明確取消單輪整輪（``TurnCoordinator.cancel_turn``）。
+    細項原因看 outcome 的 ``reason_code``。"""
+
 
 class CancelledError(Exception):
     """管線內部的取消例外。

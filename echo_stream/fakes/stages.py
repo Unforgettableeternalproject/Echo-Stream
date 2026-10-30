@@ -147,7 +147,10 @@ class FakeThinkStage:
         Web 前端的會話切換才能在無 GPU 環境下驗證。"""
 
         self._pending_user_text = ""
+        self._pending_turn_id = ""
         self._assistant_by_turn: dict[str, dict[str, str]] = {}
+        self._user_by_turn: dict[str, dict[str, str]] = {}
+        self._retracted_turns: set[str] = set()
 
     async def prepare(self) -> None:
         return
@@ -162,6 +165,7 @@ class FakeThinkStage:
         self._turn_count += 1
         self.stream_calls += 1
         self._pending_user_text = utterance.text
+        self._pending_turn_id = utterance.turn_id or ""
 
         # Memory retrieve 與 LLM 平行起跑（§7.4）
         memory_task = asyncio.ensure_future(self._retrieve(utterance.turn_id))
@@ -207,9 +211,16 @@ class FakeThinkStage:
         寫錯會讓 LLM 以為自己講完了整段。
         """
         self.committed.append((turn_id, spoken_text, generated_text))
+        if turn_id and turn_id in self._retracted_turns:
+            if self._pending_turn_id == turn_id:
+                self._pending_user_text = ""
+            return
         # 與 LLMThinkStage 相同的歷史語意：兩邊要嘛都進、要嘛都不進
         if self._pending_user_text:
-            self.history.append({"role": "user", "content": self._pending_user_text})
+            user_item = {"role": "user", "content": self._pending_user_text}
+            self.history.append(user_item)
+            if turn_id:
+                self._user_by_turn[turn_id] = user_item
         if spoken_text:
             item = {"role": "assistant", "content": spoken_text}
             self.history.append(item)
@@ -230,6 +241,22 @@ class FakeThinkStage:
         else:
             self.history[:] = [h for h in self.history if h is not item]
             self._assistant_by_turn.pop(turn_id, None)
+        return True
+
+    async def retract(self, turn_id: str) -> bool:
+        """整輪撤出歷史（user＋assistant）；尚未 commit 的輪登記為已撤回，之後的 commit 丟棄。"""
+        if not turn_id:
+            return False
+        self._retracted_turns.add(turn_id)
+        if self._pending_turn_id == turn_id:
+            self._pending_user_text = ""
+        items = [
+            i for i in (self._user_by_turn.pop(turn_id, None),
+                        self._assistant_by_turn.pop(turn_id, None))
+            if i is not None
+        ]
+        if items:
+            self.history[:] = [h for h in self.history if not any(h is i for i in items)]
         return True
 
 
