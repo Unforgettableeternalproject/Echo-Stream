@@ -1160,3 +1160,114 @@ async def test_failed_generation_still_delivers_generated_sentences() -> None:
     assert out.status is OutcomeStatus.FAILED and "backend boom" in (out.error or "")
     assert out.generated_text and out.generated_text in "".join(sent)
     assert "".join(sent).startswith(SENTENCES[0])
+
+
+# ───────────────────────── on_think_start（取得 think 鎖後的宿主 hook）─────────────────────────
+
+
+async def test_on_think_start_runs_in_lock_before_every_attempt() -> None:
+    env = build(("甲甲甲。", "乙乙乙。"), open_all=False)
+    regen = OnceRegen("你好", times=1)
+    seen: list[tuple[int, bool, int]] = []
+    views: list[object] = []
+
+    async def hook(view, attempt_id: int) -> None:
+        views.append(view)
+        seen.append((attempt_id, env.co._think_lock.locked(), len(env.backend.calls)))
+
+    r, _ = env.req("你好", regen=regen, max_regenerate=1, on_think_start=hook)
+    made: list[ManualSink] = []
+
+    def factory(_v) -> ManualSink:
+        s = ManualSink(env.log)
+        made.append(s)
+        return s
+
+    r.sink_factory = factory
+    h = env.co.submit(r)
+    await until(lambda: len(made) == 2)
+    env.speak.open(0)
+    await until(lambda: len(made[1].chunks) == 1 and made[1].draining.is_set())
+    made[1].finish()
+    out = await settled(h)
+    assert out.regenerated == 1
+    # 每趟（含 regen）都呼叫、都在鎖內、都在該趟 think 開始之前（已呼叫 backend 的次數 = 0、1）
+    assert seen == [(1, True, 0), (2, True, 1)]
+    assert all(v is h for v in views)
+
+
+async def test_on_think_start_waits_for_previous_turn_to_release_lock() -> None:
+    env = build()
+    order: list[str] = []
+
+    def hook_for(name: str):
+        async def hook(_view, _attempt_id: int) -> None:
+            env.log.append(f"hook:{name}")
+            order.append(name)
+
+        return hook
+
+    ra, sa = env.req("A", commit=CommitMode.SETTLED, on_think_start=hook_for("A"))
+    rb, sb = env.req("B", owner="u2", commit=CommitMode.SETTLED, on_think_start=hook_for("B"))
+    ha = env.co.submit(ra)
+    hb = env.co.submit(rb)
+    await playing(sa)
+    assert order == ["A"]  # B 還在等鎖，hook 不會提前跑
+    sa.finish()
+    await settled(ha)
+    await playing(sb)
+    sb.finish()
+    await settled(hb)
+    assert order == ["A", "B"]
+    assert env.log.index("hook:B") > env.log.index("commit")  # 在 A 結算 commit 之後
+
+
+async def test_on_think_start_error_is_swallowed_and_turn_still_runs(caplog) -> None:
+    env = build()
+
+    async def hook(_view, _attempt_id: int) -> None:
+        raise RuntimeError("hook boom")
+
+    r, sink = env.req("A", on_think_start=hook)
+    with caplog.at_level("WARNING"):
+        h = env.co.submit(r)
+        await playing(sink)
+        sink.finish()
+        out = await settled(h)
+    assert out.status is OutcomeStatus.COMPLETED and out.error is None
+    assert out.generated_text == RESPONSE
+    assert len(env.commits) == 1
+    assert any("on_think_start" in rec.getMessage() for rec in caplog.records)
+
+
+@pytest.mark.parametrize("how", ["void", "cancel_all"])
+async def test_cancel_during_on_think_start_ends_turn_without_thinking(how: str) -> None:
+    env = build()
+    entered = asyncio.Event()
+    hook_cancelled = asyncio.Event()
+
+    async def hook(_view, _attempt_id: int) -> None:
+        entered.set()
+        try:
+            await asyncio.Event().wait()  # 卡住，等外部取消
+        finally:
+            hook_cancelled.set()
+
+    r, sink = env.req("A", on_think_start=hook)
+    h = env.co.submit(r)
+    await asyncio.wait_for(entered.wait(), SAFETY_S)
+    if how == "void":
+        assert env.co.void(h.turn_id) is True
+    else:
+        env.co.cancel_all("left")
+    out = await settled(h)
+    assert out.status is OutcomeStatus.CANCELLED and out.error is None
+    assert hook_cancelled.is_set()  # hook 被取消，不是被放著跑
+    assert env.backend.calls == [] and sink.chunks == []  # think 從未開始
+    assert env.commits == []
+    # 鎖已放掉：下一輪照常完成
+    r2, s2 = env.req("B", owner="u2")
+    h2 = env.co.submit(r2)
+    await playing(s2)
+    s2.finish()
+    assert (await settled(h2)).status is OutcomeStatus.COMPLETED

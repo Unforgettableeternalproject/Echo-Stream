@@ -9,6 +9,7 @@
 ``submit()`` 立即返回 :class:`TurnHandle`，背景 task 依序做：
 
 1. 等 think 鎖（FIFO；等鎖期間被作廢 → ``VOIDED``，不產生任何生成／播放）
+   取得鎖後、每一趟生成開始前呼叫宿主的 ``on_think_start``（鎖內；例外吞掉並記 log）
 2. 生成：think → speak，音訊塊在「前一輪還沒播完」時先緩衝（合成不等前一輪），
    輪到自己才寫 sink；前一輪已結束就直接寫（**熱路徑不經緩衝、不多一次 await**）
 3. 生成完成：EAGER 在釋放鎖**之前** commit；SETTLED 鎖一路持有到結算（串行語意）
@@ -698,6 +699,7 @@ class TurnCoordinator:
             while True:
                 att = self._new_attempt(t, utt)
                 t._att = att
+                await self._run_think_hook(t, att)
                 result = await self._run_attempt(t, att)
                 if result == "barged":
                     phase = TurnPhase.CANCELLED  # 語音被插話截斷，文字已生成完
@@ -723,6 +725,33 @@ class TurnCoordinator:
         self._resolve_gen_done(t)
         self._mark_play_done(t)
         await self._conclude(t, att, phase, error)
+
+    async def _run_think_hook(self, t: TurnHandle, att: _Attempt) -> None:
+        """鎖內、這一趟生成開始前呼叫宿主 hook。例外吞掉；hook 期間整輪被取消就中止並收尾。"""
+        hook = t.request.on_think_start
+        if hook is None:
+            return
+
+        async def _call() -> None:
+            await hook(t, att.attempt_id)
+
+        task = asyncio.ensure_future(_call())
+        canceller = asyncio.ensure_future(t._root.wait())
+        try:
+            await asyncio.wait({task, canceller}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for pending in (task, canceller):
+                if not pending.done():
+                    pending.cancel()
+            await asyncio.gather(task, canceller, return_exceptions=True)
+        if t._root.is_cancelled:
+            # 走和「生成中被取消」同一條收尾路徑（認領早已完成，_produce 會直接結算 CANCELLED）
+            raise CancelledError(t._root.reason or CancelReason.SHUTDOWN, t._root.detail)
+        if task.done() and not task.cancelled() and task.exception() is not None:
+            _log.warning(
+                "on_think_start 失敗（turn %s，第 %d 趟），照常生成: %s",
+                t.turn_id, att.attempt_id, task.exception(), exc_info=task.exception(),
+            )
 
     async def _run_attempt(self, t: TurnHandle, att: _Attempt) -> str:
         """跑一趟生成與播放。回傳 ``"done"`` 或 ``"regen"``。

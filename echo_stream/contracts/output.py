@@ -370,6 +370,9 @@ SinkFactory = Callable[[TurnView], "AudioSink | str"]
 OnSentence = Callable[[TurnView, Sentence], Awaitable[None]]
 """句子送進語音佇列**之後**才呼叫，宿主的文字送出不會延遲 TTS。"""
 
+OnThinkStart = Callable[[TurnView, int], Awaitable[None]]
+"""取得 think 鎖之後、每一趟生成開始之前呼叫（第二參數是 ``attempt_id``，regen 每趟都呼叫）。"""
+
 
 # ─────────────────────────── 請求與結果 ───────────────────────────
 
@@ -408,6 +411,16 @@ class TurnRequest:
 
     meta: dict = field(default_factory=dict)
 
+    on_think_start: OnThinkStart | None = None
+    """取得 think 鎖（``MARK_QUEUE_ACQUIRED``）之後、每一趟 attempt 開始生成前呼叫
+    ``await hook(view, attempt_id)``，regen 每趟都會再呼叫。宿主在這裡組 system prompt、
+    取代前一輪、綁 sink 等「必須在鎖內、think 之前」的事，不必塞進 ``think.stream()``。
+
+    例外會被吞掉並記 warning，**不**讓整輪失敗：hook 是宿主的前置準備，壞掉時仍應讓這一輪
+    以預設狀態回覆；需要「失敗就不要回覆」的宿主請自行在 hook 內記旗標（``view.meta``）並於
+    自己的 think 層處理。hook 執行期間輪被取消（讓位／取代／shutdown）時，hook 會被取消，
+    輪以 CANCELLED 結束，think 不會開始。"""
+
 
 @dataclass(slots=True)
 class TurnOutcome(TurnResult):
@@ -441,6 +454,7 @@ __all__ = [
     "ModeFlags",
     "ModeRules",
     "OnSentence",
+    "OnThinkStart",
     "OutcomeStatus",
     "OptionalSinkCapabilities",
     "PlayedEvidence",
