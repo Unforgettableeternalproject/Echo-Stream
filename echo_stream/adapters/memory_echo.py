@@ -342,6 +342,8 @@ class EchoMemoryAdapter:
         """最近一次 retrieve 是否被引擎標為降級（``MemoryContext.degraded``）。
         retrieve 對外只回文字，降級旗標存這裡給宿主 log 讀。"""
         self.last_degraded_reason = ""
+        self.last_retrieve_timings_ms: dict[str, float] = {}
+        """最近一次 retrieve 的引擎分段耗時（``MemoryContext.timings_ms``，含 embedding）。"""
         self._evidence_supported: bool | None = None
         self._idempotency_supported: bool | None = None
         self._tool_executor: Any = None
@@ -597,6 +599,8 @@ class EchoMemoryAdapter:
             reason = getattr(context, "degraded_reason", "")
             self.last_retrieve_degraded = degraded
             self.last_degraded_reason = reason if degraded and isinstance(reason, str) else ""
+            timings = getattr(context, "timings_ms", None)
+            self.last_retrieve_timings_ms = dict(timings) if isinstance(timings, dict) else {}
             if degraded:
                 logger.warning(
                     "memory retrieve 降級：%s", self.last_degraded_reason or "未註明原因"

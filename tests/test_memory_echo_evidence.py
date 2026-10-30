@@ -302,3 +302,16 @@ async def test_warmup_swallows_exception(caplog):
     assert await adapter.warmup() is False
     assert "暖機失敗" in caplog.text
     await adapter.aclose()
+
+
+async def test_retrieve_記錄引擎分段耗時():
+    ctx = _DegradedCtx(degraded=True, degraded_reason="x")
+    ctx.timings_ms = {"embed_ms": 2001.5, "search_ms": 3.0}
+    adapter = EchoMemoryAdapter(engine=_RetrieveEngine(ctx))
+    assert adapter.last_retrieve_timings_ms == {}
+    await adapter.retrieve("問題")
+    assert adapter.last_retrieve_timings_ms == {"embed_ms": 2001.5, "search_ms": 3.0}
+    # 舊版 context 沒有 timings_ms：清成空 dict，不殘留上一次的值
+    adapter.engine._ctx = _Ctx()
+    await adapter.retrieve("問題")
+    assert adapter.last_retrieve_timings_ms == {}
