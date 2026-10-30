@@ -506,7 +506,11 @@ class TurnCoordinator:
         語意同 :meth:`on_voice_event` 觸發的 barge-in，但不標 ``barge_in``、不連帶取消後面
         排隊輪的語音；outcome 為 ``SKIPPED`` + ``skipped_reason=voice_cancelled``
         （``metadata["voice_cancelled"]`` = ``detail``）。成功認領回 True；輪已結束、
-        已無語音可取消（沒有語音支線、語音或整輪已被取消）、或 ``turn_id`` 不存在回 False。
+        已無語音可取消（沒有語音支線、語音或整輪已被取消、語音已播完）、或 ``turn_id``
+        不存在回 False。
+
+        這是宿主的明確指令，**不看 ``flags.barge_in``**：不可被使用者插話打斷的輪，
+        宿主仍可用它停語音。語音已播完（drain 返回）之後不能再取消，輪照常以完成結算。
         """
         for t in list(self._live):
             if t.turn_id != turn_id:

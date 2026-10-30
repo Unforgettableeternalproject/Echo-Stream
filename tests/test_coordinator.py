@@ -1609,3 +1609,118 @@ async def test_coordinator_internal_error_is_failed_not_voice_error() -> None:
     out = await settled(env.co.submit(r))
     assert out.status is OutcomeStatus.FAILED and "internal bug" in (out.error or "")
     assert "voice_error" not in out.metadata and out.skipped_reason != SkipReason.VOICE_ERROR
+
+
+# ───────────────────────── 補強：結算、競爭認領、取消時序 ─────────────────────────
+
+
+async def test_voice_cancel_waits_for_confirm_stopped_before_resolving_spoken() -> None:
+    """被停掉的 sink 要先 confirm_stopped 才推算 spoken（Pipecat #4111 的順序）。"""
+    env = build()
+    r, sink = env.req("A", commit=CommitMode.SETTLED)
+    sink.reported_after_stop = 2.0  # confirm 時才回報的實播位置
+    h = env.co.submit(r)
+    await playing(sink)
+    sink.play(0.5)
+    assert env.co.cancel_voice(h.turn_id) is True
+    out = await settled(h)
+    assert out.skipped_reason == SkipReason.VOICE_CANCELLED
+    assert out.spoken_text == SENTENCES[0] + SENTENCES[1]  # 沒等 confirm 會是空字串
+    assert env.commits == [(r.ticket.turn_id, out.spoken_text, RESPONSE)]
+
+
+async def test_settled_voice_error_commits_truncated_spoken_and_full_generated() -> None:
+    env = build()
+    env.co.speak = FlakySpeak(after=2)
+    r, sink = env.req("A", commit=CommitMode.SETTLED)
+    sink.reported_after_stop = 1.0
+    out = await settled(env.co.submit(r))
+    assert_voice_error_outcome(out, "tts boom")
+    assert out.spoken_text == SENTENCES[0] and out.generated_text == RESPONSE
+    assert env.commits == [(r.ticket.turn_id, SENTENCES[0], RESPONSE)]
+
+
+async def test_cancel_all_after_voice_error_is_cancelled_shutdown_with_voice_error() -> None:
+    env, _mid = build_split()
+    env.co.speak = FlakySpeak(after=1)
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    await until(lambda: sink.stopped)  # 語音錯誤已認領，think 還卡在中途
+    env.co.cancel_all("left")
+    out = await settled(h)
+    assert out.status is OutcomeStatus.CANCELLED and out.cancel_reason == "shutdown"
+    assert out.metadata["reason_code"] == "shutdown"
+    assert "tts boom" in out.metadata["voice_error"]
+    assert out.skipped_reason is None and not out.barge_in
+
+
+async def test_voice_error_and_other_voice_cancels_are_mutually_exclusive() -> None:
+    # 語音錯誤先認領：之後的 cancel_voice／插話都不再生效
+    env, mid = build_split()
+    env.co.speak = FlakySpeak(after=1)
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    await until(lambda: sink.stopped)
+    assert env.co.cancel_voice(h.turn_id, "late") is False
+    for k in range(4):
+        env.co.on_voice_event(voiced(1.0 + 0.5 * k))
+    mid.set()
+    out = await settled(h)
+    assert out.skipped_reason == SkipReason.VOICE_ERROR and not out.barge_in
+    assert "voice_cancelled" not in out.metadata
+
+    # cancel_voice 先認領：之後的語音錯誤認領失敗，只剩 voice_cancelled
+    env2, mid2 = build_split()
+    r2, sink2 = env2.req("A")
+    h2 = env2.co.submit(r2)
+    await until(lambda: len(sink2.chunks) == 1)
+    assert env2.co.cancel_voice(h2.turn_id, "host") is True
+    assert env2.co._claim_voice(h2, "late error", coordinator_module.KIND_VOICE_ERROR) is False
+    mid2.set()
+    out2 = await settled(h2)
+    assert out2.skipped_reason == SkipReason.VOICE_CANCELLED
+    assert "voice_error" not in out2.metadata
+
+
+async def test_cancel_voice_ignores_barge_in_flag_of_non_interruptible_turn() -> None:
+    class Rules:
+        def flags_for(self, reply_mode):
+            return ModeFlags(barge_in=False)
+
+    env = build()
+    env.co.policy_source = StaticPolicySource(PolicySnapshot(mode_rules=Rules()))
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    await playing(sink)
+    sink.play(1.0)
+    for k in range(4):
+        env.co.on_voice_event(voiced(1.0 + 0.5 * k))
+    assert not h.voice_token.is_cancelled  # 使用者插話打斷不了
+    assert env.co.cancel_voice(h.turn_id, "host") is True  # 宿主的明確指令可以
+    out = await settled(h)
+    assert out.skipped_reason == SkipReason.VOICE_CANCELLED and not out.barge_in
+
+
+async def test_cancel_during_on_think_start_of_regen_second_attempt() -> None:
+    env = build(("甲甲甲。", "乙乙乙。"), open_all=False)
+    entered = asyncio.Event()
+    hook_cancelled = asyncio.Event()
+
+    async def hook(_view, attempt_id: int) -> None:
+        if attempt_id == 1:
+            return
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            hook_cancelled.set()
+
+    r, _ = env.req("你好", regen=OnceRegen("你好", times=1), max_regenerate=1, on_think_start=hook)
+    h = env.co.submit(r)
+    await asyncio.wait_for(entered.wait(), SAFETY_S)
+    assert len(env.backend.calls) == 1  # 第一趟 think 跑過，第二趟還沒開始
+    env.co.cancel_all("left")
+    out = await settled(h)
+    assert out.status is OutcomeStatus.CANCELLED and out.regenerated == 1
+    assert hook_cancelled.is_set() and len(env.backend.calls) == 1
+    assert env.commits == []
