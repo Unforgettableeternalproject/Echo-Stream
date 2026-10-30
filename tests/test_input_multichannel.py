@@ -535,3 +535,118 @@ class TestTranscriberPool:
         assert (await queued).result is None
         assert (await running).result.text == "1"
         assert backend.calls == [1]
+
+
+class _GateBackend:
+    """value 在 ``slow`` 內的任務會卡在 gate 上，直到測試放行；其餘立即完成。"""
+
+    def __init__(self, slow: set[int]) -> None:
+        self.slow = slow
+        self.gate = threading.Event()
+        self.started: list[int] = []
+        self.finished: list[int] = []
+
+    def transcribe(self, pcm: bytes, sample_rate: int) -> TranscriptionResult | None:
+        value = struct.unpack("<h", pcm[:2])[0]
+        self.started.append(value)
+        if value in self.slow:
+            self.gate.wait(5.0)
+        self.finished.append(value)
+        return TranscriptionResult(text=str(value))
+
+
+def _pcm(value: int) -> bytes:
+    return struct.pack("<h", value) * 100
+
+
+class TestTranscriberPoolTimeout:
+    async def test_停用時行為不變(self) -> None:
+        backend = _GateBackend(slow=set())
+        pool = TranscriberPool(backend)
+        assert pool.job_timeout_s is None
+        result = await pool.run("A", _pcm(1), SR)
+        assert result.result.text == "1"
+        assert result.timed_out is False
+        assert pool.timeouts == 0
+
+    async def test_停用時慢任務照常等完(self) -> None:
+        backend = _GateBackend(slow={1})
+        pool = TranscriberPool(backend)
+        slow = asyncio.ensure_future(pool.run("A", _pcm(1), SR))
+        nxt = asyncio.ensure_future(pool.run("B", _pcm(2), SR))
+        await asyncio.sleep(0.15)
+        assert not nxt.done()  # 沒設逾時：B 一直排隊
+        backend.gate.set()
+        assert (await slow).result.text == "1"
+        assert (await nxt).result.text == "2"
+
+    async def test_逾時後下一個任務不再等滿(self) -> None:
+        backend = _GateBackend(slow={1})
+        pool = TranscriberPool(backend, job_timeout_s=0.1)
+        try:
+            slow = asyncio.ensure_future(pool.run("A", _pcm(1), SR))
+            nxt = asyncio.ensure_future(pool.run("B", _pcm(2), SR))
+            t0 = time.perf_counter()
+            second = await asyncio.wait_for(nxt, 2.0)
+            assert second.result.text == "2"
+            assert second.timed_out is False
+            assert time.perf_counter() - t0 < 1.0  # gate 未放行：不是等慢任務完成
+            assert (await slow).timed_out is True
+            assert pool.timeouts == 1
+        finally:
+            backend.gate.set()
+            await asyncio.sleep(0.05)
+
+    async def test_逾時結果被丟棄且記_warning(self, caplog) -> None:
+        backend = _GateBackend(slow={1})
+        pool = TranscriberPool(backend, job_timeout_s=0.1)
+        try:
+            with caplog.at_level("WARNING", logger="echo_stream.core.multichannel"):
+                result = await pool.run("alice", _pcm(1), SR)
+            assert result.result is None
+            assert result.timed_out is True
+            assert any(
+                "alice" in r.getMessage() and "逾時" in r.getMessage() for r in caplog.records
+            )
+        finally:
+            backend.gate.set()
+            await asyncio.sleep(0.05)
+
+    async def test_晚到結果不外洩且不影響後續(self) -> None:
+        backend = _GateBackend(slow={1})
+        pool = TranscriberPool(backend, job_timeout_s=0.1)
+        timed_out = await pool.run("A", _pcm(1), SR)
+        assert timed_out.result is None
+        backend.gate.set()  # 孤兒執行緒此時才完成
+        await asyncio.sleep(0.1)
+        assert 1 in backend.finished
+        assert pool._orphans == 0  # 額度歸還
+        # 同聲道的後續任務順序、狀態正常，拿到的是自己的結果
+        after = await pool.run("A", _pcm(3), SR)
+        assert after.result.text == "3"
+        assert after.timed_out is False
+        assert pool.timeouts == 1
+
+    async def test_孤兒額滿時不再放棄(self) -> None:
+        backend = _GateBackend(slow={1, 2})
+        pool = TranscriberPool(backend, job_timeout_s=0.1, max_orphans=1)
+        try:
+            first = await pool.run("A", _pcm(1), SR)
+            assert first.timed_out is True
+            second = asyncio.ensure_future(pool.run("B", _pcm(2), SR))
+            await asyncio.sleep(0.3)
+            assert not second.done()  # 孤兒額滿：照常等，不疊第三條 GPU 工作
+            assert pool.timeouts == 1
+            backend.gate.set()
+            result = await asyncio.wait_for(second, 2.0)
+            assert result.result.text == "2"
+            assert result.timed_out is False
+        finally:
+            backend.gate.set()
+            await asyncio.sleep(0.05)
+
+    async def test_逾時值必須為正(self) -> None:
+        import pytest
+
+        with pytest.raises(ValueError):
+            TranscriberPool(_GateBackend(set()), job_timeout_s=0)

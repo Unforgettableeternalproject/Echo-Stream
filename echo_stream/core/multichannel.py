@@ -34,7 +34,7 @@ _CANCELLED = (asyncio.CancelledError, CancelledError)
 class PoolResult:
     """一次轉錄任務的產物與耗時。``queue_ms`` 是等 pool 排程的時間，與 ``stt_ms`` 分開。"""
 
-    __slots__ = ("result", "queue_ms", "stt_ms", "started_ts", "done_ts")
+    __slots__ = ("result", "queue_ms", "stt_ms", "started_ts", "done_ts", "timed_out")
 
     def __init__(
         self,
@@ -43,12 +43,18 @@ class PoolResult:
         stt_ms: float = 0.0,
         started_ts: float = 0.0,
         done_ts: float = 0.0,
+        timed_out: bool = False,
     ) -> None:
+        self.timed_out = timed_out
         self.result = result
         self.queue_ms = queue_ms
         self.stt_ms = stt_ms
         self.started_ts = started_ts
         self.done_ts = done_ts
+
+
+_TIMED_OUT = object()
+"""``TranscriberPool._await_with_timeout`` 的哨兵：該任務已逾時放棄。"""
 
 
 class _Job:
@@ -71,6 +77,12 @@ class TranscriberPool:
     * 有待辦任務的聲道排成輪轉環；任務完成後，該聲道若還有待辦就排到環尾，
       所以人多時每人輪流，話多的人不會餓死別人。
     * 同時執行數以 ``max_concurrency`` 限制（預設 1，GPU 不並行）。
+    * ``job_timeout_s``（預設 None＝停用）：單一任務的牆鐘逾時。逾時就立刻釋放
+      槽位給下一個任務，該任務以空結果（``timed_out=True``）完成、結果作廢。
+      建議值約 6.0；Whisper 偶發的解碼重試／重複迴圈可能卡 4–13 秒，不設就會
+      拖住後面所有聲道。轉錄跑在執行緒，Python 無法中止，逾時後那條執行緒仍會
+      算完（GPU 仍在跑），此時最多同時 ``max_orphans``（預設 1）個「孤兒」；
+      孤兒額滿時，再逾時的任務不放棄，照常等到完成，避免 GPU 上無限堆疊。
     * backend 若有 ``transcribe_for(speaker_id, pcm, sr)`` 就呼叫它
       （讓 backend 做逐聲道詞表等），否則用 ``transcribe(pcm, sr)``。
     """
@@ -80,12 +92,22 @@ class TranscriberPool:
         backend: Any,
         *,
         max_concurrency: int = 1,
+        job_timeout_s: float | None = None,
+        max_orphans: int = 1,
         clock: Callable[[], float] = time.perf_counter,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("max_concurrency 必須 >= 1")
+        if job_timeout_s is not None and job_timeout_s <= 0:
+            raise ValueError("job_timeout_s 必須 > 0 或為 None")
+        if max_orphans < 0:
+            raise ValueError("max_orphans 必須 >= 0")
         self.backend = backend
         self.max_concurrency = max_concurrency
+        self.job_timeout_s = job_timeout_s
+        self.max_orphans = max_orphans
+        self.timeouts = 0
+        self._orphans = 0
         self._clock = clock
         self._queues: dict[str, deque[_Job]] = {}
         self._ring: deque[str] = deque()
@@ -160,13 +182,56 @@ class TranscriberPool:
             return per_channel(speaker_id, pcm, sample_rate)
         return self.backend.transcribe(pcm, sample_rate)
 
+    async def _await_with_timeout(
+        self, speaker_id: str, job: _Job, fut: asyncio.Future, started: float
+    ) -> Any:
+        """等執行緒結果；逾時且孤兒額度有空就放棄它（回傳 ``_TIMED_OUT``）。"""
+        done, _ = await asyncio.wait({fut}, timeout=self.job_timeout_s)
+        if done:
+            return fut.result()
+        if self._orphans >= self.max_orphans:
+            return await fut  # 孤兒額滿：不再放棄，照常等
+        self._orphans += 1
+        self.timeouts += 1
+        fut.add_done_callback(self._reap_orphan)
+        elapsed = self._clock() - started
+        logger.warning(
+            "轉錄逾時：speaker=%s 音訊=%.2fs 已耗時=%.2fs（上限 %.2fs），結果作廢並釋放槽位",
+            speaker_id,
+            len(job.pcm) / 2 / max(1, job.sample_rate),
+            elapsed,
+            self.job_timeout_s,
+        )
+        if not job.future.done():
+            job.future.set_result(
+                PoolResult(
+                    None,
+                    queue_ms=max(0.0, (started - job.submitted) * 1000.0),
+                    stt_ms=max(0.0, elapsed * 1000.0),
+                    started_ts=started,
+                    done_ts=started + elapsed,
+                    timed_out=True,
+                )
+            )
+        return _TIMED_OUT
+
+    def _reap_orphan(self, fut: asyncio.Future) -> None:
+        """孤兒執行緒終於結束：歸還額度，吞掉結果／例外（不外洩、不產生未取回警告）。"""
+        self._orphans -= 1
+        if not fut.cancelled():
+            fut.exception()
+
     async def _execute(self, speaker_id: str, job: _Job) -> None:
         loop = asyncio.get_running_loop()
         started = self._clock()
         try:
-            result = await loop.run_in_executor(
-                None, self._invoke, speaker_id, job.pcm, job.sample_rate
-            )
+            fut = loop.run_in_executor(None, self._invoke, speaker_id, job.pcm, job.sample_rate)
+            if self.job_timeout_s is None:
+                result = await fut
+            else:
+                result = await self._await_with_timeout(speaker_id, job, fut, started)
+                if result is _TIMED_OUT:
+                    return
         except asyncio.CancelledError:
             if not job.future.done():
                 job.future.cancel()
@@ -302,6 +367,7 @@ class ChannelEngine:
         idle_evict_s: float = 60.0,
         max_channels: int = 32,
         max_concurrency: int = 1,
+        job_timeout_s: float | None = None,
         tick_interval_s: float = 0.1,
         silence_fill_s: float = 0.1,
         clock: Callable[[], float] = time.perf_counter,
@@ -317,6 +383,7 @@ class ChannelEngine:
         self.idle_evict_s = idle_evict_s
         self.max_channels = max_channels
         self.max_concurrency = max_concurrency
+        self.job_timeout_s = job_timeout_s
         self.tick_interval_s = tick_interval_s
         self.silence_fill_s = silence_fill_s
         self._clock = clock
@@ -329,6 +396,7 @@ class ChannelEngine:
             "channels_rejected": 0,
             "channels_evicted": 0,
             "stt_errors": 0,
+            "stt_timeouts": 0,
         }
         self._loop: asyncio.AbstractEventLoop | None = None
         self._closed = True
@@ -364,7 +432,10 @@ class ChannelEngine:
         out: StreamChannel[Utterance] = StreamChannel(maxsize=self.queue_size, token=token)
         self._out = out
         self._pool = TranscriberPool(
-            self.backend, max_concurrency=self.max_concurrency, clock=self._clock
+            self.backend,
+            max_concurrency=self.max_concurrency,
+            job_timeout_s=self.job_timeout_s,
+            clock=self._clock,
         )
         self._ticker = asyncio.ensure_future(self._tick_loop())
 
@@ -656,6 +727,8 @@ class ChannelEngine:
                         except Exception:  # noqa: BLE001 - 單一聲道轉錄失敗不拖垮 session
                             self.stats["stt_errors"] += 1
                             logger.exception("聲道 %s 轉錄失敗", sid)
+                    if job is not None and job.timed_out:
+                        self.stats["stt_timeouts"] += 1
                     if segment.gen != st.core.gen:
                         continue
                     result = job.result if job is not None else None
