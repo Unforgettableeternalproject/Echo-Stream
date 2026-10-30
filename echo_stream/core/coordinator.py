@@ -842,9 +842,9 @@ class TurnCoordinator:
                 self.tracer.count_sentence(tid, sentence.split_reason)
 
                 voiced: Sentence | None = sentence
-                if att.voice.is_cancelled:
-                    voiced = None  # 語音已被截斷：文字照常記帳，但不再餵語音支線
-                elif filt is not None and speaking:
+                # PASS 偵測與要不要唸脫鉤：每句都餵 filter（PASS 後不再餵），
+                # 語音已取消／不唸只影響是否 emit；PASS 只關語音，think 照常跑完
+                if filt is not None and not att.passed:
                     try:
                         text = filt.feed(sentence.text)
                         passed = bool(filt.passed)
@@ -853,11 +853,12 @@ class TurnCoordinator:
                         text, passed = None, False
                     if passed:
                         att.passed = True
-                        break
-                    if not text:
+                    elif not text:
                         voiced = None
                     elif text != sentence.text:
                         voiced = dataclasses.replace(sentence, text=text)
+                if att.passed or att.voice.is_cancelled:
+                    voiced = None  # PASS 後／語音已被截斷：文字照常記帳，但不再餵語音支線
 
                 if voiced is not None and voiced.text:
                     att.voiced[sentence.index] = voiced.text
@@ -1111,16 +1112,19 @@ class TurnCoordinator:
         # --- 狀態與跳過原因 ---
         skipped: str | None = None
         if phase is TurnPhase.DONE:
-            if t._skip_reason:
+            if att.passed:
+                skipped = SkipReason.PASS  # 模型的 PASS 優先於 mode_silent 等靜態原因
+            elif t._skip_reason:
                 skipped = t._skip_reason
-            elif att.passed:
-                skipped = SkipReason.PASS
             elif sink is not None:
                 play_error = getattr(sink, "play_error", None)
                 if not att.voiced:
                     skipped = SkipReason.NO_SPOKEN_TEXT
                 elif not att.wrote_any or (play_error and not t.audio_started):
                     skipped = f"play_failed: {play_error}" if play_error else SkipReason.NO_AUDIO
+        elif barge_in and att.passed:
+            # 語音已被插話截斷但模型仍 PASS：status 維持 CANCELLED／barge_in，PASS 只當資訊旗標
+            skipped = SkipReason.PASS
         if phase is TurnPhase.FAILED:
             status = OutcomeStatus.FAILED
         elif cancelled:

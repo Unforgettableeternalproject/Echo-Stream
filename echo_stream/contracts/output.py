@@ -348,7 +348,9 @@ class SpeechTextFilter(Protocol):
     """句級文字過濾（標記剝除、PASS 偵測）。協定內容屬宿主。"""
 
     passed: bool
-    """已偵測到 PASS：ES 關閉該輪語音輸入、不寫 sink。"""
+    """已偵測到 PASS：ES 只關閉該輪語音（該句與之後句子不送 TTS、不寫 sink），
+    **think 照常生成到完**——全文照常記帳、commit、送 ``on_sentence``，usage 完整。
+    ES 對每句都 feed（不論是否播放、語音是否已取消），PASS 後不再 feed。"""
 
     def feed(self, sentence_text: str) -> str | None:
         """回傳要唸的文字；None = 這句不唸。"""

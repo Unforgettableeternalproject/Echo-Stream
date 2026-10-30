@@ -414,6 +414,44 @@ class PassOnFirst:
         return text
 
 
+class PassOn:
+    """句子以指定前綴開頭時 PASS，並記錄每次 feed 的句子。"""
+
+    def __init__(self, prefix: str) -> None:
+        self.prefix = prefix
+        self.passed = False
+        self.addressee_ids: set[str] = set()
+        self.fed: list[str] = []
+
+    def feed(self, text: str):
+        self.fed.append(text)
+        if text.startswith(self.prefix):
+            self.passed = True
+            return None
+        return text
+
+
+def track_think_completion(env: Env) -> dict[str, bool]:
+    """包住 think.stream，記錄是否真的迭代到底、或被提早 aclose。"""
+    state = {"finished": False, "closed_early": False}
+    original = env.think.stream
+
+    async def stream(utterance, token):
+        agen = original(utterance, token)
+        try:
+            async for sentence in agen:
+                yield sentence
+            state["finished"] = True
+        except GeneratorExit:
+            state["closed_early"] = not state["finished"]
+            raise
+        finally:
+            await agen.aclose()
+
+    env.think.stream = stream  # type: ignore[method-assign]
+    return state
+
+
 @pytest.mark.parametrize("mode", [CommitMode.EAGER, CommitMode.SETTLED])
 async def test_pass_writes_nothing_and_commits_per_mode(mode: CommitMode) -> None:
     env = build()
@@ -422,12 +460,66 @@ async def test_pass_writes_nothing_and_commits_per_mode(mode: CommitMode) -> Non
     out = await settled(h)
     assert sink.chunks == [] and sink.stop_calls == 0
     assert out.status is OutcomeStatus.SKIPPED and out.skipped_reason == SkipReason.PASS
+    assert out.generated_text == RESPONSE  # PASS 只關語音，think 生成到完
     assert len(env.commits) == 1
     _tid, spoken, generated = env.commits[0]
     if mode is CommitMode.EAGER:
-        assert spoken == generated == S0  # bot 現況：PASS 照樣 commit 已生成的文字
+        assert spoken == generated == RESPONSE  # 全文（含 PASS 標記）照常 commit
     else:
-        assert spoken == "" and generated == S0
+        assert spoken == "" and generated == RESPONSE
+
+
+async def test_pass_keeps_think_running_and_delivers_all_sentences() -> None:
+    env = build()
+    state = track_think_completion(env)
+    sent: list[str] = []
+
+    async def on_sentence(_view, sentence: Sentence) -> None:
+        sent.append(sentence.text)
+
+    r, sink = env.req("A", text_filter=PassOn("乙"), on_sentence=on_sentence)
+    h = env.co.submit(r)
+    await playing(sink, 1)
+    sink.finish()
+    out = await settled(h)
+    assert state == {"finished": True, "closed_early": False}
+    assert [x for x in sent if x] == SENTENCES  # PASS 句與之後的句子文字照常送
+    assert env.speak.seen == [0]  # PASS 句與之後都不進語音
+    assert len(sink.chunks) == 1
+    assert out.generated_text == RESPONSE and out.skipped_reason == SkipReason.PASS
+    assert env.commits[0][2] == RESPONSE
+
+
+async def test_pass_is_detected_after_barge_in() -> None:
+    env, mid = build_split()
+    filt = PassOn("乙")
+    r, sink = env.req("A", text_filter=filt)
+    h = env.co.submit(r)
+    await until(lambda: len(sink.chunks) == 1)
+    sink.play(1.0)
+    for k in range(4):
+        env.co.on_voice_event(voiced(1.0 + 0.5 * k))
+    assert h.voice_token.is_cancelled
+    mid.set()
+    out = await settled(h)
+    assert filt.passed and SENTENCES[1] in filt.fed  # barge-in 後仍餵 filter
+    assert out.generated_text == FULL
+    # voice 已取消與 pass 同時成立：status／barge_in 維持 barge-in 語意，pass 只當資訊旗標
+    assert out.barge_in and out.status is OutcomeStatus.CANCELLED
+    assert out.skipped_reason == SkipReason.PASS
+
+
+async def test_pass_is_detected_when_speak_is_off() -> None:
+    class Rules:
+        def flags_for(self, reply_mode):
+            return ModeFlags(speak=False)
+
+    env = build()
+    env.co.policy_source = StaticPolicySource(PolicySnapshot(mode_rules=Rules()))
+    r, sink = env.req("A", text_filter=PassOn("乙"))
+    out = await settled(env.co.submit(r))
+    assert sink.chunks == []
+    assert out.skipped_reason == SkipReason.PASS  # PASS 比靜態的 mode_silent 更具體
 
 
 # ───────────────────────── commit／settle ─────────────────────────
