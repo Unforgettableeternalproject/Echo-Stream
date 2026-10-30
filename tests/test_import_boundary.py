@@ -2,6 +2,7 @@
 
 守的是「ES 不變成第六個孤島」與「uep -> echo_stream 單向」兩條線。
 以 AST 掃描（含函式內的延遲 import），不實際 import 任何模組。
+限制：動態 import（``importlib.import_module``、``__import__``）靜態掃描守不到。
 """
 
 from __future__ import annotations
@@ -36,6 +37,11 @@ def _imports(path: Path) -> list[tuple[int, int, str | None]]:
             if node.level > 0 and node.module is None:
                 # ``from .. import adapters`` 這種：被匯入的名稱本身就是套件
                 found.extend((node.lineno, node.level, alias.name) for alias in node.names)
+            elif node.level == 0 and node.module == "echo_stream":
+                # ``from echo_stream import adapters``：展開成 echo_stream.adapters
+                found.extend(
+                    (node.lineno, 0, f"echo_stream.{alias.name}") for alias in node.names
+                )
     return found
 
 
