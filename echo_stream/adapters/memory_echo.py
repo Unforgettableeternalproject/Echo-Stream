@@ -667,8 +667,11 @@ class EchoMemoryAdapter:
         if result is None:
             return {"success": False, "result": "目前無法查詢這位成員的共享內容。"}
         if not result.text:
-            return {"success": True, "result": f"沒有查到「{label}」可分享的內容。"}
-        text = f"關於「{label}」的共享內容：\n{result.text}"
+            return {
+                "success": True,
+                "result": f"「{label}」是本伺服器成員，但目前沒有可分享的內容。",
+            }
+        text = f"以下是「{label}」（本伺服器成員）在伺服器裡提過、可分享的內容：\n{result.text}"
         visible = list(result.ids)
         if len(text) > self.tool_max_chars:
             cut = text[: self.tool_max_chars]

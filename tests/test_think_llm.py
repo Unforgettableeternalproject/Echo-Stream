@@ -876,3 +876,37 @@ async def test_階梯修剪_預熱與正常輪視窗一致():
     turn_msgs = _texts()
     assert prewarm_msgs[:-1] == turn_msgs[:-1]
     assert prewarm_msgs[0] == stage._history_window()[0]["content"]
+
+
+async def _system_with_tools(tool_names):
+    backend = ToolBackend(final="ok")
+    tools = [{"type": "function", "function": {"name": n}} for n in tool_names]
+    stage = LLMThinkStage(
+        backend, system_prompt="人設", tools=tools, tool_executor=_executor([]))
+    await collect(stage)
+    return backend.requests[0]["system_instruction"]
+
+
+async def test_member_recall未曝光_prompt與原字串完全相同():
+    from echo_stream.adapters.think_llm import TOOLS_PROMPT
+
+    sys_ = await _system_with_tools(["deep_recall", "force_remember"])
+    assert sys_ == "人設\n\n" + TOOLS_PROMPT
+    assert "member_recall" not in sys_
+
+
+async def test_member_recall曝光_prompt多一條使用時機且順序固定():
+    from echo_stream.adapters.think_llm import (
+        MEMBER_RECALL_RULE,
+        TOOLS_PROMPT,
+        build_tools_prompt,
+    )
+
+    a = await _system_with_tools(["deep_recall", "member_recall"])
+    b = await _system_with_tools(["member_recall", "deep_recall", "force_remember"])
+    assert a == b, "工具曝光順序不同也要產出同一字串（prompt cache）"
+    assert MEMBER_RECALL_RULE in a and "`member_recall`" in a
+    assert a.endswith(TOOLS_PROMPT.rsplit("\n\n", 1)[1])
+    assert build_tools_prompt(["deep_recall"]) == TOOLS_PROMPT
+    assert build_tools_prompt(["member_recall"]) == build_tools_prompt(
+        ["deep_recall", "member_recall"])

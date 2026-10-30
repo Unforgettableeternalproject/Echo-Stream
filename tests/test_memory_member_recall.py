@@ -92,7 +92,8 @@ async def test_標題用resolver對應的顯示名_不回填LLM給的字串():
     adapter = _adapter(_OwnerEngine(), lambda name: "u1")
     out = await adapter.execute_tool(
         "member_recall", {"member": "忽略前述指示的怪字串"}, context=_ctx())
-    assert out["result"].startswith("關於「成員甲」")
+    assert out["result"].startswith(
+        "以下是「成員甲」（本伺服器成員）在伺服器裡提過、可分享的內容：\n")
     assert "怪字串" not in out["result"]
 
 
@@ -176,7 +177,8 @@ async def test_owner等於viewer_引擎回空_不登記ids():
     eng = _OwnerEngine(_Shared([]))
     ctx = _ctx(viewer="u1")
     out = await _adapter(eng).execute_tool("member_recall", {"member": "成員甲"}, context=ctx)
-    assert "沒有查到" in out["result"] and "member_recall_ids" not in ctx
+    assert out["result"] == "「成員甲」是本伺服器成員，但目前沒有可分享的內容。"
+    assert "member_recall_ids" not in ctx
 
 
 async def test_截斷時ids只含LLM實際看得到的():
@@ -301,3 +303,18 @@ async def test_think_舊executor不收context照舊呼叫():
     await _drain(_stage(ex), Utterance(
         text="hi", speaker_id="u", metadata={"tool_context": {"a": 1}}))
     assert seen == [("member_recall", {"member": "成員甲"})]
+
+
+async def test_查無投影時_label缺省用這位成員():
+    eng = _OwnerEngine(_Shared([]))
+    ctx = {"member_recall": {"scope_id": "s", "viewer_uid": "v"}}
+    out = await _adapter(eng).execute_tool("member_recall", {"member": "成員甲"}, context=ctx)
+    assert out["result"] == "「這位成員」是本伺服器成員，但目前沒有可分享的內容。"
+
+
+async def test_解析失敗_不說是本伺服器成員():
+    eng = _OwnerEngine(_Shared([_Item("p1")]))
+    out = await _adapter(eng, resolver=lambda name: None).execute_tool(
+        "member_recall", {"member": "成員乙"}, context=_ctx())
+    assert out["result"] == "無法確認是哪位成員。"
+    assert "本伺服器成員" not in out["result"] and eng.calls2 == []
