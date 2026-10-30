@@ -906,6 +906,7 @@ async def test_member_recall曝光_prompt多一條使用時機且順序固定():
     b = await _system_with_tools(["member_recall", "deep_recall", "force_remember"])
     assert a == b, "工具曝光順序不同也要產出同一字串（prompt cache）"
     assert MEMBER_RECALL_RULE in a and "`member_recall`" in a
+    assert "你是說" in MEMBER_RECALL_RULE  # 名稱與使用者所說不同時先確認，避免近音對錯人
     assert a.endswith(TOOLS_PROMPT.rsplit("\n\n", 1)[1])
     assert build_tools_prompt(["deep_recall"]) == TOOLS_PROMPT
     assert build_tools_prompt(["member_recall"]) == build_tools_prompt(
