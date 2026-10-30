@@ -9,7 +9,8 @@
 ``submit()`` 立即返回 :class:`TurnHandle`，背景 task 依序做：
 
 1. 等 think 鎖（FIFO；等鎖期間被作廢 → ``VOIDED``，不產生任何生成／播放）
-   取得鎖後、每一趟生成開始前呼叫宿主的 ``on_think_start``（鎖內；例外吞掉並記 log）
+   取得鎖後、每一趟生成開始前呼叫宿主的 ``on_think_start``（鎖內；例外與逾時吞掉並記 log，
+   摘要放 ``metadata["on_think_start_error"]``）
 2. 生成：think → speak，音訊塊在「前一輪還沒播完」時先緩衝（合成不等前一輪），
    輪到自己才寫 sink；前一輪已結束就直接寫（**熱路徑不經緩衝、不多一次 await**）
 3. 生成完成：EAGER 在釋放鎖**之前** commit；SETTLED 鎖一路持有到結算（串行語意）
@@ -106,6 +107,12 @@ IDLE_TIMEOUT_S = 0.5
 _END = object()
 _CANCELLED = object()
 """句子佇列的內部標記：結束、取消。"""
+
+THINK_HOOK_TIMEOUT_S = 10.0
+"""``on_think_start`` 的逾時：hook 卡住會一直持有 think 鎖，逾時視為 hook 失敗並照常生成。"""
+
+THINK_HOOK_CANCEL_GRACE_S = 1.0
+"""取消（逾時或整輪作廢）hook 之後等它收尾的寬限；hook 吞掉取消也不會繼續卡住鎖。"""
 
 TEXT_TIMEOUT_S = 30.0
 """結算前等 ``on_sentence`` 送完文字的上限（逾時就放棄剩餘句子，不擋 outcome）。"""
@@ -237,6 +244,7 @@ class TurnHandle:
         self._cancel_kind: str | None = None
         self._voice_kind: str | None = None
         self._voice_error: str | None = None
+        self._hook_error: str | None = None
         self._voice_settled = False
         """語音已播完（drain 返回）：之後 voice_cancel／voice_error 不能再認領。"""
 
@@ -332,6 +340,7 @@ class TurnCoordinator:
         play_timeout_s: float = PLAY_TIMEOUT_S,
         idle_timeout_s: float = IDLE_TIMEOUT_S,
         text_timeout_s: float = TEXT_TIMEOUT_S,
+        think_hook_timeout_s: float | None = THINK_HOOK_TIMEOUT_S,
         clock: Callable[[], float] = time.perf_counter,
     ) -> None:
         self.think = think_stage
@@ -347,6 +356,7 @@ class TurnCoordinator:
         self._play_timeout_s = play_timeout_s
         self._idle_timeout_s = idle_timeout_s
         self._text_timeout_s = text_timeout_s
+        self._think_hook_timeout_s = think_hook_timeout_s
         self._clock = clock
 
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -778,7 +788,11 @@ class TurnCoordinator:
         await self._conclude(t, att, phase, error)
 
     async def _run_think_hook(self, t: TurnHandle, att: _Attempt) -> None:
-        """鎖內、這一趟生成開始前呼叫宿主 hook。例外吞掉；hook 期間整輪被取消就中止並收尾。"""
+        """鎖內、這一趟生成開始前呼叫宿主 hook。
+
+        只吞 hook 的 ``Exception``（含逾時），記到 ``metadata["on_think_start_error"]``；
+        取消照常傳遞：hook 期間整輪被取消就中止並收尾（hook 被取消，不等它）。
+        """
         hook = t.request.on_think_start
         if hook is None:
             return
@@ -787,22 +801,42 @@ class TurnCoordinator:
             await hook(t, att.attempt_id)
 
         task = asyncio.ensure_future(_call())
+        # 被放生（吞掉取消）的 hook 之後才失敗也要取走例外，免得 "never retrieved" 警告
+        task.add_done_callback(lambda f: f.cancelled() or f.exception())
         canceller = asyncio.ensure_future(t._root.wait())
         try:
-            await asyncio.wait({task, canceller}, return_when=asyncio.FIRST_COMPLETED)
+            done, _ = await asyncio.wait(
+                {task, canceller}, timeout=self._think_hook_timeout_s,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
         finally:
-            for pending in (task, canceller):
-                if not pending.done():
-                    pending.cancel()
-            await asyncio.gather(task, canceller, return_exceptions=True)
+            pending = {p for p in (task, canceller) if not p.done()}
+            for p in pending:
+                p.cancel()
+            if pending:
+                # 有限等待：hook 吞掉取消時放生它，不讓 think 鎖永遠不放
+                await asyncio.wait(pending, timeout=THINK_HOOK_CANCEL_GRACE_S)
         if t._root.is_cancelled:
             # 走和「生成中被取消」同一條收尾路徑（認領早已完成，_produce 會直接結算 CANCELLED）
             raise CancelledError(t._root.reason or CancelReason.SHUTDOWN, t._root.detail)
-        if task.done() and not task.cancelled() and task.exception() is not None:
+        error: str | None = None
+        if task not in done:
+            error = "timeout"
+            _log.warning(
+                "on_think_start 逾時（turn %s，第 %d 趟，%ss），照常生成",
+                t.turn_id, att.attempt_id, self._think_hook_timeout_s,
+            )
+        elif task.cancelled():
+            error = "CancelledError: hook 自行取消"
+            _log.warning("on_think_start 被取消（turn %s），照常生成", t.turn_id)
+        elif (exc := task.exception()) is not None:
+            error = f"{type(exc).__name__}: {exc}"
             _log.warning(
                 "on_think_start 失敗（turn %s，第 %d 趟），照常生成: %s",
-                t.turn_id, att.attempt_id, task.exception(), exc_info=task.exception(),
+                t.turn_id, att.attempt_id, error, exc_info=exc,
             )
+        if error is not None:
+            t._hook_error = error
 
     async def _run_attempt(self, t: TurnHandle, att: _Attempt) -> str:
         """跑一趟生成與播放。回傳 ``"done"`` 或 ``"regen"``。
@@ -1313,6 +1347,8 @@ class TurnCoordinator:
         self.tracer.finish(tid, phase, cancel_value, error)
 
         meta = self._outcome_meta(t, reason, kind, detail)
+        if t._hook_error is not None:
+            meta["on_think_start_error"] = t._hook_error
         if voice_error is not None:
             meta["voice_error"] = voice_error
         if voice_kind == KIND_VOICE_CANCEL:

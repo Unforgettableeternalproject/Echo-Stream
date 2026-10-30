@@ -27,6 +27,7 @@ from echo_stream.contracts.output import (
 )
 from echo_stream.contracts.turn import VoiceEvent, VoiceState
 from echo_stream.contracts.types import TTS_SAMPLE_RATE, AudioChunk, Sentence, Utterance
+from echo_stream.core import coordinator as coordinator_module
 from echo_stream.core import tracer as marks
 from echo_stream.core.coordinator import TurnCoordinator
 from echo_stream.core.standalone import StandaloneTicketIssuer, StaticPolicySource
@@ -39,6 +40,7 @@ from .scenario_support import (
     ManualSink,
     ScriptBackend,
     build_think,
+    poll,
     until,
 )
 
@@ -1238,6 +1240,7 @@ async def test_on_think_start_error_is_swallowed_and_turn_still_runs(caplog) -> 
     assert out.generated_text == RESPONSE
     assert len(env.commits) == 1
     assert any("on_think_start" in rec.getMessage() for rec in caplog.records)
+    assert "hook boom" in out.metadata["on_think_start_error"]
 
 
 @pytest.mark.parametrize("how", ["void", "cancel_all"])
@@ -1543,3 +1546,49 @@ async def test_cancel_voice_after_drain_returned_is_refused() -> None:
     assert out.status is OutcomeStatus.COMPLETED and out.skipped_reason is None
     assert not out.cut_short and out.spoken_text == RESPONSE  # 最後一句沒被截掉
     assert "voice_cancelled" not in out.metadata
+
+
+async def test_on_think_start_timeout_counts_as_failure_and_frees_lock() -> None:
+    env = build(think_hook_timeout_s=0.05)
+
+    async def hook(_view, _attempt_id: int) -> None:
+        await asyncio.Event().wait()  # 永遠不返回
+
+    r, sink = env.req("A", on_think_start=hook)
+    h = env.co.submit(r)
+    await poll(lambda: len(sink.chunks) == 4 and sink.draining.is_set())  # 逾時靠牆鐘
+    sink.finish()
+    out = await settled(h)
+    assert out.status is OutcomeStatus.COMPLETED and out.generated_text == RESPONSE
+    assert out.metadata["on_think_start_error"] == "timeout"
+    r2, s2 = env.req("B", owner="u2")
+    h2 = env.co.submit(r2)
+    await playing(s2)
+    s2.finish()
+    out2 = await settled(h2)
+    assert out2.status is OutcomeStatus.COMPLETED
+    assert "on_think_start_error" not in out2.metadata
+
+
+async def test_on_think_start_swallowing_cancel_does_not_hold_lock(monkeypatch) -> None:
+    monkeypatch.setattr(coordinator_module, "THINK_HOOK_CANCEL_GRACE_S", 0.05)
+    env = build(think_hook_timeout_s=0.05)
+    stop = asyncio.Event()
+
+    async def hook(_view, _attempt_id: int) -> None:
+        while not stop.is_set():
+            try:
+                await stop.wait()
+            except asyncio.CancelledError:  # 壞掉的 hook：吞掉取消
+                pass
+
+    r, sink = env.req("A", on_think_start=hook)
+    h = env.co.submit(r)
+    try:
+        await poll(lambda: len(sink.chunks) == 4 and sink.draining.is_set())
+        sink.finish()
+        out = await settled(h)
+        assert out.status is OutcomeStatus.COMPLETED
+        assert out.metadata["on_think_start_error"] == "timeout"
+    finally:
+        stop.set()

@@ -424,10 +424,13 @@ class TurnRequest:
     ``await hook(view, attempt_id)``，regen 每趟都會再呼叫。宿主在這裡組 system prompt、
     取代前一輪、綁 sink 等「必須在鎖內、think 之前」的事，不必塞進 ``think.stream()``。
 
-    例外會被吞掉並記 warning，**不**讓整輪失敗：hook 是宿主的前置準備，壞掉時仍應讓這一輪
-    以預設狀態回覆；需要「失敗就不要回覆」的宿主請自行在 hook 內記旗標（``view.meta``）並於
-    自己的 think 層處理。hook 執行期間輪被取消（讓位／取代／shutdown）時，hook 會被取消，
-    輪以 CANCELLED 結束，think 不會開始。"""
+    只吞 hook 的 ``Exception``，記 warning 並寫入 ``outcome.metadata["on_think_start_error"]``
+    （例外摘要；逾時為 ``"timeout"``），**不**讓整輪失敗：hook 是宿主的前置準備，壞掉時仍應讓
+    這一輪以預設狀態回覆；需要「失敗就不要回覆」的宿主請自行在 hook 內記旗標（``view.meta``）
+    並於自己的 think 層處理。hook 持有 think 鎖，所以有逾時（``TurnCoordinator`` 的
+    ``think_hook_timeout_s``，預設 10 秒，None 停用）；逾時視同失敗，hook 被取消並放行生成
+    （hook 吞掉取消也只多等一小段寬限）。取消照常傳遞：hook 期間輪被取消（讓位／取代／
+    shutdown）時，hook 會被取消，輪以 CANCELLED 結束，think 不會開始。"""
 
 
 @dataclass(slots=True)
