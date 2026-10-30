@@ -237,6 +237,9 @@ class TurnHandle:
         self._cancel_kind: str | None = None
         self._voice_kind: str | None = None
         self._voice_error: str | None = None
+        self._voice_settled = False
+        """語音已播完（drain 返回）：之後 voice_cancel／voice_error 不能再認領。"""
+
         self._chaining = False
 
     # --- TurnView ---
@@ -564,6 +567,8 @@ class TurnCoordinator:
         with t._cancel_lock:
             if t._voice_claimed or t._cancel_claimed:
                 return False
+            if t._voice_settled and kind in _SOFT_VOICE_KINDS:
+                return False  # 語音已播完，不能再把這輪標成被取消／出錯
             t._voice_claimed = True
             t._voice_detail = detail
             t._voice_kind = kind
@@ -844,6 +849,8 @@ class TurnCoordinator:
                 token.raise_if_cancelled()
                 if att.wrote_any:
                     await self._drain(t, att)
+                with t._cancel_lock:
+                    t._voice_settled = True  # 與 _claim_voice 同鎖：之後的 cancel_voice 回 False
                 return "done"
             except CancelledError as exc:
                 if att.regen_utt is not None and not t._root.is_cancelled:
@@ -1219,6 +1226,10 @@ class TurnCoordinator:
         tid = t.turn_id
         sink = att.sink
         cancelled = phase is TurnPhase.CANCELLED
+        # 語音取消的狀態在開頭快照一次：skipped 與 metadata 都用快照，避免 await 期間前後不一致
+        voice_kind = t._voice_kind if t._voice_claimed else None
+        voice_detail = t._voice_detail
+        voice_error = t._voice_error
         reason: CancelReason | None = None
         detail = ""
         kind: str | None = None
@@ -1230,9 +1241,7 @@ class TurnCoordinator:
         barge_in = reason is CancelReason.BARGE_IN
         superseded = cancelled and kind == KIND_OWNER
         aborted = cancelled and not (barge_in and kind != KIND_CASCADE)
-        voice_soft = (
-            phase is TurnPhase.DONE and t._voice_claimed and t._voice_kind in _SOFT_VOICE_KINDS
-        )
+        voice_soft = phase is TurnPhase.DONE and voice_kind in _SOFT_VOICE_KINDS
         cut_short = barge_in or superseded or aborted or bool(error) or voice_soft
 
         # 被停掉的 sink 可能還有「最後實播位置」在回報路上：先等它確認再推算 spoken
@@ -1271,7 +1280,7 @@ class TurnCoordinator:
                 skipped = SkipReason.PASS  # 模型的 PASS 優先於 mode_silent 等靜態原因
             elif voice_soft:
                 skipped = (
-                    SkipReason.VOICE_ERROR if t._voice_kind == KIND_VOICE_ERROR
+                    SkipReason.VOICE_ERROR if voice_kind == KIND_VOICE_ERROR
                     else SkipReason.VOICE_CANCELLED
                 )
             elif t._skip_reason:
@@ -1304,10 +1313,10 @@ class TurnCoordinator:
         self.tracer.finish(tid, phase, cancel_value, error)
 
         meta = self._outcome_meta(t, reason, kind, detail)
-        if t._voice_error is not None:
-            meta["voice_error"] = t._voice_error
-        if t._voice_claimed and t._voice_kind == KIND_VOICE_CANCEL:
-            meta["voice_cancelled"] = t._voice_detail
+        if voice_error is not None:
+            meta["voice_error"] = voice_error
+        if voice_kind == KIND_VOICE_CANCEL:
+            meta["voice_cancelled"] = voice_detail
         if phase is not TurnPhase.DONE and t._skip_reason:
             meta["sink_skip_reason"] = t._skip_reason  # 取消／失敗時仍保留語音支線的靜態原因
         outcome = TurnOutcome(

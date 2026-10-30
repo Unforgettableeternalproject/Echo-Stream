@@ -1495,3 +1495,51 @@ async def test_cancel_voice_from_other_threads_stops_sync_and_wins_once() -> Non
     mid.set()
     out = await settled(h)
     assert out.skipped_reason == SkipReason.VOICE_CANCELLED and out.generated_text == FULL
+
+
+# ───────────────────────── 播完窗口：drain 已返回、播放位置還沒讓出 ─────────────────────────
+
+
+class SlowCloseSpeak(GateSpeak):
+    """stream 回傳物件的 aclose 卡住，把「drain 已返回、_play_done 還沒 set」的窗口撐開。"""
+
+    def __init__(self) -> None:
+        super().__init__(open_all=True)
+        self.release = asyncio.Event()
+
+    def stream(self, sentences, token):
+        inner = super().stream(sentences, token)
+        release = self.release
+
+        class _Held:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                return await inner.__anext__()
+
+            async def aclose(self) -> None:
+                await release.wait()
+                await inner.aclose()
+
+        return _Held()
+
+
+async def test_cancel_voice_after_drain_returned_is_refused() -> None:
+    env = build()
+    speak = SlowCloseSpeak()
+    env.co.speak = speak
+    r, sink = env.req("A", history_spoken_only=True)
+    h = env.co.submit(r)
+    await playing(sink)
+    sink.finish()  # 全部播完，drain 返回；但收尾卡在 aclose，播放位置還沒讓出
+    for _ in range(50):
+        await asyncio.sleep(0)
+    assert not h._play_done.is_set()
+    assert env.co.cancel_voice(h.turn_id, "late") is False  # 語音早已播完，不能再標成取消
+    assert not h.voice_token.is_cancelled
+    speak.release.set()
+    out = await settled(h)
+    assert out.status is OutcomeStatus.COMPLETED and out.skipped_reason is None
+    assert not out.cut_short and out.spoken_text == RESPONSE  # 最後一句沒被截掉
+    assert "voice_cancelled" not in out.metadata
