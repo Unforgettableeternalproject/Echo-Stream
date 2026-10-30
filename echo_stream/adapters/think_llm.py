@@ -419,6 +419,13 @@ class LLMThinkStage:
         """turn_id -> 該輪寫進 history 的 assistant 項（同一個 dict 物件）。
         只存參照、不在 history 項上加欄位，所以送 API 的 messages 與 prompt cache 前綴不受影響。"""
         self._pending_user_text = ""
+        self._context_epoch = 0
+        """對話脈絡世代，``reset_context`` 時 +1。commit 比對該輪 stream 開始時的世代，
+        不符就是上一群聽眾的晚到結果，丟棄不寫進新 history。"""
+        self._turn_epoch: dict[str, int] = {}
+        """turn_id -> 該輪 stream 開始時的 ``_context_epoch``（reset 不清，靠世代比對作廢）。"""
+        self._pending_epoch = 0
+        """最近一次 stream 開始時的世代，給沒有 turn_id 的 commit 用。"""
         self._prewarm_sent: dict[str, float] = {}
         """預熱去重：前綴 hash -> 送出時間（monotonic）。"""
         self.memory_resolver = memory_resolver
@@ -517,15 +524,25 @@ class LLMThinkStage:
 
         清掉：``history``（給了 ``history`` 就以其複本取代）、依 turn_id 的 assistant 索引、
         待提交的 user 文字、所有 scope 的待注入記憶、``_last_build``、``_retrieved``
-        去重記錄與 ``last_injected_memory``——前一群聽眾的記憶不得滲入下一群。
+        去重記錄、``last_injected_memory``、``last_tool_calls``（含上一群的工具結果摘要），
+        以及 ``profile`` 清成 ``""``——profile 隨聽眾而變，**宿主需在 reset 後自行重設**。
+        前一群聽眾的記憶不得滲入下一群。
         ``_discard_gen`` +1，讓清除前發起、尚在途的 retrieve 晚到時作廢、不寫回槽。
+        ``_context_epoch`` +1：reset 之前開始的輪次，之後的 ``commit`` 會被丟棄（log info）、
+        ``settle`` 回 False，上一群的回答不會寫進新 history。
 
-        前置條件：呼叫端保證此時沒有進行中的 ``stream``；偵測到（``_scope_owner`` 有值）
-        就拋 ``RuntimeError``，而不是靜默清掉別人正在用的狀態。
-        ``history`` 之後若有 ``settle`` 舊 turn_id，會因索引已清而回 False。
+        前置條件：
+        - 呼叫端保證此時沒有進行中的 ``stream``；偵測到（``_scope_owner`` 有值）
+          就拋 ``RuntimeError``，而不是靜默清掉別人正在用的狀態。
+        - 也保證沒有「已建立但尚未開始迭代」的 stream（偵測不到；由 coordinator 的
+          think 鎖序列化保證）。
+        - 每個 stream 都必須迭代完或被 ``aclose``；否則 owner 不會清，reset 會永久拋錯。
         """
         if self._scope_owner is not None:
             raise RuntimeError("stream 進行中不可 reset_context（呼叫端須先確保 think 閒置）")
+        self._context_epoch += 1
+        self.last_tool_calls = []
+        self.profile = ""
         self.history[:] = list(history) if history is not None else []
         self._assistant_by_turn = {}
         self._pending_user_text = ""
@@ -749,6 +766,12 @@ class LLMThinkStage:
         carried: SpeechStyle | None = None
         try:
             self._pending_user_text = utterance.text
+            self._pending_epoch = self._context_epoch
+            if utterance.turn_id:
+                self._turn_epoch[utterance.turn_id] = self._context_epoch
+                if len(self._turn_epoch) > 8 * max(1, self.history_limit):
+                    for key in list(self._turn_epoch)[: len(self._turn_epoch) // 2]:
+                        del self._turn_epoch[key]
             messages = to_messages(
                 self._build_messages(
                     utterance.text, scope, utterance.turn_id,
@@ -1127,6 +1150,10 @@ class LLMThinkStage:
         這樣一輪對話的兩邊要嘛都進、要嘛都不進，不會出現
         「使用者問了但機器人的回答不見了」的半套狀態。
         """
+        epoch = self._turn_epoch.get(turn_id) if turn_id else self._pending_epoch
+        if epoch is not None and epoch != self._context_epoch:
+            logger.info("commit 丟棄：turn %s 屬於 reset_context 之前的脈絡", turn_id)
+            return
         if self._pending_user_text:
             self.history.append({"role": "user", "content": self._pending_user_text})
         if spoken_text:
@@ -1147,6 +1174,10 @@ class LLMThinkStage:
         ``spoken_text`` 非空 = 換成這段文字（例如私訊占位、之後再回填可透露的版本）；
         空字串 = 移除該 assistant 項。找不到（沒 commit 過、已被修剪出歷史）回 False，不報錯。
         """
+        epoch = self._turn_epoch.get(turn_id)
+        if epoch is not None and epoch != self._context_epoch:
+            logger.info("settle 丟棄：turn %s 屬於 reset_context 之前的脈絡", turn_id)
+            return False
         item = self._assistant_by_turn.get(turn_id)
         if item is None or not any(h is item for h in self.history):
             return False

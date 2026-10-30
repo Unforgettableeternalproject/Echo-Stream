@@ -264,7 +264,10 @@ class ThinkHostSurface(ThinkStage, SettleCapable, Protocol):
     在 :class:`ThinkStage` 與 :class:`SettleCapable` 之上補上實作早已公開、
     但契約沒寫的部分，讓宿主以結構型別檢查取代 ``getattr`` 探測。
     ``reset_context`` 的前置條件：呼叫端保證沒有進行中的 ``stream``，否則實作拋
-    ``RuntimeError``。
+    ``RuntimeError``；reset 會把 ``profile`` 清成 ``""``，宿主需自行重設。
+
+    這是 ``LLMThinkStage`` 現況的快照，新增成員走契約變更。``history``、``tools`` 為
+    宿主唯讀；除 ``profile``、``tool_executor`` 外，宿主不得重設這些成員。
     """
 
     history: list[dict[str, str]]

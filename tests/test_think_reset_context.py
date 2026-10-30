@@ -121,7 +121,6 @@ async def test_reset保留設定與靜態前綴():
     stage = _stage(
         FakeBackend(delay_s=0.001), system_prompt="人設", tools=tools, prompt_cache_key="k1",
     )
-    stage.profile = "常駐 profile"
     stage._prewarm_sent["h"] = 1.0
     await _committed_turn(stage, "你好", "A", "t1")
     stage.last_usage = {"input_tokens": 10}
@@ -131,6 +130,37 @@ async def test_reset保留設定與靜態前綴():
     assert stage.system_prompt == "人設"
     assert stage.tools == tools
     assert stage.prompt_cache_key == "k1"
-    assert stage.profile == "常駐 profile"
     assert stage._prewarm_sent == {"h": 1.0}
     assert stage.last_usage == {"input_tokens": 10}
+
+
+async def test_reset清掉上一群的工具結果摘要與profile():
+    stage = _stage(FakeBackend(delay_s=0.001))
+    stage.last_tool_calls = [{"name": "deep_recall", "result_summary": "甲群的事"}]
+    stage.profile = "甲群 profile"  # profile 隨聽眾而變，reset 後由宿主重設
+    stage.reset_context()
+    assert stage.last_tool_calls == []
+    assert stage.profile == ""
+
+
+async def test_reset後commit舊turn_id不得進新history():
+    stage = _stage(FakeBackend(delay_s=0.001))
+    await _run_turn(stage, "上一群的問題", "A", turn_id="t1")  # stream 已結束、尚未 commit
+    stage.reset_context()
+    await stage.commit("t1", "上一群的回答", "上一群的回答")
+    assert stage.history == []
+    assert stage._assistant_by_turn == {}
+    assert await stage.settle("t1", "改寫") is False
+
+
+async def test_reset後新一輪commit正常_舊輪commit仍被丟棄():
+    stage = _stage(FakeBackend(delay_s=0.001))
+    await _run_turn(stage, "舊問題", "A", turn_id="t1")
+    stage.reset_context()
+    await _run_turn(stage, "新問題", "B", turn_id="t2")
+    await stage.commit("t1", "舊回答", "舊回答")  # 晚到的舊輪
+    await stage.commit("t2", "新回答", "新回答")
+    assert stage.history == [
+        {"role": "user", "content": "新問題"},
+        {"role": "assistant", "content": "新回答"},
+    ]
