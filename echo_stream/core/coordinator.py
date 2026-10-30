@@ -135,6 +135,16 @@ _SOFT_VOICE_KINDS = (KIND_VOICE_ERROR, KIND_VOICE_CANCEL)
 """只關語音、輪本身仍以 DONE 結算的語音取消種類（與 barge-in／cascade 的 CANCELLED 區分）。"""
 
 
+class _VoiceSideError(Exception):
+    """語音側呼叫（speak 產音訊、sink.write、flush、drain）拋出的例外。
+
+    包一層是為了和 coordinator 自身的程式錯誤區分：只有它會走「只停語音」路徑。"""
+
+    def __init__(self, cause: Exception) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+
+
 def _stop_sink(sink: AudioSink | None) -> None:
     if sink is None:
         return
@@ -865,11 +875,16 @@ class TurnCoordinator:
                     if not att.direct:
                         att.flusher = asyncio.ensure_future(self._flush(t, att))
                     chunk_stream = self.speak.stream(feed, token)
-                    async for chunk in chunk_stream:
+                    chunks = chunk_stream.__aiter__()
+                    while True:
+                        try:
+                            chunk = await self._voice_side(chunks.__anext__())
+                        except StopAsyncIteration:
+                            break
                         token.raise_if_cancelled()
                         self.tracer.mark(tid, marks.MARK_SPEAK_FIRST_CHUNK)
                         if att.direct:
-                            await self._write(t, att, chunk)
+                            await self._voice_side(self._write(t, att, chunk))
                         else:
                             att.buffer.append(chunk)
                     self.tracer.mark(tid, marks.MARK_SPEAK_LAST_CHUNK)
@@ -879,10 +894,10 @@ class TurnCoordinator:
                 if att.regen_utt is not None and not t._root.is_cancelled:
                     return "regen"
                 if att.flusher is not None:
-                    await att.flusher
+                    await self._voice_side(att.flusher)
                 token.raise_if_cancelled()
                 if att.wrote_any:
-                    await self._drain(t, att)
+                    await self._voice_side(self._drain(t, att))
                 with t._cancel_lock:
                     t._voice_settled = True  # 與 _claim_voice 同鎖：之後的 cancel_voice 回 False
                 return "done"
@@ -902,10 +917,20 @@ class TurnCoordinator:
                         ) from None
                     return "barged"
                 raise
-            except Exception as exc:  # noqa: BLE001 - 語音側（TTS／sink 寫入／drain）的例外
-                return await self._voice_failed(t, att, exc)
+            except _VoiceSideError as vexc:
+                return await self._voice_failed(t, att, vexc.cause)
         finally:
             await self._close_attempt(t, att, feed, chunk_stream)
+
+    @staticmethod
+    async def _voice_side(awaitable):
+        """跑一個語音側呼叫；它的例外包成 :class:`_VoiceSideError`，取消與迭代結束照常傳遞。"""
+        try:
+            return await awaitable
+        except (CancelledError, StopAsyncIteration):
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise _VoiceSideError(exc) from exc
 
     async def _voice_failed(self, t: TurnHandle, att: _Attempt, exc: Exception) -> str:
         """語音側出錯：只取消語音 token，讓 think 生成到完（收尾同 barge-in）。

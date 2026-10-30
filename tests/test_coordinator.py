@@ -1592,3 +1592,20 @@ async def test_on_think_start_swallowing_cancel_does_not_hold_lock(monkeypatch) 
         assert out.metadata["on_think_start_error"] == "timeout"
     finally:
         stop.set()
+
+
+async def test_coordinator_internal_error_is_failed_not_voice_error() -> None:
+    """只有 speak／sink.write／flush／drain 的例外算語音側；coordinator 自身錯誤仍是 FAILED。"""
+    env = build()
+    original = env.tracer.mark
+
+    def mark(tid, name, *args, **kw):
+        if name == marks.MARK_SPEAK_FIRST_CHUNK:
+            raise RuntimeError("internal bug")
+        return original(tid, name, *args, **kw)
+
+    env.tracer.mark = mark  # type: ignore[method-assign]
+    r, _ = env.req("A")
+    out = await settled(env.co.submit(r))
+    assert out.status is OutcomeStatus.FAILED and "internal bug" in (out.error or "")
+    assert "voice_error" not in out.metadata and out.skipped_reason != SkipReason.VOICE_ERROR
