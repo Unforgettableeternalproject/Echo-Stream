@@ -29,14 +29,17 @@
   ``cut_short=True``，不標 ``barge_in``／``aborted``、沒有 ``reason_code``（跟 PASS 一樣屬
   「這輪沒把語音唸完，文字照常處理」，既有只看 CANCELLED／aborted 的消費者不會把文字丟掉）。
   think 本身的例外維持 ``FAILED``
+* 宿主單輪停語音 ``cancel_voice()``：同一條「只取消語音」機制（kind ``voice_cancel``），
+  語意同 barge-in 但不標 ``barge_in``、不連帶取消後面排隊輪；outcome 為 ``phase=DONE``、
+  ``status=SKIPPED``、``skipped_reason=voice_cancelled``、``metadata["voice_cancelled"]`` 為 detail
 * 讓位 ``void()``：``SUPERSEDED`` + detail ``yielded``；已開播的輪不處理（回 False）
 * 同 owner 新回覆：``SUPERSEDED`` + detail ``superseded_by_owner``
 * ``cancel_all()``：``SHUTDOWN``，整輪作廢（think 也停），不 commit、不 settle
 
 ## 執行緒
 
-``on_voice_event`` / ``void`` / ``cancel_all`` 可從任何執行緒呼叫：在呼叫執行緒同步
-``sink.stop()``，token 取消經 ``call_soon_threadsafe`` 回 loop。``submit`` 與策略
+``on_voice_event`` / ``void`` / ``cancel_voice`` / ``cancel_all`` 可從任何執行緒呼叫：
+在呼叫執行緒同步 ``sink.stop()``，token 取消經 ``call_soon_threadsafe`` 回 loop。``submit`` 與策略
 ``refresh`` / ``SpeechTextFilter`` 只在 loop 內。
 
 ## 不做的事
@@ -116,11 +119,12 @@ KIND_OWNER = "owner"
 KIND_BARGE_IN = "barge_in"
 KIND_CASCADE = "cascade"
 KIND_VOICE_ERROR = "voice_error"
+KIND_VOICE_CANCEL = "voice_cancel"
 """取消種類（認領時記錄，決定 reason_code／superseded／cascade 旗標；``detail`` 只是自由字串）。
 其餘種類沿用 ``CancelReason.value``（shutdown、timeout、upstream_error…）。"""
 
 
-_SOFT_VOICE_KINDS = (KIND_VOICE_ERROR,)
+_SOFT_VOICE_KINDS = (KIND_VOICE_ERROR, KIND_VOICE_CANCEL)
 """只關語音、輪本身仍以 DONE 結算的語音取消種類（與 barge-in／cascade 的 CANCELLED 區分）。"""
 
 
@@ -473,6 +477,28 @@ class TurnCoordinator:
             return True
         return False
 
+    def cancel_voice(self, turn_id: str, detail: str = "host") -> bool:
+        """只取消單輪的語音（停播、停 TTS），think 照常生成到完、文字照常 commit。任何執行緒皆可。
+
+        語意同 :meth:`on_voice_event` 觸發的 barge-in，但不標 ``barge_in``、不連帶取消後面
+        排隊輪的語音；outcome 為 ``SKIPPED`` + ``skipped_reason=voice_cancelled``
+        （``metadata["voice_cancelled"]`` = ``detail``）。成功認領回 True；輪已結束、
+        已無語音可取消（沒有語音支線、語音或整輪已被取消）、或 ``turn_id`` 不存在回 False。
+        """
+        for t in list(self._live):
+            if t.turn_id != turn_id:
+                continue
+            att = t._att
+            if (att.sink if att is not None else t._first_sink) is None:
+                return False
+            if t._done or t._play_done.is_set():
+                return False
+            if not self._claim_voice(t, detail, KIND_VOICE_CANCEL):
+                return False
+            self._dispatch_voice(t, cascade=False)
+            return True
+        return False
+
     def cancel_all(self, reason: str = "shutdown") -> None:
         """取消所有進行中與排隊中的輪（SHUTDOWN）：停播、不 commit、不 settle。"""
         for t in list(self._live):
@@ -547,14 +573,18 @@ class TurnCoordinator:
         """插話：呼叫執行緒同步停 sink，語音 token 取消回 loop；think 不受影響。"""
         if not self._claim_voice(t, "voice"):
             return
+        self._dispatch_voice(t, cascade=True)
+
+    def _dispatch_voice(self, t: TurnHandle, *, cascade: bool) -> None:
+        """已認領的語音取消：呼叫執行緒同步停 sink，token 取消回 loop。"""
         if self._on_loop_thread():
-            self._cancel_voice_in_loop(t, True)
+            self._cancel_voice_in_loop(t, cascade)
             return
         att = t._att
         _stop_sink(att.sink if att is not None else t._first_sink)
         loop = self._loop
         if loop is not None:
-            loop.call_soon_threadsafe(self._cancel_voice_in_loop, t, True)
+            loop.call_soon_threadsafe(self._cancel_voice_in_loop, t, cascade)
 
     def _cancel_voice_in_loop(self, t: TurnHandle, cascade: bool) -> None:
         att = t._att
@@ -1240,7 +1270,10 @@ class TurnCoordinator:
             if att.passed:
                 skipped = SkipReason.PASS  # 模型的 PASS 優先於 mode_silent 等靜態原因
             elif voice_soft:
-                skipped = SkipReason.VOICE_ERROR
+                skipped = (
+                    SkipReason.VOICE_ERROR if t._voice_kind == KIND_VOICE_ERROR
+                    else SkipReason.VOICE_CANCELLED
+                )
             elif t._skip_reason:
                 skipped = t._skip_reason
             elif sink is not None:
@@ -1273,6 +1306,8 @@ class TurnCoordinator:
         meta = self._outcome_meta(t, reason, kind, detail)
         if t._voice_error is not None:
             meta["voice_error"] = t._voice_error
+        if t._voice_claimed and t._voice_kind == KIND_VOICE_CANCEL:
+            meta["voice_cancelled"] = t._voice_detail
         if phase is not TurnPhase.DONE and t._skip_reason:
             meta["sink_skip_reason"] = t._skip_reason  # 取消／失敗時仍保留語音支線的靜態原因
         outcome = TurnOutcome(

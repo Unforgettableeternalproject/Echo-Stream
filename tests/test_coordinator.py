@@ -1399,3 +1399,99 @@ async def test_think_error_is_still_failed_not_voice_error() -> None:
     out = await settled(env.co.submit(r))
     assert out.status is OutcomeStatus.FAILED and "backend boom" in (out.error or "")
     assert "voice_error" not in out.metadata
+
+
+# ───────────────────────── cancel_voice（單輪只取消語音）─────────────────────────
+
+
+async def test_cancel_voice_stops_voice_only_and_think_finishes() -> None:
+    env, mid = build_split()
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    await until(lambda: len(sink.chunks) == 1)
+    sink.play(0.5)
+    assert env.co.cancel_voice(h.turn_id, "host_stop") is True
+    assert sink.stopped and h.voice_token.is_cancelled
+    assert not h.token.is_cancelled and not h.generation_done.done()  # think 不受影響
+    assert env.co.cancel_voice(h.turn_id) is False  # 重複呼叫
+    for k in range(4):  # 之後再有人插話也不會重複取消
+        env.co.on_voice_event(voiced(2.0 + 0.5 * k))
+    mid.set()
+    out = await settled(h)
+    assert out.status is OutcomeStatus.SKIPPED and out.skipped_reason == SkipReason.VOICE_CANCELLED
+    assert out.metadata["voice_cancelled"] == "host_stop"
+    assert not out.barge_in and not out.aborted and out.cut_short
+    assert "reason_code" not in out.metadata and "voice_error" not in out.metadata
+    assert out.generated_text == FULL
+    assert len(env.commits) == 1 and env.commits[0][2] == FULL
+    assert len(sink.chunks) == 1 and sink.writes_after_stop == 0
+    assert env.co.cancel_voice(h.turn_id) is False  # 已結束
+
+
+async def test_cancel_voice_returns_false_without_voice_or_unknown_turn() -> None:
+    env = build()
+    assert env.co.cancel_voice("nope") is False
+    r, _ = env.req("A")
+    r.sink_factory = lambda _v: "no_voice"  # 沒有語音支線
+    h = env.co.submit(r)
+    assert env.co.cancel_voice(h.turn_id) is False
+    out = await settled(h)
+    assert out.status is OutcomeStatus.SKIPPED and out.skipped_reason == "no_voice"
+
+
+async def test_cancel_voice_does_not_cascade_to_queued_turns() -> None:
+    env = build()
+    ra, sa = env.req("A")
+    rb, sb = env.req("B", owner="u2")
+    ha = env.co.submit(ra)
+    hb = env.co.submit(rb)
+    await playing(sa)
+    assert env.co.cancel_voice(ha.turn_id) is True
+    out_a = await settled(ha)
+    assert out_a.skipped_reason == SkipReason.VOICE_CANCELLED
+    assert not hb.voice_token.is_cancelled  # 不像 barge-in 連帶取消後面的輪
+    await playing(sb)
+    sb.finish()
+    assert (await settled(hb)).status is OutcomeStatus.COMPLETED
+
+
+async def test_cancel_voice_on_queued_turn_keeps_its_text() -> None:
+    env = build()
+    ra, sa = env.req("A")
+    rb, sb = env.req("B", owner="u2")
+    ha = env.co.submit(ra)
+    hb = env.co.submit(rb)
+    await playing(sa)
+    assert env.co.cancel_voice(hb.turn_id) is True
+    sa.finish()
+    await settled(ha)
+    out_b = await settled(hb)
+    assert out_b.skipped_reason == SkipReason.VOICE_CANCELLED
+    assert out_b.generated_text == RESPONSE and sb.chunks == [] and sb.stopped
+
+
+async def test_cancel_voice_from_other_threads_stops_sync_and_wins_once() -> None:
+    env, mid = build_split()
+    sink = ThreadSpySink(env.log)
+    r, _ = env.req("A", sink=sink)
+    h = env.co.submit(r)
+    await until(lambda: len(sink.chunks) == 1)
+    cancels: list[int] = []
+    h.voice_token.on_cancel(lambda _r: cancels.append(threading.get_ident()))
+    loop_thread = threading.get_ident()
+    caller_threads: list[int] = []
+    results: list[bool] = []
+
+    def call() -> None:
+        caller_threads.append(threading.get_ident())
+        results.append(env.co.cancel_voice(h.turn_id, "thread"))
+
+    loop = asyncio.get_running_loop()
+    await asyncio.gather(*(loop.run_in_executor(None, call) for _ in range(4)))
+    assert sorted(results) == [False, False, False, True]  # 只有一個呼叫贏得認領
+    assert sink.stop_threads[0] in caller_threads and sink.stop_threads[0] != loop_thread
+    await until(lambda: h.voice_token.is_cancelled)
+    assert cancels == [loop_thread] and not h.token.is_cancelled
+    mid.set()
+    out = await settled(h)
+    assert out.skipped_reason == SkipReason.VOICE_CANCELLED and out.generated_text == FULL

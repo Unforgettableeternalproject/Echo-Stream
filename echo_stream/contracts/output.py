@@ -107,6 +107,10 @@ class SkipReason:
     """語音側（TTS／sink 寫入／drain）出錯：只關這一輪的語音，think 照常跑完、文字照常 commit。
     例外摘要在 ``metadata["voice_error"]``；``phase`` 為 DONE、``error`` 為 None。"""
 
+    VOICE_CANCELLED = "voice_cancelled"
+    """宿主以 ``TurnCoordinator.cancel_voice`` 只取消這一輪的語音（不是 barge-in）：
+    think 照常跑完、文字照常 commit；``detail`` 在 ``metadata["voice_cancelled"]``。"""
+
 
 class CommitMode(str, Enum):
     """歷史寫回時機。"""
