@@ -17,11 +17,14 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
-from typing import Protocol, runtime_checkable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from .cancellation import CancellationToken
 from .types import AudioChunk, Sentence, Utterance
+
+if TYPE_CHECKING:
+    from .turn import VoiceEvent
 
 
 @runtime_checkable
@@ -118,6 +121,12 @@ class MultiChannelInputStage(Protocol):
 
     name: str
 
+    on_voice_event: Callable[[VoiceEvent], None] | None
+    """每個聲道的 VAD 事件回呼（可從 STT 執行緒呼叫）；``None`` = 不訂閱。"""
+
+    on_partial: Callable[[str, str, int], None] | None
+    """局部轉錄回呼 ``(speaker_id, text, index)``；``None`` = 不訂閱。"""
+
     async def prepare(self) -> None: ...
 
     async def aclose(self) -> None: ...
@@ -187,6 +196,14 @@ class ThinkStage(Protocol):
     Codex（#13946）都踩過這個坑：API 失敗或中途有新訊息進來時，
     原始對話被永久吞掉。正確順序是「保留原始 → 背景算 → 算完才原子性替換
     → 中途變髒就作廢重算」。
+
+    ## 單 stream 不變條件
+
+    **同一個 ThinkStage 實例同一時間只跑一個 ``stream``。** 實作可以把「這一輪的 scope」
+    放在實例屬性（例如 ``active_scope``，供 tool_executor 讀取），不保證併行安全，
+    所以宿主必須序列化 ``stream``（coordinator 以 think 鎖保證）：後一輪的 ``stream``
+    開始前，前一輪的 ``active_scope`` 已清回 ``None``，兩輪不得交錯。
+    宿主不得為不同聽眾並行共用同一個實例；要並行請各建實例。
     """
 
     name: str
@@ -222,6 +239,61 @@ class SettleCapable(Protocol):
         self, turn_id: str, spoken_text: str, generated_text: str = ""
     ) -> bool | None:
         """依 turn_id 改寫已 commit 的 assistant 歷史項。找不到回 False，不報錯。"""
+        ...
+
+
+@runtime_checkable
+class MemoryRetriever(Protocol):
+    """ThinkStage 消費記憶的最小形狀：``await retrieve(query, **kw) -> str | None``。
+
+    回傳可直接塞進 prompt 的文字，沒撈到回 ``None``。``kw`` 來自
+    ``Utterance.metadata["memory_retrieve_kwargs"]``（例如 ``audience``、``actor_id``、
+    ``shared_turn``），實作必須原樣接收；不認得的參數由實作自行略過或拒絕，
+    ThinkStage 不判斷授權。per-speaker 隔離走 ThinkStage 的 ``memory_resolver``
+    （``scope -> MemoryRetriever | None``），不是這個 Protocol 的事。
+    ``EchoMemoryAdapter`` 是較大的實作；宿主的轉接物件只需滿足這個最小需求。
+    """
+
+    async def retrieve(self, text: str, **kwargs: Any) -> str | None: ...
+
+
+@runtime_checkable
+class ThinkHostSurface(ThinkStage, SettleCapable, Protocol):
+    """ThinkStage 的宿主面：宿主（Discord bot、Core 的 EchoPipelineHost）會直接碰的成員。
+
+    在 :class:`ThinkStage` 與 :class:`SettleCapable` 之上補上實作早已公開、
+    但契約沒寫的部分，讓宿主以結構型別檢查取代 ``getattr`` 探測。
+    ``reset_context`` 的前置條件：呼叫端保證沒有進行中的 ``stream``，否則實作拋
+    ``RuntimeError``；reset 會把 ``profile`` 清成 ``""``，宿主需自行重設。
+
+    這是 ``LLMThinkStage`` 現況的快照，新增成員走契約變更。``history``、``tools`` 為
+    宿主唯讀；除 ``profile``、``tool_executor`` 外，宿主不得重設這些成員。
+    """
+
+    history: list[dict[str, str]]
+    tools: list[dict[str, Any]]
+    tool_executor: Callable[[str, dict[str, Any]], Awaitable[Any]] | None
+    profile: str
+    active_scope: str | None
+    """``stream`` 期間 = 本輪 ``speaker_id``，結束清回 ``None``（見單 stream 不變條件）。"""
+    supports_turn_context: bool
+    memory: MemoryRetriever | None
+    memory_resolver: Callable[[str | None], MemoryRetriever | None] | None
+
+    async def prewarm(self, system_prompt: str | None = None) -> bool:
+        """送極小請求預熱 provider 的 prompt cache；回傳是否真的送出且成功。"""
+        ...
+
+    def seed_pending(self, scope: str | None, text: str) -> bool:
+        """預填該 scope 的待注入記憶（槽為空才放）；回傳是否放入。"""
+        ...
+
+    def discard_pending(self, scope: str | None = None, *, all_scopes: bool = False) -> int:
+        """丟棄待注入記憶（成員離場隱私）；回傳實際清掉的槽數。"""
+        ...
+
+    def reset_context(self, history: list[dict[str, str]] | None = None) -> None:
+        """聽眾切換：清乾淨對話狀態與待注入記憶，保留實例與靜態前綴。"""
         ...
 
 

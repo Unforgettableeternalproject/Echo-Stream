@@ -136,6 +136,8 @@ class FakeThinkStage:
         self.split_policy = split_policy or SplitPolicy()
         self.tracer = tracer
         self._turn_count = 0
+        self.stream_calls = 0
+        """``stream()`` 被呼叫（開始迭代）的次數，單輸入單輸出（V09）斷言用。"""
         self.committed: list[tuple[str, str, str]] = []
         """commit 記錄 ``(turn_id, spoken_text, generated_text)``，供測試檢查
         barge-in 善後是否寫對了東西。"""
@@ -158,6 +160,7 @@ class FakeThinkStage:
     ) -> AsyncIterator[Sentence]:
         response = self.responses[self._turn_count % len(self.responses)]
         self._turn_count += 1
+        self.stream_calls += 1
         self._pending_user_text = utterance.text
 
         # Memory retrieve 與 LLM 平行起跑（§7.4）
@@ -259,6 +262,8 @@ class FakeSpeakStage:
 
         self.sample_rate = sample_rate
         self.base_freq = base_freq
+        self.speak_calls = 0
+        """``stream()`` 被呼叫（開始迭代）的次數，單輸入單輸出（V09）斷言用。"""
 
     async def prepare(self) -> None:
         return
@@ -271,6 +276,7 @@ class FakeSpeakStage:
     ) -> AsyncIterator[AudioChunk]:
         from .audio import sine_pcm
 
+        self.speak_calls += 1
         first = True
         async for sentence in sentences:
             token.raise_if_cancelled()
