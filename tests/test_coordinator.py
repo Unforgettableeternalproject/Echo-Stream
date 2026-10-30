@@ -1724,3 +1724,115 @@ async def test_cancel_during_on_think_start_of_regen_second_attempt() -> None:
     assert out.status is OutcomeStatus.CANCELLED and out.regenerated == 1
     assert hook_cancelled.is_set() and len(env.backend.calls) == 1
     assert env.commits == []
+
+
+
+# ───────────────────── S3：bind_loop／關閉後 submit／reason_code／生成完成 ─────────────────────
+
+
+def test_bind_loop_rejects_submit_from_another_loop() -> None:
+    env = build()
+    loop_a = asyncio.new_event_loop()
+    try:
+        env.co.bind_loop(loop_a)
+
+        async def go() -> None:
+            r, _ = env.req("A")
+            with pytest.raises(RuntimeError):
+                env.co.submit(r)
+
+        asyncio.run(go())  # 另一個 loop
+    finally:
+        loop_a.close()
+
+
+async def test_bind_loop_same_loop_submit_ok_and_unbound_keeps_lazy_capture() -> None:
+    env = build()
+    env.co.bind_loop(asyncio.get_running_loop())
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    await playing(sink)
+    sink.finish()
+    assert (await settled(h)).status is OutcomeStatus.COMPLETED
+    # 未綁定：維持首次 submit 擷取
+    env2 = build()
+    assert env2.co._loop is None
+    r2, sink2 = env2.req("B")
+    h2 = env2.co.submit(r2)
+    assert env2.co._loop is asyncio.get_running_loop()
+    await playing(sink2)
+    sink2.finish()
+    await settled(h2)
+
+
+async def test_cross_thread_entries_after_bind_loop_before_first_submit_are_safe() -> None:
+    env = build()
+    loop = asyncio.get_running_loop()
+    results: list[object] = []
+
+    def poke() -> None:
+        env.co.bind_loop(loop)  # 從其他執行緒綁定
+        env.co.on_voice_event(voiced(0.0))
+        results.append(env.co.void("nope"))
+        results.append(env.co.cancel_voice("nope"))
+        env.co.cancel_all("early")
+
+    await loop.run_in_executor(None, poke)
+    assert results == [False, False]
+    assert env.co._loop is loop
+    # 之後第一輪照常（早先的 cancel_all 沒有殘留影響）
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    await playing(sink)
+    sink.finish()
+    assert (await settled(h)).status is OutcomeStatus.COMPLETED
+
+
+async def test_bound_loop_cross_thread_cancel_all_cancels_live_turn() -> None:
+    env, mid = build_split()
+    env.co.bind_loop(asyncio.get_running_loop())
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    await until(lambda: len(sink.chunks) == 1)
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, env.co.cancel_all, "left")
+    out = await settled(h)
+    assert out.status is OutcomeStatus.CANCELLED
+    mid.set()
+
+
+async def test_submit_after_aclose_is_voided_shutdown_and_never_speaks() -> None:
+    env = build()
+    await env.co.aclose()
+    factory_calls: list[int] = []
+    r, sink = env.req("A")
+    r.sink_factory = lambda _v: factory_calls.append(1) or sink
+    h = env.co.submit(r)
+    out = await settled(h)
+    assert out.status is OutcomeStatus.VOIDED
+    assert out.skipped_reason == SkipReason.SHUTDOWN == "shutdown"
+    assert out.metadata["reason_code"] == "shutdown"
+    assert out.turn_id == h.turn_id
+    assert factory_calls == [] and sink.chunks == [] and env.backend.calls == []
+    assert env.commits == []
+    assert [o.turn_id for o in env.outcomes] == [h.turn_id]  # on_turn_ended 恰一次
+    assert h.generation_done.done()
+    assert env.co.live_turns() == [] and not env.co.busy
+
+
+async def test_cross_thread_entries_after_aclose_are_noops_returning_false() -> None:
+    env, mid = build_split()
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    await until(lambda: len(sink.chunks) == 1)
+    mid.set()
+    await env.co.aclose()
+    assert (await settled(h)).status is OutcomeStatus.CANCELLED
+    loop = asyncio.get_running_loop()
+
+    def poke() -> list[object]:
+        env.co.on_voice_event(voiced(0.0))
+        env.co.cancel_all("again")
+        return [env.co.void(h.turn_id), env.co.cancel_voice(h.turn_id)]
+
+    assert await loop.run_in_executor(None, poke) == [False, False]

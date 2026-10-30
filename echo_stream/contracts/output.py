@@ -97,6 +97,9 @@ class SkipReason:
     TTS_NOT_READY = "tts_not_ready"
     DROPPED_BUSY = "dropped_busy"
     VOIDED = "voided"
+    SHUTDOWN = "shutdown"
+    """``TurnCoordinator.aclose`` 之後才 submit 的輪：不生成、不出聲，status 為 VOIDED。"""
+
     MODE_SILENT = "mode_silent"
     """``ModeFlags.speak`` 為 False：這一輪只產文字、不出聲。"""
 

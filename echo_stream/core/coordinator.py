@@ -370,7 +370,13 @@ class TurnCoordinator:
         self._clock = clock
 
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._loop_bound = False
+        """True = 宿主以 :meth:`bind_loop` 明確綁定；submit 的 loop 必須與它一致。"""
+
         self._loop_thread: int | None = None
+        self._closed = False
+        """:meth:`aclose` 之後為 True：不再接新輪，跨執行緒入口一律 no-op。"""
+
         self._live: list[TurnHandle] = []
         self._think_lock = asyncio.Lock()
         self._lock_users = 0
@@ -395,17 +401,35 @@ class TurnCoordinator:
         """排隊等 think 鎖的輪數（扣掉持鎖者；同 admission 的 ``waiting`` 參數）。"""
         return max(0, self._active_lock_users() - 1)
 
+    def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """在第一次 ``submit`` 之前綁定 loop（任何執行緒皆可，通常在宿主啟動時呼叫一次）。
+
+        綁定後，從其他執行緒進來的 ``on_voice_event`` / ``void`` / ``cancel_voice`` /
+        ``cancel_all`` 就有 loop 可以排回去，不必等第一輪才「恰好」可用。之後 ``submit``
+        必須在這個 loop 內呼叫，否則拋 ``RuntimeError``。沒有綁定時維持舊行為：第一次
+        ``submit`` 才擷取 loop。重複綁同一個 loop 無害；已綁定後改綁別的 loop 拋 ``RuntimeError``。
+        """
+        if self._loop_bound and self._loop is not loop:
+            raise RuntimeError("TurnCoordinator 已綁定另一個 event loop")
+        self._loop = loop
+        self._loop_bound = True
+
     def submit(self, req: TurnRequest) -> TurnHandle:
         """送出一輪。必須在 loop 內呼叫；立即返回，不等生成。
 
         ticket 與 utterance 不對應、或 turn_id 與還在處理的輪重複，是呼叫端的程式錯誤，
-        拋 ``ValueError``（不算 submit，也沒有 outcome）。其餘情況每個 submit 恰好一個 outcome。
+        拋 ``ValueError``（不算 submit，也沒有 outcome）。已用 :meth:`bind_loop` 綁定時，
+        在別的 loop 內呼叫拋 ``RuntimeError``。:meth:`aclose` 之後的 submit 不會出聲：
+        產生 ``VOIDED``（``skipped_reason="shutdown"``）outcome，``on_turn_ended`` 照常呼叫。
+        其餘情況每個 submit 恰好一個 outcome。
         """
         if not req.ticket.matches(req.utterance):
             raise ValueError("ticket 與 utterance 不對應（source_turn_id != utterance.turn_id）")
         if any(t.turn_id == req.ticket.turn_id and not t._done for t in self._live):
             raise ValueError(f"turn_id 重複: {req.ticket.turn_id}")
         loop = asyncio.get_running_loop()
+        if self._loop_bound and loop is not self._loop:
+            raise RuntimeError("submit 必須在 bind_loop 綁定的 event loop 內呼叫")
         self._loop = loop
         self._loop_thread = threading.get_ident()
 
@@ -413,6 +437,10 @@ class TurnCoordinator:
         stale = self._is_stale(snap)
         flags = self._flags_for(snap, req.ticket.reply_mode)
         t = TurnHandle(req, flags, loop, snap.version, stale, self)
+
+        if self._closed:
+            self._deliver_closed(t)
+            return t
 
         try:
             admitted = self._admission.admit(req, self.busy, self.waiting)
@@ -458,7 +486,7 @@ class TurnCoordinator:
         ``call_soon_threadsafe`` 回 loop，且每輪只取消一次。
         """
         loop = self._loop
-        if loop is None:
+        if loop is None or self._closed:
             return
         live = [t for t in list(self._live) if not t._done and not t._play_done.is_set()]
         if not live:
@@ -489,6 +517,8 @@ class TurnCoordinator:
 
         已開播的輪不處理（回 False，交給 barge-in）；已被認領取消的輪也回 False。
         """
+        if self._closed:
+            return False
         for t in list(self._live):
             if t.turn_id != turn_id:
                 continue
@@ -512,6 +542,8 @@ class TurnCoordinator:
         這是宿主的明確指令，**不看 ``flags.barge_in``**：不可被使用者插話打斷的輪，
         宿主仍可用它停語音。語音已播完（drain 返回）之後不能再取消，輪照常以完成結算。
         """
+        if self._closed:
+            return False
         for t in list(self._live):
             if t.turn_id != turn_id:
                 continue
@@ -527,7 +559,14 @@ class TurnCoordinator:
         return False
 
     def cancel_all(self, reason: str = "shutdown") -> None:
-        """取消所有進行中與排隊中的輪（SHUTDOWN）：停播、不 commit、不 settle。"""
+        """取消所有進行中與排隊中的輪（SHUTDOWN）：停播、不 commit、不 settle。
+
+        :meth:`aclose` 之後為 no-op（關閉時已取消過所有輪）。"""
+        if self._closed:
+            return
+        self._cancel_all(reason)
+
+    def _cancel_all(self, reason: str) -> None:
         for t in list(self._live):
             if t._done or t._play_done.is_set():
                 continue
@@ -547,7 +586,9 @@ class TurnCoordinator:
             await asyncio.wait(tasks)  # 不用 gather：外層被取消時不該連帶取消各輪 task
 
     async def aclose(self) -> None:
-        self.cancel_all("shutdown")
+        """關閉：拒絕新輪（之後的 submit 產生 VOIDED/shutdown）→ 取消所有輪 → 等它們結束。"""
+        self._closed = True
+        self._cancel_all("shutdown")
         await self.join()
 
     # ───────────────────────── 取消機制 ─────────────────────────
@@ -1456,6 +1497,23 @@ class TurnCoordinator:
             utterance_text=t.request.utterance.text,
             skipped_reason=SkipReason.DROPPED_BUSY,
             status=OutcomeStatus.DROPPED_BUSY,
+            snapshot_version=t._snapshot_version,
+        ))
+
+    def _deliver_closed(self, t: TurnHandle) -> None:
+        """aclose 之後的 submit：不建 sink、不生成、不出聲，只給一個 VOIDED outcome。"""
+        self._resolve_gen_done(t)
+        t._play_done.set()
+        self._deliver(t, TurnOutcome(
+            turn_id=t.turn_id,
+            phase=TurnPhase.CANCELLED,
+            utterance_text=t.request.utterance.text,
+            cancel_reason=CancelReason.SHUTDOWN.value,
+            metadata={"reason_code": CancelReason.SHUTDOWN.value, "cancel_detail": "closed"},
+            skipped_reason=SkipReason.SHUTDOWN,
+            cut_short=True,
+            status=OutcomeStatus.VOIDED,
+            aborted=True,
             snapshot_version=t._snapshot_version,
         ))
 
