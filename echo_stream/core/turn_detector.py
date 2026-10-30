@@ -46,7 +46,9 @@ class SilenceTurnDetector(TurnDetector):
         self._turn_elapsed_s = max(self._turn_elapsed_s, event.duration_s)
 
         if event.state is VoiceState.SPEECH:
-            self._speech_accum_s = event.duration_s
+            # 取整個 turn 中最長的一次 SPEECH burst：多個零碎短 burst 不會互相洗掉，
+            # 結尾的短語氣詞（嗯）也不會把前面的長語音判成太短
+            self._speech_accum_s = max(self._speech_accum_s, event.duration_s)
             return TurnDecision(
                 is_end_of_turn=False,
                 confidence=1.0,

@@ -207,11 +207,13 @@ class VoiceChannel:
             self._buffer
             and event.state is VoiceState.SILENCE
             and event.duration_s >= policy.silence_threshold_s
-            and self._speech_in_turn_s < policy.min_utterance_s
+            and decision.reason == "too_short"
         ):
-            # 太短不成 turn（咳嗽、關門聲）且靜音已足：丟掉。
-            # 不丟的話這段噪音會黏在下一個 turn 的開頭一起送去轉錄。
+            # 偵測器判定太短（咳嗽、關門聲、零碎噪音 burst）且靜音已足：丟掉。
+            # 以偵測器的判定為準——它永不會為 too_short 結束 turn，
+            # 不丟的話 turn 會卡住，噪音黏到下一個 turn 一起送去轉錄。
             self._clear_turn()
+            self.turn_detector.reset()
         return segments
 
     def flush(self, now: float) -> Segment | None:
