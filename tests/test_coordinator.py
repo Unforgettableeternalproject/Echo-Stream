@@ -732,6 +732,71 @@ async def test_every_submit_gets_exactly_one_outcome() -> None:
     assert len(env.backend.calls) == 1
 
 
+async def test_busy_and_waiting_are_public_and_skip_claimed_cancels() -> None:
+    gate = asyncio.Event()
+    env = build(gate=gate)
+    assert env.co.busy is False and env.co.waiting == 0
+    ha = env.co.submit(env.req("A", owner="u1")[0])
+    assert env.co.busy is True and env.co.waiting == 0  # 只有持鎖者，沒人在等
+    hb = env.co.submit(env.req("B", owner="u2")[0])
+    hc = env.co.submit(env.req("C", owner="u3")[0])
+    assert env.co.waiting == 2
+    assert env.co.void(hb.turn_id) is True  # 已認領取消、尚未離開鎖：不再算排隊
+    assert env.co.waiting == 1
+    env.co.cancel_all("left")
+    assert env.co.busy is False and env.co.waiting == 0
+    gate.set()
+    for h in (ha, hb, hc):
+        await settled(h)
+    assert env.co.busy is False and env.co.waiting == 0
+
+
+async def test_admission_sees_busy_and_waiting_from_public_properties() -> None:
+    seen: list[tuple[bool, int]] = []
+
+    class Spy:
+        def admit(self, request, busy: bool, waiting: int) -> bool:
+            seen.append((busy, waiting))
+            return True
+
+    gate = asyncio.Event()
+    env = build(gate=gate, admission=Spy())
+    for name in ("A", "B", "C"):
+        env.co.submit(env.req(name, owner=name)[0])
+    assert seen == [(False, 0), (True, 0), (True, 1)]
+    gate.set()
+    env.co.cancel_all("left")
+
+
+async def test_handle_exposes_skip_reason_and_predecessor() -> None:
+    gate = asyncio.Event()
+    env = build(gate=gate)
+    ra, _ = env.req("A", owner="u1")
+    ra.sink_factory = lambda _v: "tts_not_ready"
+    ha = env.co.submit(ra)
+    hb = env.co.submit(env.req("B", owner="u2")[0])
+    assert ha.skip_reason == "tts_not_ready" and hb.skip_reason is None
+    assert ha.predecessor is None and hb.predecessor is ha
+    # CANCELLED 的 outcome 也保留語音支線的靜態原因
+    await until(lambda: len(env.backend.calls) == 1)
+    env.co.cancel_all("left")
+    out_a = await settled(ha)
+    assert out_a.status is OutcomeStatus.CANCELLED
+    assert out_a.metadata["sink_skip_reason"] == "tts_not_ready"
+    out_b = await settled(hb)  # 等鎖期間作廢（VOIDED）沒有靜態原因
+    assert "sink_skip_reason" not in out_b.metadata
+    gate.set()
+
+
+async def test_done_outcome_does_not_carry_sink_skip_reason_metadata() -> None:
+    env = build()
+    r, _ = env.req("A")
+    r.sink_factory = lambda _v: "tts_not_ready"
+    out = await settled(env.co.submit(r))
+    assert out.skipped_reason == "tts_not_ready"  # DONE 沿用既有 skipped_reason
+    assert "sink_skip_reason" not in out.metadata
+
+
 def test_submit_rejects_ticket_mismatch() -> None:
     async def go() -> None:
         env = build()

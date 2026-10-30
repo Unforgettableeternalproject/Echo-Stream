@@ -234,6 +234,16 @@ class TurnHandle:
         return att.first_write_at is not None
 
     @property
+    def skip_reason(self) -> str | None:
+        """目前這趟的靜態跳過原因（mode_silent、sink 建立失敗等）；None = 無。"""
+        return self._skip_reason
+
+    @property
+    def predecessor(self) -> TurnHandle | None:
+        """排在前面、播放位置尚未讓出的上一輪（submit 時決定）；None = 直接輪到自己。"""
+        return self._predecessor
+
+    @property
     def behind_playing(self) -> bool:
         pred = self._predecessor
         return pred is not None and not pred._play_done.is_set() and pred.audio_started
@@ -328,6 +338,23 @@ class TurnCoordinator:
 
     # ───────────────────────── 對外介面 ─────────────────────────
 
+    def _active_lock_users(self) -> int:
+        """持有或等待 think 鎖、且尚未被認領取消的輪數（已認領取消的輪即將離開鎖系統）。"""
+        return sum(
+            1 for t in self._live
+            if t._lock_state in ("held", "waiting") and not t._cancel_claimed
+        )
+
+    @property
+    def busy(self) -> bool:
+        """有輪持有或等待 think 鎖（不含已認領取消、尚未離開鎖的輪）。"""
+        return self._active_lock_users() > 0
+
+    @property
+    def waiting(self) -> int:
+        """排隊等 think 鎖的輪數（扣掉持鎖者；同 admission 的 ``waiting`` 參數）。"""
+        return max(0, self._active_lock_users() - 1)
+
     def submit(self, req: TurnRequest) -> TurnHandle:
         """送出一輪。必須在 loop 內呼叫；立即返回，不等生成。
 
@@ -347,10 +374,8 @@ class TurnCoordinator:
         flags = self._flags_for(snap, req.ticket.reply_mode)
         t = TurnHandle(req, flags, loop, snap.version, stale, self)
 
-        busy = self._lock_users > 0
-        waiting = max(0, self._lock_users - 1)
         try:
-            admitted = self._admission.admit(req, busy, waiting)
+            admitted = self._admission.admit(req, self.busy, self.waiting)
         except Exception:  # noqa: BLE001 - 閘門壞掉不該擋住回覆
             _log.warning("admission 失敗，視為接受", exc_info=True)
             admitted = True
@@ -1159,6 +1184,9 @@ class TurnCoordinator:
         cancel_value = reason.value if reason is not None else None
         self.tracer.finish(tid, phase, cancel_value, error)
 
+        meta = self._outcome_meta(t, reason, kind, detail)
+        if phase is not TurnPhase.DONE and t._skip_reason:
+            meta["sink_skip_reason"] = t._skip_reason  # 取消／失敗時仍保留語音支線的靜態原因
         outcome = TurnOutcome(
             turn_id=tid,
             phase=phase,
@@ -1168,7 +1196,7 @@ class TurnCoordinator:
             spoken_duration_s=spoken_s,
             cancel_reason=cancel_value,
             error=error,
-            metadata=self._outcome_meta(t, reason, kind, detail),
+            metadata=meta,
             skipped_reason=skipped,
             cut_short=cut_short,
             audio_started=t.audio_started,
@@ -1241,13 +1269,16 @@ class TurnCoordinator:
         kind = t._cancel_kind
         barge_in = reason is CancelReason.BARGE_IN
         _stop_sink(t._first_sink)
+        meta = self._outcome_meta(t, reason, kind, detail)
+        if t._skip_reason:
+            meta["sink_skip_reason"] = t._skip_reason
         self.tracer.finish(t.turn_id, TurnPhase.CANCELLED, reason.value, None)
         self._deliver(t, TurnOutcome(
             turn_id=t.turn_id,
             phase=TurnPhase.CANCELLED,
             utterance_text=t.request.utterance.text,
             cancel_reason=reason.value,
-            metadata=self._outcome_meta(t, reason, kind, detail),
+            metadata=meta,
             skipped_reason=SkipReason.VOIDED,
             cut_short=True,
             status=OutcomeStatus.VOIDED,
