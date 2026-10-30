@@ -190,6 +190,12 @@ def english_guard_reason(
     return None
 
 
+def _worst(segments: list[Any], attr: str, pick: Any) -> float | None:
+    """保留段落中某個解碼品質欄位的最差值；欄位拿不到就回 None。"""
+    values = [v for v in (getattr(seg, attr, None) for seg in segments) if v is not None]
+    return float(pick(values)) if values else None
+
+
 # ---------------------------------------------------------------------------
 # Profile
 # ---------------------------------------------------------------------------
@@ -506,7 +512,12 @@ class DiscordTranscriberBackend:
         ):
             return None
         return TranscriptionResult(
-            text=text, language=getattr(info, "language", None), confidence=confidence
+            text=text,
+            language=getattr(info, "language", None),
+            confidence=confidence,
+            temperature=_worst(kept, "temperature", max),
+            avg_logprob=_worst(kept, "avg_logprob", min),
+            compression_ratio=_worst(kept, "compression_ratio", max),
         )
 
 

@@ -248,3 +248,16 @@ def merge_parts(parts: list[Any]) -> tuple[str, float, str | None]:
     confidence = sum(r.confidence * len(r.text.strip()) for r in parts) / total_chars
     language = next((r.language for r in parts if r.language), None)
     return " ".join(texts), confidence, language
+
+
+def decode_stats(parts: list[Any]) -> dict[str, float]:
+    """跨段落彙整 Whisper 解碼品質，只放有值的鍵（給 Utterance.metadata）。
+
+    temperature 取最大、avg_logprob 取最小、compression_ratio 取最大——都取最差的那段。
+    """
+    out: dict[str, float] = {}
+    for key, pick in (("temperature", max), ("avg_logprob", min), ("compression_ratio", max)):
+        values = [v for v in (getattr(r, key, None) for r in parts) if v is not None]
+        if values:
+            out[key] = float(pick(values))
+    return out

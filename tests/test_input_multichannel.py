@@ -190,6 +190,7 @@ class TestTurns:
             assert md["stt_ms"] >= 15
             assert md["queue_ms"] >= 0
             assert md["channel_segments"] == 1
+            assert "temperature" not in md  # backend 沒給解碼品質就不放鍵
             assert utt.started_at == md["speech_start_ts"]
             assert utt.ended_at == md["speech_end_ts"]
         finally:

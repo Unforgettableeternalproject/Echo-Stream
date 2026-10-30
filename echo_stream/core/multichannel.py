@@ -19,7 +19,7 @@ from ..contracts.cancellation import CancellationToken, CancelledError
 from ..contracts.turn import TurnDetector
 from ..contracts.types import STT_SAMPLE_RATE, Utterance, new_turn_id
 from .channel import ChannelClosed, StreamChannel
-from .channel_engine import Segment, VoiceChannel, merge_parts
+from .channel_engine import Segment, VoiceChannel, decode_stats, merge_parts
 from .turn_detector import SilenceTurnDetector
 from .vad import EnergyVad
 
@@ -670,6 +670,7 @@ class ChannelEngine:
                     if not segment.final or not st.parts:
                         continue
                     text, confidence, language = merge_parts(st.parts)
+                    stats = decode_stats(st.parts)
                     n_parts = len(st.parts)
                     st.parts = []
                     done_ts = job.done_ts if job is not None else self._clock()
@@ -691,6 +692,7 @@ class ChannelEngine:
                                 "stt_ms": job.stt_ms if job is not None else 0.0,
                                 "queue_ms": job.queue_ms if job is not None else 0.0,
                                 "channel_segments": n_parts,
+                                **stats,
                             },
                         )
                     )

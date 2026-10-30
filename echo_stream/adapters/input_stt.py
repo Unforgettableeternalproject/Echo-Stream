@@ -51,7 +51,7 @@ from ..contracts.types import STT_SAMPLE_RATE, Utterance, new_turn_id
 from ..core.channel import StreamChannel
 from ..core.channel_engine import Segment as _Segment
 from ..core.channel_engine import VoiceChannel as _Channel
-from ..core.channel_engine import merge_parts
+from ..core.channel_engine import decode_stats, merge_parts
 from ..core.turn_detector import SilenceTurnDetector
 from ..core.vad import EnergyVad
 
@@ -63,6 +63,11 @@ class TranscriptionResult:
     text: str
     language: str | None = None
     confidence: float = 1.0
+    # Whisper 解碼品質（保留段落中最差的值）：temperature 取最大、avg_logprob 取最小、
+    # compression_ratio 取最大。backend 拿不到就留 None，給尾端延遲分析用
+    temperature: float | None = None
+    avg_logprob: float | None = None
+    compression_ratio: float | None = None
 
 
 @runtime_checkable
@@ -343,6 +348,7 @@ class SttInputStage:
                 if not parts:
                     continue  # 整個 turn 都是雜訊
                 text, confidence, language = merge_parts(parts)
+                stats_parts = parts
                 n_parts = len(parts)
                 parts = []
                 done_ts = time.perf_counter()
@@ -363,6 +369,7 @@ class SttInputStage:
                             "stt_ms": (done_ts - final_started) * 1000.0,
                             "queue_ms": max(0.0, final_started - segment.turn_end_ts) * 1000.0,
                             "channel_segments": n_parts,
+                            **decode_stats(stats_parts),
                         },
                     )
                 )

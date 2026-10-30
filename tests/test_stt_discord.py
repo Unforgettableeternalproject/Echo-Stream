@@ -559,3 +559,19 @@ def test_source_feed_from_multiple_threads():
     [t.join() for t in ts]
     outs = {_fed(stage, f"m{i}") for i in range(4)}
     assert len(outs) == 1  # 同樣輸入 → 各成員輸出相同，沒有互相污染
+
+
+def test_解碼品質取保留段落的最差值():
+    a = _Seg("第一句", lp=-0.3, cr=1.2, start=0.0, end=1.0)
+    b = _Seg("第二句", lp=-0.8, cr=1.8, start=1.0, end=2.0)
+    a.temperature, b.temperature = 0.0, 0.4
+    r = _backend(_FakeModel(a, b)).transcribe(_pcm(seconds=2.0), 16000)
+    assert r.temperature == 0.4
+    assert r.avg_logprob == pytest.approx(-0.8)
+    assert r.compression_ratio == pytest.approx(1.8)
+
+
+def test_解碼品質_段落沒有_temperature_時為_None():
+    r = _backend(_model("你好", -0.3)).transcribe(_pcm(), 16000)
+    assert r.temperature is None
+    assert r.avg_logprob == pytest.approx(-0.3) and r.compression_ratio == pytest.approx(1.0)

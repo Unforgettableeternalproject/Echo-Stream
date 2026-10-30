@@ -105,3 +105,19 @@ def test_長語音後接短語氣詞仍結束_turn() -> None:
 
     assert len(feeder.segments) == 1
     assert len(feeder.segments[0].pcm) / 2 / SAMPLE_RATE >= 1.5
+
+
+def test_decode_stats_跨段取最差值且略過缺值():
+    from types import SimpleNamespace as NS
+
+    from echo_stream.core.channel_engine import decode_stats
+
+    parts = [
+        NS(temperature=0.0, avg_logprob=-0.2, compression_ratio=1.1),
+        NS(temperature=0.6, avg_logprob=-0.9, compression_ratio=None),
+        NS(),  # 舊 backend：完全沒有這些欄位
+    ]
+    assert decode_stats(parts) == {
+        "temperature": 0.6, "avg_logprob": -0.9, "compression_ratio": 1.1,
+    }
+    assert decode_stats([NS(text="x")]) == {}
