@@ -27,6 +27,7 @@ from echo_stream.contracts.output import (
 )
 from echo_stream.contracts.turn import VoiceEvent, VoiceState
 from echo_stream.contracts.types import TTS_SAMPLE_RATE, AudioChunk, Sentence, Utterance
+from echo_stream.core import coordinator as coordinator_module
 from echo_stream.core import tracer as marks
 from echo_stream.core.coordinator import TurnCoordinator
 from echo_stream.core.standalone import StandaloneTicketIssuer, StaticPolicySource
@@ -39,6 +40,7 @@ from .scenario_support import (
     ManualSink,
     ScriptBackend,
     build_think,
+    poll,
     until,
 )
 
@@ -1160,3 +1162,565 @@ async def test_failed_generation_still_delivers_generated_sentences() -> None:
     assert out.status is OutcomeStatus.FAILED and "backend boom" in (out.error or "")
     assert out.generated_text and out.generated_text in "".join(sent)
     assert "".join(sent).startswith(SENTENCES[0])
+
+
+# ───────────────────────── on_think_start（取得 think 鎖後的宿主 hook）─────────────────────────
+
+
+async def test_on_think_start_runs_in_lock_before_every_attempt() -> None:
+    env = build(("甲甲甲。", "乙乙乙。"), open_all=False)
+    regen = OnceRegen("你好", times=1)
+    seen: list[tuple[int, bool, int]] = []
+    views: list[object] = []
+
+    async def hook(view, attempt_id: int) -> None:
+        views.append(view)
+        seen.append((attempt_id, env.co._think_lock.locked(), len(env.backend.calls)))
+
+    r, _ = env.req("你好", regen=regen, max_regenerate=1, on_think_start=hook)
+    made: list[ManualSink] = []
+
+    def factory(_v) -> ManualSink:
+        s = ManualSink(env.log)
+        made.append(s)
+        return s
+
+    r.sink_factory = factory
+    h = env.co.submit(r)
+    await until(lambda: len(made) == 2)
+    env.speak.open(0)
+    await until(lambda: len(made[1].chunks) == 1 and made[1].draining.is_set())
+    made[1].finish()
+    out = await settled(h)
+    assert out.regenerated == 1
+    # 每趟（含 regen）都呼叫、都在鎖內、都在該趟 think 開始之前（已呼叫 backend 的次數 = 0、1）
+    assert seen == [(1, True, 0), (2, True, 1)]
+    assert all(v is h for v in views)
+
+
+async def test_on_think_start_waits_for_previous_turn_to_release_lock() -> None:
+    env = build()
+    order: list[str] = []
+
+    def hook_for(name: str):
+        async def hook(_view, _attempt_id: int) -> None:
+            env.log.append(f"hook:{name}")
+            order.append(name)
+
+        return hook
+
+    ra, sa = env.req("A", commit=CommitMode.SETTLED, on_think_start=hook_for("A"))
+    rb, sb = env.req("B", owner="u2", commit=CommitMode.SETTLED, on_think_start=hook_for("B"))
+    ha = env.co.submit(ra)
+    hb = env.co.submit(rb)
+    await playing(sa)
+    assert order == ["A"]  # B 還在等鎖，hook 不會提前跑
+    sa.finish()
+    await settled(ha)
+    await playing(sb)
+    sb.finish()
+    await settled(hb)
+    assert order == ["A", "B"]
+    assert env.log.index("hook:B") > env.log.index("commit")  # 在 A 結算 commit 之後
+
+
+async def test_on_think_start_error_is_swallowed_and_turn_still_runs(caplog) -> None:
+    env = build()
+
+    async def hook(_view, _attempt_id: int) -> None:
+        raise RuntimeError("hook boom")
+
+    r, sink = env.req("A", on_think_start=hook)
+    with caplog.at_level("WARNING"):
+        h = env.co.submit(r)
+        await playing(sink)
+        sink.finish()
+        out = await settled(h)
+    assert out.status is OutcomeStatus.COMPLETED and out.error is None
+    assert out.generated_text == RESPONSE
+    assert len(env.commits) == 1
+    assert any("on_think_start" in rec.getMessage() for rec in caplog.records)
+    assert "hook boom" in out.metadata["on_think_start_error"]
+
+
+@pytest.mark.parametrize("how", ["void", "cancel_all"])
+async def test_cancel_during_on_think_start_ends_turn_without_thinking(how: str) -> None:
+    env = build()
+    entered = asyncio.Event()
+    hook_cancelled = asyncio.Event()
+
+    async def hook(_view, _attempt_id: int) -> None:
+        entered.set()
+        try:
+            await asyncio.Event().wait()  # 卡住，等外部取消
+        finally:
+            hook_cancelled.set()
+
+    r, sink = env.req("A", on_think_start=hook)
+    h = env.co.submit(r)
+    await asyncio.wait_for(entered.wait(), SAFETY_S)
+    if how == "void":
+        assert env.co.void(h.turn_id) is True
+    else:
+        env.co.cancel_all("left")
+    out = await settled(h)
+    assert out.status is OutcomeStatus.CANCELLED and out.error is None
+    assert hook_cancelled.is_set()  # hook 被取消，不是被放著跑
+    assert env.backend.calls == [] and sink.chunks == []  # think 從未開始
+    assert env.commits == []
+    # 鎖已放掉：下一輪照常完成
+    r2, s2 = env.req("B", owner="u2")
+    h2 = env.co.submit(r2)
+    await playing(s2)
+    s2.finish()
+    assert (await settled(h2)).status is OutcomeStatus.COMPLETED
+
+
+# ───────────────────────── 語音側出錯：只停語音、think 照常跑完 ─────────────────────────
+
+
+class FlakySpeak(GateSpeak):
+    """第一次 stream 在產出 ``after`` 個音訊塊後拋例外，之後恢復正常。"""
+
+    def __init__(self, after: int = 1) -> None:
+        super().__init__(open_all=True)
+        self.after = after
+        self.streams = 0
+
+    async def stream(self, sentences, token):
+        self.streams += 1
+        fail = self.streams == 1
+        n = 0
+        async for chunk in super().stream(sentences, token):
+            yield chunk
+            n += 1
+            if fail and n >= self.after:
+                raise RuntimeError("tts boom")
+
+
+class FailingWriteSink(ManualSink):
+    async def write(self, chunk) -> None:
+        raise OSError("sink write boom")
+
+
+class FailingDrainSink(ManualSink):
+    async def drain(self) -> None:
+        self.draining.set()
+        raise OSError("sink drain boom")
+
+
+def assert_voice_error_outcome(out: TurnOutcome, needle: str) -> None:
+    assert out.status is OutcomeStatus.SKIPPED and out.skipped_reason == SkipReason.VOICE_ERROR
+    assert out.phase.value == "done" and out.error is None  # think 沒事，不是 FAILED
+    assert needle in out.metadata["voice_error"]
+    assert not out.barge_in and not out.aborted and not out.superseded and out.cut_short
+    assert out.cancel_reason is None
+    assert "reason_code" not in out.metadata  # 不誤標 barge_in 等取消原因
+
+
+@pytest.mark.parametrize("mode", [CommitMode.EAGER, CommitMode.SETTLED])
+async def test_tts_error_stops_voice_only_and_think_finishes(mode: CommitMode) -> None:
+    env, mid = build_split()
+    env.co.speak = FlakySpeak(after=1)
+    sent: list[str] = []
+
+    async def on_sentence(_view, sentence: Sentence) -> None:
+        sent.append(sentence.text)
+
+    r, sink = env.req("A", commit=mode, on_sentence=on_sentence)
+    h = env.co.submit(r)
+    await until(lambda: sink.stopped)  # TTS 出錯 -> 語音被關
+    assert h.voice_token.is_cancelled and not h.token.is_cancelled  # think 不受影響
+    assert not h.generation_done.done()
+    mid.set()  # 之後的文字照常生成
+    out = await settled(h)
+    assert_voice_error_outcome(out, "tts boom")
+    assert out.generated_text == FULL
+    assert "".join(sent) == FULL  # 文字照常送出
+    assert len(env.commits) == 1 and env.commits[0][2] == FULL
+    assert env.commits[0][1] == (FULL if mode is CommitMode.EAGER else "")
+    # 下一輪不受影響（FlakySpeak 只壞第一次）
+    r2, s2 = env.req("B", owner="u2")
+    h2 = env.co.submit(r2)
+    await until(lambda: len(s2.chunks) == 3 and s2.draining.is_set())
+    s2.finish()
+    out2 = await settled(h2)
+    assert out2.status is OutcomeStatus.COMPLETED and out2.generated_text == FULL
+
+
+@pytest.mark.parametrize("which", ["write", "drain"])
+async def test_sink_error_stops_voice_only_and_text_still_commits(which: str) -> None:
+    env = build()
+    sink = (FailingWriteSink if which == "write" else FailingDrainSink)(env.log)
+    sent: list[str] = []
+
+    async def on_sentence(_view, sentence: Sentence) -> None:
+        sent.append(sentence.text)
+
+    r, _ = env.req("A", sink=sink, commit=CommitMode.SETTLED, on_sentence=on_sentence)
+    h = env.co.submit(r)
+    out = await settled(h)
+    assert_voice_error_outcome(out, "sink " + which + " boom")
+    assert out.generated_text == RESPONSE and "".join(sent) == RESPONSE
+    assert len(env.commits) == 1 and env.commits[0][2] == RESPONSE
+    assert sink.stopped
+    r2, s2 = env.req("B", owner="u2")
+    h2 = env.co.submit(r2)
+    await playing(s2)
+    s2.finish()
+    assert (await settled(h2)).status is OutcomeStatus.COMPLETED
+
+
+async def test_queued_turn_flush_error_does_not_touch_predecessor() -> None:
+    env = build()
+    ra, sa = env.req("A")
+    rb, _ = env.req("B", owner="u2", sink=FailingWriteSink(env.log))
+    ha = env.co.submit(ra)
+    hb = env.co.submit(rb)
+    await playing(sa)
+    sa.finish()  # 前一輪播完，B 的緩衝才開始寫出 -> 寫入失敗
+    out_a = await settled(ha)
+    out_b = await settled(hb)
+    assert out_a.status is OutcomeStatus.COMPLETED
+    assert_voice_error_outcome(out_b, "sink write boom")
+    assert out_b.generated_text == RESPONSE
+
+
+async def test_think_error_is_still_failed_not_voice_error() -> None:
+    class FailingBackend(ScriptBackend):
+        async def stream_query(self, messages, system_instruction=None, **kwargs):
+            self.calls.append(list(messages))
+            for ch in SENTENCES[0]:
+                yield ch
+            raise RuntimeError("backend boom")
+
+    env = build()
+    backend = FailingBackend()
+    backend.stage = env.think
+    env.think._backend = backend
+    r, _ = env.req("A")
+    out = await settled(env.co.submit(r))
+    assert out.status is OutcomeStatus.FAILED and "backend boom" in (out.error or "")
+    assert "voice_error" not in out.metadata
+
+
+# ───────────────────────── cancel_voice（單輪只取消語音）─────────────────────────
+
+
+async def test_cancel_voice_stops_voice_only_and_think_finishes() -> None:
+    env, mid = build_split()
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    await until(lambda: len(sink.chunks) == 1)
+    sink.play(0.5)
+    assert env.co.cancel_voice(h.turn_id, "host_stop") is True
+    assert sink.stopped and h.voice_token.is_cancelled
+    assert not h.token.is_cancelled and not h.generation_done.done()  # think 不受影響
+    assert env.co.cancel_voice(h.turn_id) is False  # 重複呼叫
+    for k in range(4):  # 之後再有人插話也不會重複取消
+        env.co.on_voice_event(voiced(2.0 + 0.5 * k))
+    mid.set()
+    out = await settled(h)
+    assert out.status is OutcomeStatus.SKIPPED and out.skipped_reason == SkipReason.VOICE_CANCELLED
+    assert out.metadata["voice_cancelled"] == "host_stop"
+    assert not out.barge_in and not out.aborted and out.cut_short
+    assert "reason_code" not in out.metadata and "voice_error" not in out.metadata
+    assert out.generated_text == FULL
+    assert len(env.commits) == 1 and env.commits[0][2] == FULL
+    assert len(sink.chunks) == 1 and sink.writes_after_stop == 0
+    assert env.co.cancel_voice(h.turn_id) is False  # 已結束
+
+
+async def test_cancel_voice_returns_false_without_voice_or_unknown_turn() -> None:
+    env = build()
+    assert env.co.cancel_voice("nope") is False
+    r, _ = env.req("A")
+    r.sink_factory = lambda _v: "no_voice"  # 沒有語音支線
+    h = env.co.submit(r)
+    assert env.co.cancel_voice(h.turn_id) is False
+    out = await settled(h)
+    assert out.status is OutcomeStatus.SKIPPED and out.skipped_reason == "no_voice"
+
+
+async def test_cancel_voice_does_not_cascade_to_queued_turns() -> None:
+    env = build()
+    ra, sa = env.req("A")
+    rb, sb = env.req("B", owner="u2")
+    ha = env.co.submit(ra)
+    hb = env.co.submit(rb)
+    await playing(sa)
+    assert env.co.cancel_voice(ha.turn_id) is True
+    out_a = await settled(ha)
+    assert out_a.skipped_reason == SkipReason.VOICE_CANCELLED
+    assert not hb.voice_token.is_cancelled  # 不像 barge-in 連帶取消後面的輪
+    await playing(sb)
+    sb.finish()
+    assert (await settled(hb)).status is OutcomeStatus.COMPLETED
+
+
+async def test_cancel_voice_on_queued_turn_keeps_its_text() -> None:
+    env = build()
+    ra, sa = env.req("A")
+    rb, sb = env.req("B", owner="u2")
+    ha = env.co.submit(ra)
+    hb = env.co.submit(rb)
+    await playing(sa)
+    assert env.co.cancel_voice(hb.turn_id) is True
+    sa.finish()
+    await settled(ha)
+    out_b = await settled(hb)
+    assert out_b.skipped_reason == SkipReason.VOICE_CANCELLED
+    assert out_b.generated_text == RESPONSE and sb.chunks == [] and sb.stopped
+
+
+async def test_cancel_voice_from_other_threads_stops_sync_and_wins_once() -> None:
+    env, mid = build_split()
+    sink = ThreadSpySink(env.log)
+    r, _ = env.req("A", sink=sink)
+    h = env.co.submit(r)
+    await until(lambda: len(sink.chunks) == 1)
+    cancels: list[int] = []
+    h.voice_token.on_cancel(lambda _r: cancels.append(threading.get_ident()))
+    loop_thread = threading.get_ident()
+    caller_threads: list[int] = []
+    results: list[bool] = []
+
+    def call() -> None:
+        caller_threads.append(threading.get_ident())
+        results.append(env.co.cancel_voice(h.turn_id, "thread"))
+
+    loop = asyncio.get_running_loop()
+    await asyncio.gather(*(loop.run_in_executor(None, call) for _ in range(4)))
+    assert sorted(results) == [False, False, False, True]  # 只有一個呼叫贏得認領
+    assert sink.stop_threads[0] in caller_threads and sink.stop_threads[0] != loop_thread
+    await until(lambda: h.voice_token.is_cancelled)
+    assert cancels == [loop_thread] and not h.token.is_cancelled
+    mid.set()
+    out = await settled(h)
+    assert out.skipped_reason == SkipReason.VOICE_CANCELLED and out.generated_text == FULL
+
+
+# ───────────────────────── 播完窗口：drain 已返回、播放位置還沒讓出 ─────────────────────────
+
+
+class SlowCloseSpeak(GateSpeak):
+    """stream 回傳物件的 aclose 卡住，把「drain 已返回、_play_done 還沒 set」的窗口撐開。"""
+
+    def __init__(self) -> None:
+        super().__init__(open_all=True)
+        self.release = asyncio.Event()
+
+    def stream(self, sentences, token):
+        inner = super().stream(sentences, token)
+        release = self.release
+
+        class _Held:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                return await inner.__anext__()
+
+            async def aclose(self) -> None:
+                await release.wait()
+                await inner.aclose()
+
+        return _Held()
+
+
+async def test_cancel_voice_after_drain_returned_is_refused() -> None:
+    env = build()
+    speak = SlowCloseSpeak()
+    env.co.speak = speak
+    r, sink = env.req("A", history_spoken_only=True)
+    h = env.co.submit(r)
+    await playing(sink)
+    sink.finish()  # 全部播完，drain 返回；但收尾卡在 aclose，播放位置還沒讓出
+    for _ in range(50):
+        await asyncio.sleep(0)
+    assert not h._play_done.is_set()
+    assert env.co.cancel_voice(h.turn_id, "late") is False  # 語音早已播完，不能再標成取消
+    assert not h.voice_token.is_cancelled
+    speak.release.set()
+    out = await settled(h)
+    assert out.status is OutcomeStatus.COMPLETED and out.skipped_reason is None
+    assert not out.cut_short and out.spoken_text == RESPONSE  # 最後一句沒被截掉
+    assert "voice_cancelled" not in out.metadata
+
+
+async def test_on_think_start_timeout_counts_as_failure_and_frees_lock() -> None:
+    env = build(think_hook_timeout_s=0.05)
+
+    async def hook(_view, _attempt_id: int) -> None:
+        await asyncio.Event().wait()  # 永遠不返回
+
+    r, sink = env.req("A", on_think_start=hook)
+    h = env.co.submit(r)
+    await poll(lambda: len(sink.chunks) == 4 and sink.draining.is_set())  # 逾時靠牆鐘
+    sink.finish()
+    out = await settled(h)
+    assert out.status is OutcomeStatus.COMPLETED and out.generated_text == RESPONSE
+    assert out.metadata["on_think_start_error"] == "timeout"
+    r2, s2 = env.req("B", owner="u2")
+    h2 = env.co.submit(r2)
+    await playing(s2)
+    s2.finish()
+    out2 = await settled(h2)
+    assert out2.status is OutcomeStatus.COMPLETED
+    assert "on_think_start_error" not in out2.metadata
+
+
+async def test_on_think_start_swallowing_cancel_does_not_hold_lock(monkeypatch) -> None:
+    monkeypatch.setattr(coordinator_module, "THINK_HOOK_CANCEL_GRACE_S", 0.05)
+    env = build(think_hook_timeout_s=0.05)
+    stop = asyncio.Event()
+
+    async def hook(_view, _attempt_id: int) -> None:
+        while not stop.is_set():
+            try:
+                await stop.wait()
+            except asyncio.CancelledError:  # 壞掉的 hook：吞掉取消
+                pass
+
+    r, sink = env.req("A", on_think_start=hook)
+    h = env.co.submit(r)
+    try:
+        await poll(lambda: len(sink.chunks) == 4 and sink.draining.is_set())
+        sink.finish()
+        out = await settled(h)
+        assert out.status is OutcomeStatus.COMPLETED
+        assert out.metadata["on_think_start_error"] == "timeout"
+    finally:
+        stop.set()
+
+
+async def test_coordinator_internal_error_is_failed_not_voice_error() -> None:
+    """只有 speak／sink.write／flush／drain 的例外算語音側；coordinator 自身錯誤仍是 FAILED。"""
+    env = build()
+    original = env.tracer.mark
+
+    def mark(tid, name, *args, **kw):
+        if name == marks.MARK_SPEAK_FIRST_CHUNK:
+            raise RuntimeError("internal bug")
+        return original(tid, name, *args, **kw)
+
+    env.tracer.mark = mark  # type: ignore[method-assign]
+    r, _ = env.req("A")
+    out = await settled(env.co.submit(r))
+    assert out.status is OutcomeStatus.FAILED and "internal bug" in (out.error or "")
+    assert "voice_error" not in out.metadata and out.skipped_reason != SkipReason.VOICE_ERROR
+
+
+# ───────────────────────── 補強：結算、競爭認領、取消時序 ─────────────────────────
+
+
+async def test_voice_cancel_waits_for_confirm_stopped_before_resolving_spoken() -> None:
+    """被停掉的 sink 要先 confirm_stopped 才推算 spoken（Pipecat #4111 的順序）。"""
+    env = build()
+    r, sink = env.req("A", commit=CommitMode.SETTLED)
+    sink.reported_after_stop = 2.0  # confirm 時才回報的實播位置
+    h = env.co.submit(r)
+    await playing(sink)
+    sink.play(0.5)
+    assert env.co.cancel_voice(h.turn_id) is True
+    out = await settled(h)
+    assert out.skipped_reason == SkipReason.VOICE_CANCELLED
+    assert out.spoken_text == SENTENCES[0] + SENTENCES[1]  # 沒等 confirm 會是空字串
+    assert env.commits == [(r.ticket.turn_id, out.spoken_text, RESPONSE)]
+
+
+async def test_settled_voice_error_commits_truncated_spoken_and_full_generated() -> None:
+    env = build()
+    env.co.speak = FlakySpeak(after=2)
+    r, sink = env.req("A", commit=CommitMode.SETTLED)
+    sink.reported_after_stop = 1.0
+    out = await settled(env.co.submit(r))
+    assert_voice_error_outcome(out, "tts boom")
+    assert out.spoken_text == SENTENCES[0] and out.generated_text == RESPONSE
+    assert env.commits == [(r.ticket.turn_id, SENTENCES[0], RESPONSE)]
+
+
+async def test_cancel_all_after_voice_error_is_cancelled_shutdown_with_voice_error() -> None:
+    env, _mid = build_split()
+    env.co.speak = FlakySpeak(after=1)
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    await until(lambda: sink.stopped)  # 語音錯誤已認領，think 還卡在中途
+    env.co.cancel_all("left")
+    out = await settled(h)
+    assert out.status is OutcomeStatus.CANCELLED and out.cancel_reason == "shutdown"
+    assert out.metadata["reason_code"] == "shutdown"
+    assert "tts boom" in out.metadata["voice_error"]
+    assert out.skipped_reason is None and not out.barge_in
+
+
+async def test_voice_error_and_other_voice_cancels_are_mutually_exclusive() -> None:
+    # 語音錯誤先認領：之後的 cancel_voice／插話都不再生效
+    env, mid = build_split()
+    env.co.speak = FlakySpeak(after=1)
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    await until(lambda: sink.stopped)
+    assert env.co.cancel_voice(h.turn_id, "late") is False
+    for k in range(4):
+        env.co.on_voice_event(voiced(1.0 + 0.5 * k))
+    mid.set()
+    out = await settled(h)
+    assert out.skipped_reason == SkipReason.VOICE_ERROR and not out.barge_in
+    assert "voice_cancelled" not in out.metadata
+
+    # cancel_voice 先認領：之後的語音錯誤認領失敗，只剩 voice_cancelled
+    env2, mid2 = build_split()
+    r2, sink2 = env2.req("A")
+    h2 = env2.co.submit(r2)
+    await until(lambda: len(sink2.chunks) == 1)
+    assert env2.co.cancel_voice(h2.turn_id, "host") is True
+    assert env2.co._claim_voice(h2, "late error", coordinator_module.KIND_VOICE_ERROR) is False
+    mid2.set()
+    out2 = await settled(h2)
+    assert out2.skipped_reason == SkipReason.VOICE_CANCELLED
+    assert "voice_error" not in out2.metadata
+
+
+async def test_cancel_voice_ignores_barge_in_flag_of_non_interruptible_turn() -> None:
+    class Rules:
+        def flags_for(self, reply_mode):
+            return ModeFlags(barge_in=False)
+
+    env = build()
+    env.co.policy_source = StaticPolicySource(PolicySnapshot(mode_rules=Rules()))
+    r, sink = env.req("A")
+    h = env.co.submit(r)
+    await playing(sink)
+    sink.play(1.0)
+    for k in range(4):
+        env.co.on_voice_event(voiced(1.0 + 0.5 * k))
+    assert not h.voice_token.is_cancelled  # 使用者插話打斷不了
+    assert env.co.cancel_voice(h.turn_id, "host") is True  # 宿主的明確指令可以
+    out = await settled(h)
+    assert out.skipped_reason == SkipReason.VOICE_CANCELLED and not out.barge_in
+
+
+async def test_cancel_during_on_think_start_of_regen_second_attempt() -> None:
+    env = build(("甲甲甲。", "乙乙乙。"), open_all=False)
+    entered = asyncio.Event()
+    hook_cancelled = asyncio.Event()
+
+    async def hook(_view, attempt_id: int) -> None:
+        if attempt_id == 1:
+            return
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            hook_cancelled.set()
+
+    r, _ = env.req("你好", regen=OnceRegen("你好", times=1), max_regenerate=1, on_think_start=hook)
+    h = env.co.submit(r)
+    await asyncio.wait_for(entered.wait(), SAFETY_S)
+    assert len(env.backend.calls) == 1  # 第一趟 think 跑過，第二趟還沒開始
+    env.co.cancel_all("left")
+    out = await settled(h)
+    assert out.status is OutcomeStatus.CANCELLED and out.regenerated == 1
+    assert hook_cancelled.is_set() and len(env.backend.calls) == 1
+    assert env.commits == []

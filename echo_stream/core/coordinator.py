@@ -9,6 +9,8 @@
 ``submit()`` 立即返回 :class:`TurnHandle`，背景 task 依序做：
 
 1. 等 think 鎖（FIFO；等鎖期間被作廢 → ``VOIDED``，不產生任何生成／播放）
+   取得鎖後、每一趟生成開始前呼叫宿主的 ``on_think_start``（鎖內；例外與逾時吞掉並記 log，
+   摘要放 ``metadata["on_think_start_error"]``）
 2. 生成：think → speak，音訊塊在「前一輪還沒播完」時先緩衝（合成不等前一輪），
    輪到自己才寫 sink；前一輪已結束就直接寫（**熱路徑不經緩衝、不多一次 await**）
 3. 生成完成：EAGER 在釋放鎖**之前** commit；SETTLED 鎖一路持有到結算（串行語意）
@@ -22,14 +24,23 @@
 * barge-in：``BARGE_IN``，**只取消語音 token**（停播、停 TTS），think 照常生成到完，
   完整文字在 outcome 供補傳（同 bot 的 ``token.child()``）；排在後面還沒開播的輪
   的語音連帶取消（detail ``cascade``）。barge-in 之後仍可再整輪作廢
+* 語音側（TTS／sink 寫入／drain）例外：同樣**只取消語音 token**（kind ``voice_error``），
+  think 照常生成到完、文字照常 commit 與送出；outcome 為 ``phase=DONE``、
+  ``status=SKIPPED``、``skipped_reason=voice_error``、``metadata["voice_error"]`` 帶例外摘要，
+  ``cut_short=True``，不標 ``barge_in``／``aborted``、沒有 ``reason_code``（跟 PASS 一樣屬
+  「這輪沒把語音唸完，文字照常處理」，既有只看 CANCELLED／aborted 的消費者不會把文字丟掉）。
+  think 本身的例外維持 ``FAILED``
+* 宿主單輪停語音 ``cancel_voice()``：同一條「只取消語音」機制（kind ``voice_cancel``），
+  語意同 barge-in 但不標 ``barge_in``、不連帶取消後面排隊輪；outcome 為 ``phase=DONE``、
+  ``status=SKIPPED``、``skipped_reason=voice_cancelled``、``metadata["voice_cancelled"]`` 為 detail
 * 讓位 ``void()``：``SUPERSEDED`` + detail ``yielded``；已開播的輪不處理（回 False）
 * 同 owner 新回覆：``SUPERSEDED`` + detail ``superseded_by_owner``
 * ``cancel_all()``：``SHUTDOWN``，整輪作廢（think 也停），不 commit、不 settle
 
 ## 執行緒
 
-``on_voice_event`` / ``void`` / ``cancel_all`` 可從任何執行緒呼叫：在呼叫執行緒同步
-``sink.stop()``，token 取消經 ``call_soon_threadsafe`` 回 loop。``submit`` 與策略
+``on_voice_event`` / ``void`` / ``cancel_voice`` / ``cancel_all`` 可從任何執行緒呼叫：
+在呼叫執行緒同步 ``sink.stop()``，token 取消經 ``call_soon_threadsafe`` 回 loop。``submit`` 與策略
 ``refresh`` / ``SpeechTextFilter`` 只在 loop 內。
 
 ## 不做的事
@@ -97,6 +108,12 @@ _END = object()
 _CANCELLED = object()
 """句子佇列的內部標記：結束、取消。"""
 
+THINK_HOOK_TIMEOUT_S = 10.0
+"""``on_think_start`` 的逾時：hook 卡住會一直持有 think 鎖，逾時視為 hook 失敗並照常生成。"""
+
+THINK_HOOK_CANCEL_GRACE_S = 1.0
+"""取消（逾時或整輪作廢）hook 之後等它收尾的寬限；hook 吞掉取消也不會繼續卡住鎖。"""
+
 TEXT_TIMEOUT_S = 30.0
 """結算前等 ``on_sentence`` 送完文字的上限（逾時就放棄剩餘句子，不擋 outcome）。"""
 
@@ -108,8 +125,24 @@ KIND_YIELD = "yield"
 KIND_OWNER = "owner"
 KIND_BARGE_IN = "barge_in"
 KIND_CASCADE = "cascade"
+KIND_VOICE_ERROR = "voice_error"
+KIND_VOICE_CANCEL = "voice_cancel"
 """取消種類（認領時記錄，決定 reason_code／superseded／cascade 旗標；``detail`` 只是自由字串）。
 其餘種類沿用 ``CancelReason.value``（shutdown、timeout、upstream_error…）。"""
+
+
+_SOFT_VOICE_KINDS = (KIND_VOICE_ERROR, KIND_VOICE_CANCEL)
+"""只關語音、輪本身仍以 DONE 結算的語音取消種類（與 barge-in／cascade 的 CANCELLED 區分）。"""
+
+
+class _VoiceSideError(Exception):
+    """語音側呼叫（speak 產音訊、sink.write、flush、drain）拋出的例外。
+
+    包一層是為了和 coordinator 自身的程式錯誤區分：只有它會走「只停語音」路徑。"""
+
+    def __init__(self, cause: Exception) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
 
 
 def _stop_sink(sink: AudioSink | None) -> None:
@@ -220,6 +253,11 @@ class TurnHandle:
         self._cancel_detail = ""
         self._cancel_kind: str | None = None
         self._voice_kind: str | None = None
+        self._voice_error: str | None = None
+        self._hook_error: str | None = None
+        self._voice_settled = False
+        """語音已播完（drain 返回）：之後 voice_cancel／voice_error 不能再認領。"""
+
         self._chaining = False
 
     # --- TurnView ---
@@ -312,6 +350,7 @@ class TurnCoordinator:
         play_timeout_s: float = PLAY_TIMEOUT_S,
         idle_timeout_s: float = IDLE_TIMEOUT_S,
         text_timeout_s: float = TEXT_TIMEOUT_S,
+        think_hook_timeout_s: float | None = THINK_HOOK_TIMEOUT_S,
         clock: Callable[[], float] = time.perf_counter,
     ) -> None:
         self.think = think_stage
@@ -327,6 +366,7 @@ class TurnCoordinator:
         self._play_timeout_s = play_timeout_s
         self._idle_timeout_s = idle_timeout_s
         self._text_timeout_s = text_timeout_s
+        self._think_hook_timeout_s = think_hook_timeout_s
         self._clock = clock
 
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -460,6 +500,32 @@ class TurnCoordinator:
             return True
         return False
 
+    def cancel_voice(self, turn_id: str, detail: str = "host") -> bool:
+        """只取消單輪的語音（停播、停 TTS），think 照常生成到完、文字照常 commit。任何執行緒皆可。
+
+        語意同 :meth:`on_voice_event` 觸發的 barge-in，但不標 ``barge_in``、不連帶取消後面
+        排隊輪的語音；outcome 為 ``SKIPPED`` + ``skipped_reason=voice_cancelled``
+        （``metadata["voice_cancelled"]`` = ``detail``）。成功認領回 True；輪已結束、
+        已無語音可取消（沒有語音支線、語音或整輪已被取消、語音已播完）、或 ``turn_id``
+        不存在回 False。
+
+        這是宿主的明確指令，**不看 ``flags.barge_in``**：不可被使用者插話打斷的輪，
+        宿主仍可用它停語音。語音已播完（drain 返回）之後不能再取消，輪照常以完成結算。
+        """
+        for t in list(self._live):
+            if t.turn_id != turn_id:
+                continue
+            att = t._att
+            if (att.sink if att is not None else t._first_sink) is None:
+                return False
+            if t._done or t._play_done.is_set():
+                return False
+            if not self._claim_voice(t, detail, KIND_VOICE_CANCEL):
+                return False
+            self._dispatch_voice(t, cascade=False)
+            return True
+        return False
+
     def cancel_all(self, reason: str = "shutdown") -> None:
         """取消所有進行中與排隊中的輪（SHUTDOWN）：停播、不 commit、不 settle。"""
         for t in list(self._live):
@@ -525,6 +591,8 @@ class TurnCoordinator:
         with t._cancel_lock:
             if t._voice_claimed or t._cancel_claimed:
                 return False
+            if t._voice_settled and kind in _SOFT_VOICE_KINDS:
+                return False  # 語音已播完，不能再把這輪標成被取消／出錯
             t._voice_claimed = True
             t._voice_detail = detail
             t._voice_kind = kind
@@ -534,19 +602,27 @@ class TurnCoordinator:
         """插話：呼叫執行緒同步停 sink，語音 token 取消回 loop；think 不受影響。"""
         if not self._claim_voice(t, "voice"):
             return
+        self._dispatch_voice(t, cascade=True)
+
+    def _dispatch_voice(self, t: TurnHandle, *, cascade: bool) -> None:
+        """已認領的語音取消：呼叫執行緒同步停 sink，token 取消回 loop。"""
         if self._on_loop_thread():
-            self._cancel_voice_in_loop(t, True)
+            self._cancel_voice_in_loop(t, cascade)
             return
         att = t._att
         _stop_sink(att.sink if att is not None else t._first_sink)
         loop = self._loop
         if loop is not None:
-            loop.call_soon_threadsafe(self._cancel_voice_in_loop, t, True)
+            loop.call_soon_threadsafe(self._cancel_voice_in_loop, t, cascade)
 
     def _cancel_voice_in_loop(self, t: TurnHandle, cascade: bool) -> None:
         att = t._att
         _stop_sink(att.sink if att is not None else t._first_sink)
-        t._voice_root.cancel(CancelReason.BARGE_IN, t._voice_detail)
+        reason = (
+            CancelReason.UPSTREAM_ERROR if t._voice_kind == KIND_VOICE_ERROR
+            else CancelReason.BARGE_IN
+        )
+        t._voice_root.cancel(reason, t._voice_detail)
         if cascade and self._cascade:
             self._cancel_queued_after(t)
 
@@ -698,8 +774,9 @@ class TurnCoordinator:
             while True:
                 att = self._new_attempt(t, utt)
                 t._att = att
+                await self._run_think_hook(t, att)
                 result = await self._run_attempt(t, att)
-                if result == "barged":
+                if result == "barged" and t._voice_kind not in _SOFT_VOICE_KINDS:
                     phase = TurnPhase.CANCELLED  # 語音被插話截斷，文字已生成完
                 if result != "regen":
                     break
@@ -723,6 +800,57 @@ class TurnCoordinator:
         self._resolve_gen_done(t)
         self._mark_play_done(t)
         await self._conclude(t, att, phase, error)
+
+    async def _run_think_hook(self, t: TurnHandle, att: _Attempt) -> None:
+        """鎖內、這一趟生成開始前呼叫宿主 hook。
+
+        只吞 hook 的 ``Exception``（含逾時），記到 ``metadata["on_think_start_error"]``；
+        取消照常傳遞：hook 期間整輪被取消就中止並收尾（hook 被取消，不等它）。
+        """
+        hook = t.request.on_think_start
+        if hook is None:
+            return
+
+        async def _call() -> None:
+            await hook(t, att.attempt_id)
+
+        task = asyncio.ensure_future(_call())
+        # 被放生（吞掉取消）的 hook 之後才失敗也要取走例外，免得 "never retrieved" 警告
+        task.add_done_callback(lambda f: f.cancelled() or f.exception())
+        canceller = asyncio.ensure_future(t._root.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {task, canceller}, timeout=self._think_hook_timeout_s,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            pending = {p for p in (task, canceller) if not p.done()}
+            for p in pending:
+                p.cancel()
+            if pending:
+                # 有限等待：hook 吞掉取消時放生它，不讓 think 鎖永遠不放
+                await asyncio.wait(pending, timeout=THINK_HOOK_CANCEL_GRACE_S)
+        if t._root.is_cancelled:
+            # 走和「生成中被取消」同一條收尾路徑（認領早已完成，_produce 會直接結算 CANCELLED）
+            raise CancelledError(t._root.reason or CancelReason.SHUTDOWN, t._root.detail)
+        error: str | None = None
+        if task not in done:
+            error = "timeout"
+            _log.warning(
+                "on_think_start 逾時（turn %s，第 %d 趟，%ss），照常生成",
+                t.turn_id, att.attempt_id, self._think_hook_timeout_s,
+            )
+        elif task.cancelled():
+            error = "CancelledError: hook 自行取消"
+            _log.warning("on_think_start 被取消（turn %s），照常生成", t.turn_id)
+        elif (exc := task.exception()) is not None:
+            error = f"{type(exc).__name__}: {exc}"
+            _log.warning(
+                "on_think_start 失敗（turn %s，第 %d 趟），照常生成: %s",
+                t.turn_id, att.attempt_id, error, exc_info=exc,
+            )
+        if error is not None:
+            t._hook_error = error
 
     async def _run_attempt(self, t: TurnHandle, att: _Attempt) -> str:
         """跑一趟生成與播放。回傳 ``"done"`` 或 ``"regen"``。
@@ -751,11 +879,16 @@ class TurnCoordinator:
                     if not att.direct:
                         att.flusher = asyncio.ensure_future(self._flush(t, att))
                     chunk_stream = self.speak.stream(feed, token)
-                    async for chunk in chunk_stream:
+                    chunks = chunk_stream.__aiter__()
+                    while True:
+                        try:
+                            chunk = await self._voice_side(chunks.__anext__())
+                        except StopAsyncIteration:
+                            break
                         token.raise_if_cancelled()
                         self.tracer.mark(tid, marks.MARK_SPEAK_FIRST_CHUNK)
                         if att.direct:
-                            await self._write(t, att, chunk)
+                            await self._voice_side(self._write(t, att, chunk))
                         else:
                             att.buffer.append(chunk)
                     self.tracer.mark(tid, marks.MARK_SPEAK_LAST_CHUNK)
@@ -765,10 +898,12 @@ class TurnCoordinator:
                 if att.regen_utt is not None and not t._root.is_cancelled:
                     return "regen"
                 if att.flusher is not None:
-                    await att.flusher
+                    await self._voice_side(att.flusher)
                 token.raise_if_cancelled()
                 if att.wrote_any:
-                    await self._drain(t, att)
+                    await self._voice_side(self._drain(t, att))
+                with t._cancel_lock:
+                    t._voice_settled = True  # 與 _claim_voice 同鎖：之後的 cancel_voice 回 False
                 return "done"
             except CancelledError as exc:
                 if att.regen_utt is not None and not t._root.is_cancelled:
@@ -786,8 +921,54 @@ class TurnCoordinator:
                         ) from None
                     return "barged"
                 raise
+            except _VoiceSideError as vexc:
+                return await self._voice_failed(t, att, vexc.cause)
         finally:
             await self._close_attempt(t, att, feed, chunk_stream)
+
+    @staticmethod
+    async def _voice_side(awaitable):
+        """跑一個語音側呼叫；它的例外包成 :class:`_VoiceSideError`，取消與迭代結束照常傳遞。"""
+        try:
+            return await awaitable
+        except (CancelledError, StopAsyncIteration):
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise _VoiceSideError(exc) from exc
+
+    async def _voice_failed(self, t: TurnHandle, att: _Attempt, exc: Exception) -> str:
+        """語音側出錯：只取消語音 token，讓 think 生成到完（收尾同 barge-in）。
+
+        think 自己的例外（``pump_error``）、沒有語音支線時的例外、整輪已被取消，都不走這條路。
+        """
+        if att.regen_utt is not None and not t._root.is_cancelled:
+            return "regen"
+        if att.pump_error is not None or att.pump is None:
+            raise exc
+        if t._cancel_claimed or t._root.is_cancelled:
+            raise CancelledError(
+                t._cancel_reason or t._root.reason or CancelReason.SHUTDOWN,
+                t._cancel_detail or t._root.detail,
+            ) from None
+        summary = f"{type(exc).__name__}: {exc}"
+        if self._claim_voice(t, summary, KIND_VOICE_ERROR):
+            _log.warning(
+                "語音側失敗（turn %s），只停語音、文字照常生成: %s", t.turn_id, summary,
+                exc_info=exc,
+            )
+            t._voice_error = summary
+            self._cancel_voice_in_loop(t, False)
+        else:
+            # 已被插話／整輪取消認領：錯誤多半是停掉之後的連帶結果，只留 log
+            _log.debug("語音取消後的語音側例外: %s", summary, exc_info=exc)
+        await att.pump
+        if att.pump_error is not None:
+            raise att.pump_error from None
+        if t._root.is_cancelled:
+            raise CancelledError(
+                t._root.reason or CancelReason.SHUTDOWN, t._root.detail
+            ) from None
+        return "barged"
 
     async def _close_attempt(self, t: TurnHandle, att: _Attempt, feed, chunk_stream) -> None:
         root_cancelled = t._root.is_cancelled
@@ -1108,6 +1289,10 @@ class TurnCoordinator:
         tid = t.turn_id
         sink = att.sink
         cancelled = phase is TurnPhase.CANCELLED
+        # 語音取消的狀態在開頭快照一次：skipped 與 metadata 都用快照，避免 await 期間前後不一致
+        voice_kind = t._voice_kind if t._voice_claimed else None
+        voice_detail = t._voice_detail
+        voice_error = t._voice_error
         reason: CancelReason | None = None
         detail = ""
         kind: str | None = None
@@ -1119,10 +1304,11 @@ class TurnCoordinator:
         barge_in = reason is CancelReason.BARGE_IN
         superseded = cancelled and kind == KIND_OWNER
         aborted = cancelled and not (barge_in and kind != KIND_CASCADE)
-        cut_short = barge_in or superseded or aborted or bool(error)
+        voice_soft = phase is TurnPhase.DONE and voice_kind in _SOFT_VOICE_KINDS
+        cut_short = barge_in or superseded or aborted or bool(error) or voice_soft
 
         # 被停掉的 sink 可能還有「最後實播位置」在回報路上：先等它確認再推算 spoken
-        if phase is not TurnPhase.DONE and sink is not None:
+        if (phase is not TurnPhase.DONE or voice_soft) and sink is not None:
             await self._confirm_stopped(sink)
 
         spoken, spoken_s, known, spans = self._resolve_spoken(t, att, cut_short)
@@ -1155,6 +1341,11 @@ class TurnCoordinator:
         if phase is TurnPhase.DONE:
             if att.passed:
                 skipped = SkipReason.PASS  # 模型的 PASS 優先於 mode_silent 等靜態原因
+            elif voice_soft:
+                skipped = (
+                    SkipReason.VOICE_ERROR if voice_kind == KIND_VOICE_ERROR
+                    else SkipReason.VOICE_CANCELLED
+                )
             elif t._skip_reason:
                 skipped = t._skip_reason
             elif sink is not None:
@@ -1185,6 +1376,12 @@ class TurnCoordinator:
         self.tracer.finish(tid, phase, cancel_value, error)
 
         meta = self._outcome_meta(t, reason, kind, detail)
+        if t._hook_error is not None:
+            meta["on_think_start_error"] = t._hook_error
+        if voice_error is not None:
+            meta["voice_error"] = voice_error
+        if voice_kind == KIND_VOICE_CANCEL:
+            meta["voice_cancelled"] = voice_detail
         if phase is not TurnPhase.DONE and t._skip_reason:
             meta["sink_skip_reason"] = t._skip_reason  # 取消／失敗時仍保留語音支線的靜態原因
         outcome = TurnOutcome(

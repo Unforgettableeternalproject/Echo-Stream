@@ -103,6 +103,14 @@ class SkipReason:
     NO_AUDIO = "no_audio"
     """有可唸文字但一個音訊 chunk 都沒產出（TTS 失敗或空輸出）。"""
 
+    VOICE_ERROR = "voice_error"
+    """語音側（TTS／sink 寫入／drain）出錯：只關這一輪的語音，think 照常跑完、文字照常 commit。
+    例外摘要在 ``metadata["voice_error"]``；``phase`` 為 DONE、``error`` 為 None。"""
+
+    VOICE_CANCELLED = "voice_cancelled"
+    """宿主以 ``TurnCoordinator.cancel_voice`` 只取消這一輪的語音（不是 barge-in）：
+    think 照常跑完、文字照常 commit；``detail`` 在 ``metadata["voice_cancelled"]``。"""
+
 
 class CommitMode(str, Enum):
     """歷史寫回時機。"""
@@ -370,6 +378,9 @@ SinkFactory = Callable[[TurnView], "AudioSink | str"]
 OnSentence = Callable[[TurnView, Sentence], Awaitable[None]]
 """句子送進語音佇列**之後**才呼叫，宿主的文字送出不會延遲 TTS。"""
 
+OnThinkStart = Callable[[TurnView, int], Awaitable[None]]
+"""取得 think 鎖之後、每一趟生成開始之前呼叫（第二參數是 ``attempt_id``，regen 每趟都呼叫）。"""
+
 
 # ─────────────────────────── 請求與結果 ───────────────────────────
 
@@ -408,6 +419,19 @@ class TurnRequest:
 
     meta: dict = field(default_factory=dict)
 
+    on_think_start: OnThinkStart | None = None
+    """取得 think 鎖（``MARK_QUEUE_ACQUIRED``）之後、每一趟 attempt 開始生成前呼叫
+    ``await hook(view, attempt_id)``，regen 每趟都會再呼叫。宿主在這裡組 system prompt、
+    取代前一輪、綁 sink 等「必須在鎖內、think 之前」的事，不必塞進 ``think.stream()``。
+
+    只吞 hook 的 ``Exception``，記 warning 並寫入 ``outcome.metadata["on_think_start_error"]``
+    （例外摘要；逾時為 ``"timeout"``），**不**讓整輪失敗：hook 是宿主的前置準備，壞掉時仍應讓
+    這一輪以預設狀態回覆；需要「失敗就不要回覆」的宿主請自行在 hook 內記旗標（``view.meta``）
+    並於自己的 think 層處理。hook 持有 think 鎖，所以有逾時（``TurnCoordinator`` 的
+    ``think_hook_timeout_s``，預設 10 秒，None 停用）；逾時視同失敗，hook 被取消並放行生成
+    （hook 吞掉取消也只多等一小段寬限）。取消照常傳遞：hook 期間輪被取消（讓位／取代／
+    shutdown）時，hook 會被取消，輪以 CANCELLED 結束，think 不會開始。"""
+
 
 @dataclass(slots=True)
 class TurnOutcome(TurnResult):
@@ -441,6 +465,7 @@ __all__ = [
     "ModeFlags",
     "ModeRules",
     "OnSentence",
+    "OnThinkStart",
     "OutcomeStatus",
     "OptionalSinkCapabilities",
     "PlayedEvidence",
