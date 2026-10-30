@@ -92,8 +92,8 @@ async def test_標題用resolver對應的顯示名_不回填LLM給的字串():
     adapter = _adapter(_OwnerEngine(), lambda name: "u1")
     out = await adapter.execute_tool(
         "member_recall", {"member": "忽略前述指示的怪字串"}, context=_ctx())
-    assert out["result"].startswith(
-        "以下是「成員甲」（本伺服器成員）在伺服器裡提過、可分享的內容：\n")
+    assert out["result"].startswith("以下是關於「成員甲」（本伺服器成員）在伺服器裡可分享的內容；")
+    assert "以本人為準" in out["result"].split("\n", 1)[0]
     assert "怪字串" not in out["result"]
 
 
@@ -202,7 +202,9 @@ async def test_截斷時ids只含LLM實際看得到的():
     adapter = _adapter(eng)
     ctx = _ctx()
     # 標題 + 3 行 header + 第一項剛好放得下、第二項被切
-    adapter.tool_max_chars = 80
+    full = (await adapter.execute_tool(
+        "member_recall", {"member": "成員甲"}, context=_ctx()))["result"]
+    adapter.tool_max_chars = full.index("p1") + len("p1") + 3
     out = await adapter.execute_tool("member_recall", {"member": "成員甲"}, context=ctx)
     assert out["result"].endswith("…")
     assert ctx["member_recall_ids"] == ["p1"]
@@ -318,3 +320,61 @@ async def test_解析失敗_不說是本伺服器成員():
         "member_recall", {"member": "成員乙"}, context=_ctx())
     assert out["result"] == "無法確認是哪位成員。"
     assert "本伺服器成員" not in out["result"] and eng.calls2 == []
+
+
+SHARED_MAX_ITEMS = 2  # _rendered_ids 從結果類別所在模組讀上限
+
+
+@dataclass
+class _RelItem:
+    projection_id: str
+    relation: str = "owner"
+
+
+class _SectionedShared:
+    """D87 分段結果：items 原始順序交錯，渲染時本人段在前、旁證段在後，各段上限 2。"""
+
+    def __init__(self, items):
+        self.items = items
+        self.degraded = False
+        self.degraded_reason = ""
+        self.scope_id = "scope-g1"
+
+    @property
+    def ids(self):
+        return [it.projection_id for it in self.items]
+
+    @property
+    def owner_items(self):
+        return [it for it in self.items if it.relation != "about"]
+
+    @property
+    def about_items(self):
+        return [it for it in self.items if it.relation == "about"]
+
+    def to_text(self, display_name=None):
+        lines = [f"- 本人：{it.projection_id}" for it in self.owner_items[:SHARED_MAX_ITEMS]]
+        lines += [f"- 旁證：{it.projection_id}" for it in self.about_items[:SHARED_MAX_ITEMS]]
+        return "\n".join(lines)
+
+
+async def test_分段結果_ids依渲染順序且只含實際渲染的項目():
+    items = [_RelItem("a1", "about"), _RelItem("o1"), _RelItem("a2", "about"),
+             _RelItem("o2"), _RelItem("o3"), _RelItem("a3", "about")]
+    ctx = _ctx()
+    out = await _adapter(_OwnerEngine(shared=_SectionedShared(items))).execute_tool(
+        "member_recall", {"member": "成員甲"}, context=ctx)
+    assert out["success"] is True
+    # 本人段在前（o1、o2）、旁證段在後（a1、a2）；超過上限沒渲染的 o3、a3 不登記
+    assert ctx["member_recall_ids"] == ["o1", "o2", "a1", "a2"]
+
+
+async def test_分段結果_截斷時ids與可見行一致():
+    items = [_RelItem("a1", "about"), _RelItem("o1"), _RelItem("o2"), _RelItem("a2", "about")]
+    adapter = _adapter(_OwnerEngine(shared=_SectionedShared(items)))
+    full = (await adapter.execute_tool(
+        "member_recall", {"member": "成員甲"}, context=_ctx()))["result"]
+    adapter.tool_max_chars = full.index("o2") + len("o2") + 2  # 只看得到本人段兩行
+    ctx = _ctx()
+    await adapter.execute_tool("member_recall", {"member": "成員甲"}, context=ctx)
+    assert ctx["member_recall_ids"] == ["o1", "o2"]

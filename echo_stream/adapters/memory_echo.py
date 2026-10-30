@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import sys
 import threading
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -259,6 +260,24 @@ class SharedRetrieval:
     scope_id: str = ""
     degraded: bool = False
     degraded_reason: str = ""
+
+
+def _rendered_ids(result: Any) -> list[str]:
+    """依渲染順序取 projection ids：本人段在前、旁證段在後，各段只取實際渲染的筆數。
+
+    引擎的 ``to_text`` 先渲染本人段、再渲染旁證段（D87），且各段有上限；ids 必須和
+    渲染出的行一一對應，截斷登記與 ``shared_context_ids`` 才不會歸錯。舊引擎沒有分段
+    屬性時沿用 ``result.ids``。
+    """
+    owner = getattr(result, "owner_items", None)
+    about = getattr(result, "about_items", None)
+    if owner is None or about is None:
+        return list(getattr(result, "ids", []) or [])
+    module = sys.modules.get(type(result).__module__)
+    cap = getattr(module, "SHARED_MAX_ITEMS", None)
+    if not isinstance(cap, int) or cap <= 0:
+        cap = len(owner) + len(about)
+    return [it.projection_id for it in list(owner)[:cap] + list(about)[:cap]]
 
 
 class _SharedExclusiveLock:
@@ -671,7 +690,10 @@ class EchoMemoryAdapter:
                 "success": True,
                 "result": f"「{label}」是本伺服器成員，但目前沒有可分享的內容。",
             }
-        text = f"以下是「{label}」（本伺服器成員）在伺服器裡提過、可分享的內容：\n{result.text}"
+        text = (
+            f"以下是關於「{label}」（本伺服器成員）在伺服器裡可分享的內容；"
+            f"「提到〈…〉」的是其他成員的說法，與本人說法不同時以本人為準：\n{result.text}"
+        )
         visible = list(result.ids)
         if len(text) > self.tool_max_chars:
             cut = text[: self.tool_max_chars]
@@ -1121,7 +1143,7 @@ class EchoMemoryAdapter:
             rendered = result.to_text(display_name) if display_name else result.to_text()
             return SharedRetrieval(
                 text=rendered or "",
-                ids=list(result.ids),
+                ids=_rendered_ids(result),
                 scope_id=getattr(result, "scope_id", scope_id),
                 degraded=bool(getattr(result, "degraded", False)),
                 degraded_reason=str(getattr(result, "degraded_reason", "") or ""),
