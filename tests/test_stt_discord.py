@@ -575,3 +575,15 @@ def test_解碼品質_段落沒有_temperature_時為_None():
     r = _backend(_model("你好", -0.3)).transcribe(_pcm(), 16000)
     assert r.temperature is None
     assert r.avg_logprob == pytest.approx(-0.3) and r.compression_ratio == pytest.approx(1.0)
+
+
+def test_溫度fallback預設收斂為兩階():
+    m = _model()
+    _backend(m).transcribe(_pcm(), 16000)
+    assert m.calls[0]["temperature"] == [0.0, 0.2]
+
+
+def test_溫度設None時交給faster_whisper預設():
+    m = _model()
+    _backend(m, temperature=None).transcribe(_pcm(), 16000)
+    assert "temperature" not in m.calls[0]

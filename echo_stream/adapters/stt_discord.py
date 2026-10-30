@@ -218,6 +218,10 @@ class DiscordSttProfile:
     device: str = "auto"
     # faster-whisper 參數
     beam_size: int = 5
+    # 溫度 fallback 序列。faster-whisper 預設 (0.0, 0.2, …, 1.0) 會在低信心段一路重解碼到 1.0；
+    # 10/30 實測 temperature=1.0 的段 stt_ms 中位 1766ms（T=0 為 482ms），且 avg_logprob 仍落在
+    # -1.0～-1.2、品質沒有變好。收斂到兩階，最壞只多解一次；None = 用 faster-whisper 預設
+    temperature: tuple[float, ...] | None = (0.0, 0.2)
     condition_on_previous_text: bool = False
     repetition_penalty: float = 1.0
     no_speech_threshold: float = 0.6
@@ -461,6 +465,8 @@ class DiscordTranscriberBackend:
             "no_speech_threshold": p.no_speech_threshold,
             "vad_filter": p.vad_filter,
         }
+        if p.temperature is not None:
+            kwargs["temperature"] = list(p.temperature)
         if prompt:
             kwargs["initial_prompt"] = prompt
         if hotwords:
