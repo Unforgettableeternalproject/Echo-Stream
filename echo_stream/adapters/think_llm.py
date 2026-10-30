@@ -157,6 +157,17 @@ def _is_tool_call(piece: Any) -> bool:
     )
 
 
+def _accepts_context(fn: Any) -> bool:
+    """executor 是否接受 keyword ``context``（有同名參數或 ``**kwargs``）；簽名讀不到視為否。"""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return "context" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
 def _parse_args(raw: str) -> dict[str, Any]:
     """模型給的 arguments 是 JSON 字串，壞掉時退成空 dict——由 executor 回報缺參數，
     而不是在這裡炸掉整輪。"""
@@ -792,7 +803,10 @@ class LLMThinkStage:
 
             splitter = SentenceSplitter(self.split_policy)
             async for sentence in splitter.split(
-                self._tokens(messages, utterance.turn_id, token, scope, owner),
+                self._tokens(
+                    messages, utterance.turn_id, token, scope, owner,
+                    tool_context=utterance.metadata.get("tool_context"),
+                ),
                 utterance.turn_id,
                 token,
             ):
@@ -848,6 +862,7 @@ class LLMThinkStage:
         token: CancellationToken,
         scope: str | None = None,
         owner: object | None = None,
+        tool_context: Any = None,
     ) -> AsyncIterator[str]:
         """LLM token 流，含工具往返。對上游的切句器來說這就是一條連續的文字流。"""
         self.last_tool_calls = []
@@ -923,6 +938,7 @@ class LLMThinkStage:
                         calls, model_text or lead_in, turn_id, token,
                         lead_in=lead_in, lead_in_source=lead_in_source,
                         scope=scope, owner=owner,
+                        tool_context=tool_context,
                     )
                 )
             )
@@ -951,8 +967,13 @@ class LLMThinkStage:
         lead_in_source: str = "none",
         scope: str | None = None,
         owner: object | None = None,
+        tool_context: Any = None,
     ) -> list[dict[str, Any]]:
         """執行工具、組出要接回 messages 的兩種訊息。
+
+        ``tool_context``：本輪 ``Utterance.metadata["tool_context"]``（宿主每輪自己的 dict，
+        ES 不解讀、原樣透傳）。executor 簽名有 ``context`` 參數（或 ``**kwargs``）才傳，
+        舊 executor 照舊呼叫。取自「本輪」utterance，不讀 self 上的最新狀態，交錯不串輪。
 
         呼叫用 ``tool_call_id`` 配對，每一個 call **都要有對應的 tool 訊息**，
         少一個 API 會拒絕整段對話——所以 executor 炸了也要回一則錯誤結果。
@@ -991,7 +1012,10 @@ class LLMThinkStage:
                 self.active_scope = scope
                 self._scope_owner = owner
             try:
-                outcome = await self.tool_executor(call.name, args)
+                if tool_context is not None and _accepts_context(self.tool_executor):
+                    outcome = await self.tool_executor(call.name, args, context=tool_context)
+                else:
+                    outcome = await self.tool_executor(call.name, args)
             except (CancelledError, asyncio.CancelledError):
                 raise
             except Exception as exc:  # noqa: BLE001 - 單一工具失敗不該拖垮整輪
