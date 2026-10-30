@@ -434,8 +434,8 @@ class TurnRequest:
     on_generation_done: OnGenerationDone | None = None
     """think 生成結束時呼叫一次 ``hook(view, ok)``：``ok=True`` 正常完成（含 PASS；只停語音的
     barge-in／語音出錯，生成仍照常完成，也是 True）；``ok=False`` 是 think 出錯，或整輪被取消
-    （讓位／取代／shutdown…）而中止生成。早於該輪的 outcome（同步回呼保證；非同步回呼在
-    outcome 之前啟動，不等它完成）。沒有進入生成的輪（等鎖期間作廢、DROPPED_BUSY、關閉後的
+    （讓位／取代／shutdown…）而中止生成。同步回呼保證早於該輪 outcome；非同步回呼只保證
+    已排程，不保證與 outcome 的先後。沒有進入生成的輪（等鎖期間作廢、DROPPED_BUSY、關閉後的
     submit）不呼叫。回呼例外吞掉並記 warning，不影響 outcome；回呼在 loop 內執行，須快速。"""
 
     on_think_start: OnThinkStart | None = None

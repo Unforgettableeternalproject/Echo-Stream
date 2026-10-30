@@ -55,6 +55,14 @@
 * loop 內執行的回呼若阻塞（DB、同步 I/O），整條管線都會卡住；請丟進執行緒安全佇列，
   由宿主自己的工作緒處理。
 * 呼叫端執行緒指 STT／接收執行緒，與 ``on_voice_event`` 同一個。
+* 跨執行緒排回 loop 時若 loop 已關閉，吞掉 ``RuntimeError`` 並記 debug，不拋給呼叫端。
+* ``on_turn_ended`` 在 ``DROPPED_BUSY`` 與關閉後的 submit 這兩條路徑，於 ``submit()`` 返回前、
+  在 loop 執行緒同步觸發；其餘路徑在該輪的 task 內觸發。
+* ``on_generation_done``：同步回呼保證早於該輪 outcome；非同步回呼只保證已排程，
+  不保證與 outcome 的先後（``aclose`` 會等它收尾，逾時取消）。
+* ``FAILED`` 的 ``reason_code`` 一律是 ``upstream_error``，包含「先被認領取消、之後才拋例外」
+  的邊角（此時 ``cancel_reason`` 仍為 None，認領的種類不反映在 reason_code）。
+* ``_closed`` 永久，``aclose`` 之後不能 reopen。
 
 ``void`` / ``cancel_all`` / ``on_voice_event`` 會**無鎖**讀 ``_live`` 的快照與 ``audio_started``。
 非 loop 執行緒可能讀到過渡狀態（例如某輪恰好此刻開播，``void`` 因而回 False 而不是 True），
@@ -130,6 +138,9 @@ _CANCELLED = object()
 
 THINK_HOOK_TIMEOUT_S = 10.0
 """``on_think_start`` 的逾時：hook 卡住會一直持有 think 鎖，逾時視為 hook 失敗並照常生成。"""
+
+BG_CALLBACK_GRACE_S = 1.0
+"""``aclose`` 等非同步 ``on_generation_done`` 收尾的寬限；逾時就取消它。"""
 
 THINK_HOOK_CANCEL_GRACE_S = 1.0
 """取消（逾時或整輪作廢）hook 之後等它收尾的寬限；hook 吞掉取消也不會繼續卡住鎖。"""
@@ -394,6 +405,7 @@ class TurnCoordinator:
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_bound = False
+        self._bind_lock = threading.Lock()
         """True = 宿主以 :meth:`bind_loop` 明確綁定；submit 的 loop 必須與它一致。"""
 
         self._loop_thread: int | None = None
@@ -433,12 +445,19 @@ class TurnCoordinator:
         綁定後，從其他執行緒進來的 ``on_voice_event`` / ``void`` / ``cancel_voice`` /
         ``cancel_all`` 就有 loop 可以排回去，不必等第一輪才「恰好」可用。之後 ``submit``
         必須在這個 loop 內呼叫，否則拋 ``RuntimeError``。沒有綁定時維持舊行為：第一次
-        ``submit`` 才擷取 loop。重複綁同一個 loop 無害；已綁定後改綁別的 loop 拋 ``RuntimeError``。
+        ``submit`` 才擷取 loop。重複綁同一個 loop 無害；``_loop`` 已存在（含首次 submit
+        懶擷取）且與傳入的不同，拋 ``RuntimeError``。
         """
-        if self._loop_bound and self._loop is not loop:
-            raise RuntimeError("TurnCoordinator 已綁定另一個 event loop")
-        self._loop = loop
-        self._loop_bound = True
+        with self._bind_lock:
+            if self._loop is not None and self._loop is not loop:
+                raise RuntimeError("TurnCoordinator 已綁定（或已用過）另一個 event loop")
+            self._loop = loop
+            self._loop_bound = True
+        try:
+            if asyncio.get_running_loop() is loop:
+                self._loop_thread = threading.get_ident()
+        except RuntimeError:
+            pass  # 不在任何 loop 內（例如宿主的啟動執行緒）：loop 執行緒留給 submit 設定
 
     def submit(self, req: TurnRequest) -> TurnHandle:
         """送出一輪。必須在 loop 內呼叫；立即返回，不等生成。
@@ -619,10 +638,20 @@ class TurnCoordinator:
             await asyncio.wait(tasks)  # 不用 gather：外層被取消時不該連帶取消各輪 task
 
     async def aclose(self) -> None:
-        """關閉：拒絕新輪（之後的 submit 產生 VOIDED/shutdown）→ 取消所有輪 → 等它們結束。"""
+        """關閉：拒絕新輪（之後的 submit 產生 VOIDED/shutdown）→ 取消所有輪 → 等它們結束。
+
+        關閉是永久的：``_closed`` 不會重設，不能 reopen；要再用請建新的 coordinator。"""
         self._closed = True
         self._cancel_all("shutdown")
         await self.join()
+        pending = {task for task in self._bg_tasks if not task.done()}
+        if pending:
+            # 非同步 on_generation_done 可能還在跑：給一點時間收尾，逾時就取消並等它結束
+            await asyncio.wait(pending, timeout=BG_CALLBACK_GRACE_S)
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
 
     # ───────────────────────── 取消機制 ─────────────────────────
 
@@ -649,9 +678,17 @@ class TurnCoordinator:
             return
         att = t._att
         _stop_sink(att.sink if att is not None else t._first_sink)
+        self._call_soon(self._cancel_in_loop, t, cascade)
+
+    def _call_soon(self, fn, *args) -> None:
+        """跨執行緒排回 loop；loop 已關閉時吞掉（不能把例外拋給 STT／接收執行緒）。"""
         loop = self._loop
-        if loop is not None:
-            loop.call_soon_threadsafe(self._cancel_in_loop, t, cascade)
+        if loop is None:
+            return
+        try:
+            loop.call_soon_threadsafe(fn, *args)
+        except RuntimeError:
+            _log.debug("event loop 已關閉，略過跨執行緒排程", exc_info=True)
 
     def _cancel_in_loop(self, t: TurnHandle, cascade: bool) -> None:
         att = t._att
@@ -685,9 +722,7 @@ class TurnCoordinator:
             return
         att = t._att
         _stop_sink(att.sink if att is not None else t._first_sink)
-        loop = self._loop
-        if loop is not None:
-            loop.call_soon_threadsafe(self._cancel_voice_in_loop, t, cascade)
+        self._call_soon(self._cancel_voice_in_loop, t, cascade)
 
     def _cancel_voice_in_loop(self, t: TurnHandle, cascade: bool) -> None:
         att = t._att
@@ -1187,6 +1222,8 @@ class TurnCoordinator:
                 att.token.cancel(CancelReason.SUPERSEDED, "regenerated")
                 att.voice.cancel(CancelReason.SUPERSEDED, "regenerated")
                 return
+        if att.token.is_cancelled:
+            return  # think 被整輪取消而安靜返回：不當成正常完成（不 commit、ok=False）
         await self._finish_generation(t, att)
 
     async def _finish_generation(self, t: TurnHandle, att: _Attempt) -> None:
@@ -1583,6 +1620,7 @@ class TurnCoordinator:
         """內部錯誤或 task 被外部取消時的保底：確保每個 submit 都有 outcome。"""
         if t._done:
             return
+        self._resolve_gen_done(t, False)  # 生成若已開始但未結束，同步回呼仍早於 outcome
         self.tracer.finish(
             t.turn_id, TurnPhase.CANCELLED if cancelled else TurnPhase.FAILED, None, error
         )
@@ -1591,6 +1629,11 @@ class TurnCoordinator:
             phase=TurnPhase.CANCELLED if cancelled else TurnPhase.FAILED,
             utterance_text=t.request.utterance.text,
             error=error,
+            metadata={
+                "reason_code": (
+                    CancelReason.SHUTDOWN.value if cancelled else CancelReason.UPSTREAM_ERROR.value
+                ),
+            },
             cut_short=True,
             status=OutcomeStatus.CANCELLED if cancelled else OutcomeStatus.FAILED,
             aborted=cancelled,
