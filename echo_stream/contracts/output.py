@@ -193,10 +193,15 @@ def sink_can_reset(sink: AudioSink) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class TurnTicket:
-    """一輪輸出的執行權憑證。ES 不自行開 turn，turn_id 取自這裡。"""
+    """一輪輸出的執行權憑證。ES 不自行開 turn，turn_id 取自這裡。
+
+    宿主須令 ``turn_id`` 與 ``Utterance.turn_id`` **相等**（同時令 ``source_turn_id`` 等於
+    ``turn_id``）：coordinator 的 tracer、commit、outcome 用 ``ticket.turn_id``，think 打點與
+    音訊塊用 ``utterance.turn_id``，兩者不同會讓記憶／工具打點落到孤兒 trace。不相等時
+    ``submit`` 只記 warning，不改行為。"""
 
     turn_id: str
-    """Core 簽發的 turn 識別碼（ES 輸出端、tracer 的帳號）。"""
+    """Core 簽發的 turn 識別碼（ES 輸出端、tracer 的帳號）。須等於 ``Utterance.turn_id``。"""
 
     source_turn_id: str
     """對應的輸入端 id（``Utterance.turn_id``）。"""

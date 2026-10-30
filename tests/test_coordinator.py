@@ -1968,3 +1968,29 @@ async def test_on_generation_done_not_called_when_generation_never_started() -> 
     assert out.status is OutcomeStatus.VOIDED
     assert spy.calls == []
     gate.set()
+
+
+async def test_submit_warns_when_ticket_and_utterance_turn_ids_differ(caplog) -> None:
+    env = build()
+    r, sink = env.req("A")
+    utt = r.utterance
+    r.ticket = dataclasses.replace(r.ticket, turn_id="turn_core_1", source_turn_id=utt.turn_id)
+    with caplog.at_level("WARNING"):
+        h = env.co.submit(r)
+    assert any("turn_id" in rec.getMessage() for rec in caplog.records)
+    assert h.turn_id == "turn_core_1"  # 行為不變
+    await playing(sink)
+    sink.finish()
+    assert (await settled(h)).status is OutcomeStatus.COMPLETED
+
+
+async def test_submit_does_not_warn_when_turn_ids_equal(caplog) -> None:
+    env = build()
+    r, sink = env.req("A")
+    r.ticket = dataclasses.replace(r.ticket, turn_id=r.utterance.turn_id)
+    with caplog.at_level("WARNING"):
+        h = env.co.submit(r)
+    assert not [rec for rec in caplog.records if "turn_id" in rec.getMessage()]
+    await playing(sink)
+    sink.finish()
+    await settled(h)

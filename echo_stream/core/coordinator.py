@@ -37,11 +37,30 @@
 * 同 owner 新回覆：``SUPERSEDED`` + detail ``superseded_by_owner``
 * ``cancel_all()``：``SHUTDOWN``，整輪作廢（think 也停），不 commit、不 settle
 
-## 執行緒
+## 執行緒契約
 
-``on_voice_event`` / ``void`` / ``cancel_voice`` / ``cancel_all`` 可從任何執行緒呼叫：
-在呼叫執行緒同步 ``sink.stop()``，token 取消經 ``call_soon_threadsafe`` 回 loop。``submit`` 與策略
-``refresh`` / ``SpeechTextFilter`` 只在 loop 內。
+| 入口 | 執行緒 | 備註 |
+| --- | --- | --- |
+| ``on_voice_event`` / ``void`` / ``cancel_voice`` / ``cancel_all`` | 任何執行緒 | 同步 stop |
+| ``bind_loop`` | 任何執行緒 | 須在第一次 ``submit`` 之前 |
+| ``busy`` / ``waiting`` / ``live_turns`` | 建議 loop 內 | 其他執行緒讀到瞬時快照 |
+| ``submit`` / ``join`` / ``aclose`` | 只能 loop 內 | loop 須與 ``bind_loop`` 一致 |
+| ``sink_factory`` / ``on_think_start`` / ``on_sentence`` | loop 內執行 | 須快速 |
+| ``on_generation_done`` / ``on_turn_ended`` | loop 內執行 | 不得阻塞 |
+| 策略 ``refresh`` / ``SpeechTextFilter`` / ``AdmissionPolicy`` | loop 內執行 | 同步、快速 |
+| ``PolicySource.current()`` / 策略 ``on_voiced`` | 呼叫端執行緒 | 純記憶體 |
+
+* 跨執行緒入口：呼叫執行緒內只做同步 ``sink.stop()``，token 取消一律 ``call_soon_threadsafe``
+  回 loop；每輪只認領一次（``_claim`` 以 ``threading.Lock`` 保護）。
+* loop 內執行的回呼若阻塞（DB、同步 I/O），整條管線都會卡住；請丟進執行緒安全佇列，
+  由宿主自己的工作緒處理。
+* 呼叫端執行緒指 STT／接收執行緒，與 ``on_voice_event`` 同一個。
+
+``void`` / ``cancel_all`` / ``on_voice_event`` 會**無鎖**讀 ``_live`` 的快照與 ``audio_started``。
+非 loop 執行緒可能讀到過渡狀態（例如某輪恰好此刻開播，``void`` 因而回 False 而不是 True），
+這個競態可接受：後果只是「這次讓位沒成功」，不會重複取消、不會漏掉 outcome；真正的狀態改變
+（認領）仍由鎖保護、每輪恰好一次。
+:meth:`aclose` 之後這些入口全部 no-op（``void`` / ``cancel_voice`` 回 False）。
 
 ## 不做的事
 
@@ -434,6 +453,13 @@ class TurnCoordinator:
             raise ValueError("ticket 與 utterance 不對應（source_turn_id != utterance.turn_id）")
         if any(t.turn_id == req.ticket.turn_id and not t._done for t in self._live):
             raise ValueError(f"turn_id 重複: {req.ticket.turn_id}")
+        if req.ticket.turn_id != req.utterance.turn_id:
+            # 不改行為，但 tracer／commit 用 ticket.turn_id、think 與音訊塊用 utterance.turn_id，
+            # 兩者不同會讓記憶／工具打點落到孤兒 trace
+            _log.warning(
+                "ticket.turn_id（%s）≠ utterance.turn_id（%s），打點可能分裂，宿主應令兩者相等",
+                req.ticket.turn_id, req.utterance.turn_id,
+            )
         loop = asyncio.get_running_loop()
         if self._loop_bound and loop is not self._loop:
             raise RuntimeError("submit 必須在 bind_loop 綁定的 event loop 內呼叫")
