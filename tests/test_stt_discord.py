@@ -300,9 +300,9 @@ def test_hotwords_passed_joined_and_default_empty():
     b = _backend(m)
     b.transcribe(_pcm(), 16000)
     assert "hotwords" not in m.calls[0]
-    b.set_hotwords(["雅列", "Bernie"])
+    b.set_hotwords(["成員甲", "Bernie"])
     b.transcribe(_pcm(), 16000)
-    assert m.calls[1]["hotwords"] == "雅列, Bernie"  # bot 同樣用 ", ".join
+    assert m.calls[1]["hotwords"] == "成員甲, Bernie"  # bot 同樣用 ", ".join
 
 
 def test_per_speaker_overrides_global_then_falls_back():

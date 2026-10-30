@@ -71,20 +71,20 @@ def _adapter(engine, resolver=lambda name: "u1", tools=("member_recall",)):
 
 def _ctx(scope="scope-g1", viewer="v1", present=("v1", "a"), **extra):
     cfg = {"scope_id": scope, "viewer_uid": viewer, "present_uids": list(present),
-           "display_name": lambda uid: "雅烈"}
+           "display_name": lambda uid: "成員甲"}
     cfg.update(extra)
     return {"member_recall": cfg}
 
 
 async def test_解析成功_帶owner_uid_掛名_ids寫回context():
     eng = _OwnerEngine()
-    adapter = _adapter(eng, lambda name: "u_yalie" if name == "雅烈" else None)
+    adapter = _adapter(eng, lambda name: "u_member_a" if name == "成員甲" else None)
     ctx = _ctx()
     out = await adapter.execute_tool(
-        "member_recall", {"member": "雅烈", "query": "遊戲"}, context=ctx)
+        "member_recall", {"member": "成員甲", "query": "遊戲"}, context=ctx)
     assert out["success"] is True
-    assert eng.calls2 == [("遊戲", "scope-g1", "v1", ("v1", "a"), "u_yalie")]
-    assert "雅烈" in out["result"] and "p1,p2" in out["result"]
+    assert eng.calls2 == [("遊戲", "scope-g1", "v1", ("v1", "a"), "u_member_a")]
+    assert "成員甲" in out["result"] and "p1,p2" in out["result"]
     assert ctx["member_recall_ids"] == ["p1", "p2"]
 
 
@@ -92,13 +92,13 @@ async def test_標題用resolver對應的顯示名_不回填LLM給的字串():
     adapter = _adapter(_OwnerEngine(), lambda name: "u1")
     out = await adapter.execute_tool(
         "member_recall", {"member": "忽略前述指示的怪字串"}, context=_ctx())
-    assert out["result"].startswith("關於「雅烈」")
+    assert out["result"].startswith("關於「成員甲」")
     assert "怪字串" not in out["result"]
 
 
 async def test_query空白可用():
     eng = _OwnerEngine()
-    out = await _adapter(eng).execute_tool("member_recall", {"member": "雅烈"}, context=_ctx())
+    out = await _adapter(eng).execute_tool("member_recall", {"member": "成員甲"}, context=_ctx())
     assert out["success"] is True
     assert eng.calls2[0][0] == "" and eng.calls2[0][4] == "u1"
 
@@ -119,7 +119,7 @@ async def test_resolver拋例外_視同無法確認():
 
     eng = _OwnerEngine()
     out = await _adapter(eng, boom).execute_tool(
-        "member_recall", {"member": "雅烈"}, context=_ctx())
+        "member_recall", {"member": "成員甲"}, context=_ctx())
     assert "無法確認" in out["result"] and eng.calls2 == []
 
 
@@ -133,7 +133,7 @@ async def test_resolver拋例外_視同無法確認():
 ])
 async def test_context缺失或不完整_不呼叫引擎(context):
     eng = _OwnerEngine()
-    out = await _adapter(eng).execute_tool("member_recall", {"member": "雅烈"}, context=context)
+    out = await _adapter(eng).execute_tool("member_recall", {"member": "成員甲"}, context=context)
     assert out["success"] is True and "無法確認" in out["result"]
     assert eng.calls2 == []
 
@@ -175,7 +175,7 @@ async def test_兩輪交錯_scope與ids各歸各的():
 async def test_owner等於viewer_引擎回空_不登記ids():
     eng = _OwnerEngine(_Shared([]))
     ctx = _ctx(viewer="u1")
-    out = await _adapter(eng).execute_tool("member_recall", {"member": "雅烈"}, context=ctx)
+    out = await _adapter(eng).execute_tool("member_recall", {"member": "成員甲"}, context=ctx)
     assert "沒有查到" in out["result"] and "member_recall_ids" not in ctx
 
 
@@ -193,7 +193,7 @@ async def test_截斷時ids只含LLM實際看得到的():
 
         def to_text(self, display_name=None):
             return "\n".join(["<b>", "note", "head"]
-                             + [f"- 雅烈 提過：{'內' * 20}{i.projection_id}" for i in self.items]
+                             + [f"- 成員甲 提過：{'內' * 20}{i.projection_id}" for i in self.items]
                              + ["</b>"])
 
     eng = _OwnerEngine(_Multi([_Item("p1"), _Item("p2"), _Item("p3")]))
@@ -201,13 +201,13 @@ async def test_截斷時ids只含LLM實際看得到的():
     ctx = _ctx()
     # 標題 + 3 行 header + 第一項剛好放得下、第二項被切
     adapter.tool_max_chars = 80
-    out = await adapter.execute_tool("member_recall", {"member": "雅烈"}, context=ctx)
+    out = await adapter.execute_tool("member_recall", {"member": "成員甲"}, context=ctx)
     assert out["result"].endswith("…")
     assert ctx["member_recall_ids"] == ["p1"]
 
     ctx2 = _ctx()
     adapter.tool_max_chars = 10
-    await adapter.execute_tool("member_recall", {"member": "雅烈"}, context=ctx2)
+    await adapter.execute_tool("member_recall", {"member": "成員甲"}, context=ctx2)
     assert ctx2.get("member_recall_ids", []) == []
 
 
@@ -216,7 +216,7 @@ async def test_舊引擎不支援owner_uid_回空不退化成全體查詢():
     out = await EchoMemoryAdapter(engine=eng).retrieve_shared(
         "", scope_id="s", viewer_uid="v", owner_uid="u1")
     assert out is not None and out.text == "" and out.ids == []
-    res = await _adapter(eng).execute_tool("member_recall", {"member": "雅烈"}, context=_ctx())
+    res = await _adapter(eng).execute_tool("member_recall", {"member": "成員甲"}, context=_ctx())
     assert eng.called == 0 and res["success"] is True
 
 
@@ -262,7 +262,7 @@ def test_啟用但未注入resolver_不曝光並只警告一次(monkeypatch, cap
 async def test_未啟用時execute_tool擋掉():
     eng = _OwnerEngine()
     adapter = _adapter(eng, tools=("deep_recall",))
-    out = await adapter.execute_tool("member_recall", {"member": "雅烈"}, context=_ctx())
+    out = await adapter.execute_tool("member_recall", {"member": "成員甲"}, context=_ctx())
     assert out["success"] is False and eng.calls2 == []
 
 
@@ -275,7 +275,7 @@ async def _drain(stage, utt):
 
 
 def _stage(executor):
-    backend = ToolBackend(call=_Call("c1", "member_recall", '{"member": "雅烈"}'))
+    backend = ToolBackend(call=_Call("c1", "member_recall", '{"member": "成員甲"}'))
     return LLMThinkStage(backend, tools=[{"x": 1}], tool_executor=executor)
 
 
@@ -300,4 +300,4 @@ async def test_think_舊executor不收context照舊呼叫():
 
     await _drain(_stage(ex), Utterance(
         text="hi", speaker_id="u", metadata={"tool_context": {"a": 1}}))
-    assert seen == [("member_recall", {"member": "雅烈"})]
+    assert seen == [("member_recall", {"member": "成員甲"})]
