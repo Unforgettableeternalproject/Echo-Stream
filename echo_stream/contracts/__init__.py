@@ -40,10 +40,12 @@ from .stages import (
     AudioSink,
     AudioSource,
     InputStage,
+    MemoryRetriever,
     MultiChannelInputStage,
     SettleCapable,
     SpeakStage,
     Stage,
+    ThinkHostSurface,
     ThinkStage,
 )
 from .style import EMOTION_DIMENSIONS, NEUTRAL, SpeechStyle
@@ -79,10 +81,12 @@ __all__ = [
     "AudioSink",
     "AudioSource",
     "InputStage",
+    "MemoryRetriever",
     "MultiChannelInputStage",
     "SettleCapable",
     "SpeakStage",
     "Stage",
+    "ThinkHostSurface",
     "ThinkStage",
     # output
     "BARGE_IN_PRESETS",

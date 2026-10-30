@@ -55,6 +55,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from .. import config
 from ..contracts.cancellation import CancellationToken, CancelledError
+from ..contracts.stages import MemoryRetriever
 from ..contracts.style import SpeechStyle
 from ..contracts.types import Sentence, Utterance
 from ..core.emotion import extract_style, marker_prompt
@@ -330,14 +331,14 @@ class LLMThinkStage:
         history_trim_to: int | None = None,
         default_style: SpeechStyle | None = None,
         emotion_markers: bool = False,
-        memory: Any = None,
+        memory: MemoryRetriever | None = None,
         tools: Sequence[dict[str, Any]] | None = None,
         tool_executor: ToolExecutor | None = None,
         tool_filler: str | None = DEFAULT_TOOL_FILLER,
         max_tool_rounds: int = 2,
         tool_lead_in: str = "fixed",
         tool_lead_in_extra: str = "",
-        memory_resolver: Callable[[str | None], Any] | None = None,
+        memory_resolver: Callable[[str | None], MemoryRetriever | None] | None = None,
         output_guard: OutputGuard | None = None,
         prompt_cache_key: str | None = None,
     ) -> None:
