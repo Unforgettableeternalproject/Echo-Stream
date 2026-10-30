@@ -508,6 +508,32 @@ class LLMThinkStage:
             self._last_build = (build[0], build[1], None)
         return cleared
 
+    def reset_context(self, history: list[dict[str, str]] | None = None) -> None:
+        """聽眾切換（audience 換一群）時清乾淨對話狀態，但保留實例。
+
+        保留實例是為了不丟 prompt cache 的靜態前綴（client、system_prompt、tools、
+        ``prompt_cache_key``、``_prewarm_sent`` 預熱去重都不動；``last_usage`` 等累計觀測也不動）。
+
+        清掉：``history``（給了 ``history`` 就以其複本取代）、依 turn_id 的 assistant 索引、
+        待提交的 user 文字、所有 scope 的待注入記憶、``_last_build``、``_retrieved``
+        去重記錄與 ``last_injected_memory``——前一群聽眾的記憶不得滲入下一群。
+        ``_discard_gen`` +1，讓清除前發起、尚在途的 retrieve 晚到時作廢、不寫回槽。
+
+        前置條件：呼叫端保證此時沒有進行中的 ``stream``；偵測到（``_scope_owner`` 有值）
+        就拋 ``RuntimeError``，而不是靜默清掉別人正在用的狀態。
+        ``history`` 之後若有 ``settle`` 舊 turn_id，會因索引已清而回 False。
+        """
+        if self._scope_owner is not None:
+            raise RuntimeError("stream 進行中不可 reset_context（呼叫端須先確保 think 閒置）")
+        self.history[:] = list(history) if history is not None else []
+        self._assistant_by_turn = {}
+        self._pending_user_text = ""
+        self._pending_by_scope.clear()
+        self._last_build = None
+        self._retrieved = None
+        self.last_injected_memory = None
+        self._discard_gen += 1
+
     def _slot(self, scope: str | None) -> str | None:
         """待注入記憶的槽 key。沒設 resolver 就不分 scope（維持舊行為）。"""
         return scope if self.memory_resolver is not None else None
