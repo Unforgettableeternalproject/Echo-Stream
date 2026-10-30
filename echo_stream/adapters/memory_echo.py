@@ -74,6 +74,29 @@ FORCE_REMEMBER_DESCRIPTION = (
 DEFAULT_TOOL_MAX_CHARS = 1500
 """工具結果回給 LLM 的字數上限。deep_recall 的 top_k 可到 20、門檻比自動注入鬆
 （0.2 vs 0.45），不截會把第二段續寫的 prompt 塞爆。"""
+MEMBER_RECALL = "member_recall"
+MEMBER_RECALL_DESCRIPTION = (
+    "查詢同一個伺服器裡某位成員在共享記憶中可被看到的內容（例如使用者問「你認識某某嗎？"
+    "他最近在玩什麼？」）。member 填成員的名稱；query 可選，填想了解的主題，留空則取最近的內容。"
+    "只在使用者明確問到特定成員時呼叫；查不到只代表目前沒有可用的共享內容。"
+    "Look up what is shared about one named member of this server; call only when the "
+    "user asks about that member."
+)
+MEMBER_RECALL_SCHEMA = {
+    "name": MEMBER_RECALL,
+    "description": MEMBER_RECALL_DESCRIPTION,
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "member": {"type": "string", "description": "成員名稱（顯示名稱或暱稱）。"},
+            "query": {"type": "string", "description": "想了解的主題，可留空。"},
+        },
+        "required": ["member"],
+    },
+}
+"""member_recall 不在 echo_memory 的 TOOL_DECLARATIONS 裡，由 ES 自帶 schema。
+預設不開（DEFAULT_TOOLS 不含它），由宿主在 ECHO_STREAM_MEMORY_TOOLS 加上。"""
+MEMBER_NOT_FOUND = "找不到這位成員，無法查詢。"
 ASSESS_MODES = ("llm", "heuristic", "off")
 """salience 評估模式（ECHO_STREAM_MEMORY_ASSESS）：
 llm = SubconsciousAssessor 打一次 LLM（背景，不在熱路徑）；
@@ -288,6 +311,7 @@ class EchoMemoryAdapter:
         assess_llm_fn: Callable[[str], str] | None = None,
         executor: ThreadPoolExecutor | None = None,
         engine_lock: threading.Lock | None = None,
+        member_resolver: Callable[[str], str | None] | None = None,
     ) -> None:
         self._engine = engine
         self._owns_executor = executor is None
@@ -347,6 +371,10 @@ class EchoMemoryAdapter:
         self._evidence_supported: bool | None = None
         self._idempotency_supported: bool | None = None
         self._tool_executor: Any = None
+        self.member_resolver: Callable[[str], str | None] | None = member_resolver
+        """``member_recall`` 用：成員名稱 -> uid（解析不到回 None）。宿主注入。"""
+        self._member_ctx: dict[str, Any] | None = None
+        self._member_recall_ids: list[str] = []
         self.tool_max_chars = int(
             config.get("ECHO_STREAM_MEMORY_TOOL_MAX_CHARS", str(DEFAULT_TOOL_MAX_CHARS))
         )
@@ -509,9 +537,10 @@ class EchoMemoryAdapter:
         try:
             from llm_integration.tools.definitions import TOOL_DECLARATIONS
         except ImportError as exc:
-            logger.warning("echo_memory 沒有 llm_integration.tools——工具停用：%s", exc)
-            return []
+            logger.warning("echo_memory 沒有 llm_integration.tools——只保留 ES 自帶工具：%s", exc)
+            TOOL_DECLARATIONS = []
         known = {d["name"]: d for d in TOOL_DECLARATIONS}
+        known[MEMBER_RECALL] = MEMBER_RECALL_SCHEMA
         out = []
         for name in self.enabled_tools:
             decl = known.get(name)
@@ -545,6 +574,12 @@ class EchoMemoryAdapter:
         """
         if name not in self.enabled_tools:
             return {"success": False, "result": f"Tool {name!r} is not available."}
+        if name == MEMBER_RECALL:
+            outcome = await self._member_recall(args)
+            text = str(outcome.get("result", ""))
+            if len(text) > self.tool_max_chars:
+                outcome = {**outcome, "result": text[: self.tool_max_chars] + "…"}
+            return outcome
 
         def _work() -> dict[str, Any]:
             outcome = self.tool_executor.execute(name, dict(args))
@@ -557,6 +592,76 @@ class EchoMemoryAdapter:
         kind = "dream" if name == "trigger_dream" else (
             "read" if name == "deep_recall" else "write")
         return await self._run(_work, kind)
+
+    # --- member_recall（D85 指名查詢）---
+
+    def set_member_resolver(self, resolver: Callable[[str], str | None] | None) -> None:
+        """注入成員名稱 -> uid 的解析器（解析不到回 None）。None = 停用解析。"""
+        self.member_resolver = resolver
+
+    def set_member_recall_context(
+        self,
+        *,
+        scope_id: str,
+        viewer_uid: str,
+        present_uids: Iterable[Any] = (),
+        display_name: Callable[[str], str] | None = None,
+        shared_adapter: EchoMemoryAdapter | None = None,
+    ) -> None:
+        """宿主每輪開始時設定：本輪 member_recall 查詢用的場域脈絡。
+
+        參數與宿主呼叫 :meth:`retrieve_shared` 時相同（同一份來源）。``shared_adapter``
+        = 實際掛著 scope engine 的 adapter（宿主的 user adapter 與 scope adapter 不同時給）；
+        不給就用自己。設定時同時清空上一輪累積的 ids。
+        """
+        self._member_ctx = {
+            "scope_id": scope_id,
+            "viewer_uid": viewer_uid,
+            "present_uids": tuple(present_uids),
+            "display_name": display_name,
+            "adapter": shared_adapter,
+        }
+        self._member_recall_ids = []
+
+    def clear_member_recall_context(self) -> None:
+        """本輪結束或 DM 時清除脈絡；之後 member_recall 一律回找不到。"""
+        self._member_ctx = None
+
+    def take_member_recall_ids(self) -> list[str]:
+        """取走並清空本輪工具撈到的 projection ids；宿主併入 ``shared_context_ids``。"""
+        ids, self._member_recall_ids = self._member_recall_ids, []
+        return ids
+
+    async def _member_recall(self, args: dict[str, Any]) -> dict[str, Any]:
+        """解析成員 -> 帶 owner_uid 呼叫 retrieve_shared；解析不到不碰引擎。"""
+        member = str(args.get("member") or "").strip()
+        query = str(args.get("query") or "").strip()
+        ctx = self._member_ctx
+        owner_uid: str | None = None
+        if member and ctx is not None and self.member_resolver is not None:
+            try:
+                owner_uid = self.member_resolver(member) or None
+            except Exception as exc:  # noqa: BLE001 - 解析失敗視同找不到
+                logger.warning("member_resolver 失敗：%s: %s", type(exc).__name__, exc)
+        if owner_uid is None or ctx is None:
+            return {"success": True, "result": MEMBER_NOT_FOUND}
+        target = ctx["adapter"] or self
+        result = await target.retrieve_shared(
+            query,
+            scope_id=ctx["scope_id"],
+            viewer_uid=ctx["viewer_uid"],
+            present_uids=ctx["present_uids"],
+            display_name=ctx["display_name"],
+            owner_uid=owner_uid,
+        )
+        if result is None:
+            return {"success": False, "result": "目前無法查詢這位成員的共享內容。"}
+        if not result.text:
+            return {"success": True, "result": f"沒有查到「{member}」可分享的內容。"}
+        for pid in result.ids:
+            if pid not in self._member_recall_ids:
+                self._member_recall_ids.append(pid)
+        return {"success": True, "result": f"關於「{member}」的共享內容：\n{result.text}"}
 
     # --- 管線介面 ---
 
@@ -957,6 +1062,7 @@ class EchoMemoryAdapter:
         viewer_uid: str,
         present_uids: Iterable[Any] = (),
         display_name: Callable[[str], str] | None = None,
+        owner_uid: str | None = None,
     ) -> SharedRetrieval | None:
         """檢索場域共享摘要，透傳引擎 ``retrieve_shared``（唯讀，不持寫鎖）。
 
@@ -965,16 +1071,26 @@ class EchoMemoryAdapter:
         回傳 ``SharedRetrieval``（text 無項目時為空字串、ids 供回覆後 store 的
         ``shared_context_ids``）；引擎沒有此方法或失敗回 None。引擎端失敗會自行回
         degraded 的空結果，此時 ``degraded=True``。
+
+        ``owner_uid``：只回該成員的投影（指名查詢，``member_recall`` 用），此時 ``text``
+        可為空（引擎改依時間排序）。引擎簽名不認得 ``owner_uid`` 時回空結果——
+        不得退化成不篩選的全體查詢，否則會撈出別人的投影。
         """
         fn = getattr(self.engine, "retrieve_shared", None)
-        if fn is None or not text or not text.strip():
+        if fn is None or (owner_uid is None and (not text or not text.strip())):
             return None
+        kwargs: dict[str, Any] = {
+            "scope_id": scope_id,
+            "viewer_uid": viewer_uid,
+            "present_uids": tuple(present_uids),
+        }
+        if owner_uid is not None:
+            if "owner_uid" not in self._accepted_kwargs(fn, {"owner_uid": owner_uid}):
+                logger.warning("引擎 retrieve_shared 不支援 owner_uid，指名查詢回空")
+                return SharedRetrieval(scope_id=scope_id)
+            kwargs["owner_uid"] = owner_uid
         try:
-            result = await self._run(
-                lambda: fn(text, scope_id=scope_id, viewer_uid=viewer_uid,
-                           present_uids=tuple(present_uids)),
-                "read",
-            )
+            result = await self._run(lambda: fn(text or "", **kwargs), "read")
             rendered = result.to_text(display_name) if display_name else result.to_text()
             return SharedRetrieval(
                 text=rendered or "",
