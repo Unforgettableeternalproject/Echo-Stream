@@ -234,6 +234,7 @@ class VoiceChannel:
             turn_end_ts=now,
         )
         self._clear_turn()
+        self.turn_detector.reset()
         return segment
 
 
