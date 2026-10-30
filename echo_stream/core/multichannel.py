@@ -79,8 +79,11 @@ class TranscriberPool:
     * 同時執行數以 ``max_concurrency`` 限制（預設 1，GPU 不並行）。
     * ``job_timeout_s``（預設 None＝停用）：單一任務的牆鐘逾時。逾時就立刻釋放
       槽位給下一個任務，該任務以空結果（``timed_out=True``）完成、結果作廢。
-      建議值約 6.0；Whisper 偶發的解碼重試／重複迴圈可能卡 4–13 秒，不設就會
-      拖住後面所有聲道。轉錄跑在執行緒，Python 無法中止，逾時後那條執行緒仍會
+      Whisper 偶發的解碼重試／重複迴圈可能卡 4–13 秒，不設就會拖住後面所有聲道。
+      實際上限 = ``job_timeout_s + job_timeout_per_audio_s × 音訊秒數``，避免把
+      真的長段講話（實測有 30 秒、455 字）當成卡死丟掉；建議
+      ``job_timeout_s=4.0``、``job_timeout_per_audio_s=0.5``。per_audio 預設
+      0.0＝固定上限。轉錄跑在執行緒，Python 無法中止，逾時後那條執行緒仍會
       算完（GPU 仍在跑），此時最多同時 ``max_orphans``（預設 1）個「孤兒」；
       孤兒額滿時，再逾時的任務不放棄，照常等到完成，避免 GPU 上無限堆疊。
     * backend 若有 ``transcribe_for(speaker_id, pcm, sr)`` 就呼叫它
@@ -93,6 +96,7 @@ class TranscriberPool:
         *,
         max_concurrency: int = 1,
         job_timeout_s: float | None = None,
+        job_timeout_per_audio_s: float = 0.0,
         max_orphans: int = 1,
         clock: Callable[[], float] = time.perf_counter,
     ) -> None:
@@ -100,11 +104,14 @@ class TranscriberPool:
             raise ValueError("max_concurrency 必須 >= 1")
         if job_timeout_s is not None and job_timeout_s <= 0:
             raise ValueError("job_timeout_s 必須 > 0 或為 None")
+        if job_timeout_per_audio_s < 0:
+            raise ValueError("job_timeout_per_audio_s 必須 >= 0")
         if max_orphans < 0:
             raise ValueError("max_orphans 必須 >= 0")
         self.backend = backend
         self.max_concurrency = max_concurrency
         self.job_timeout_s = job_timeout_s
+        self.job_timeout_per_audio_s = job_timeout_per_audio_s
         self.max_orphans = max_orphans
         self.timeouts = 0
         self._orphans = 0
@@ -186,7 +193,9 @@ class TranscriberPool:
         self, speaker_id: str, job: _Job, fut: asyncio.Future, started: float
     ) -> Any:
         """等執行緒結果；逾時且孤兒額度有空就放棄它（回傳 ``_TIMED_OUT``）。"""
-        done, _ = await asyncio.wait({fut}, timeout=self.job_timeout_s)
+        audio_s = len(job.pcm) / 2 / max(1, job.sample_rate)
+        limit = (self.job_timeout_s or 0.0) + self.job_timeout_per_audio_s * audio_s
+        done, _ = await asyncio.wait({fut}, timeout=limit)
         if done:
             return fut.result()
         if self._orphans >= self.max_orphans:
@@ -198,9 +207,9 @@ class TranscriberPool:
         logger.warning(
             "轉錄逾時：speaker=%s 音訊=%.2fs 已耗時=%.2fs（上限 %.2fs），結果作廢並釋放槽位",
             speaker_id,
-            len(job.pcm) / 2 / max(1, job.sample_rate),
+            audio_s,
             elapsed,
-            self.job_timeout_s,
+            limit,
         )
         if not job.future.done():
             job.future.set_result(
@@ -368,6 +377,7 @@ class ChannelEngine:
         max_channels: int = 32,
         max_concurrency: int = 1,
         job_timeout_s: float | None = None,
+        job_timeout_per_audio_s: float = 0.0,
         tick_interval_s: float = 0.1,
         silence_fill_s: float = 0.1,
         clock: Callable[[], float] = time.perf_counter,
@@ -384,6 +394,7 @@ class ChannelEngine:
         self.max_channels = max_channels
         self.max_concurrency = max_concurrency
         self.job_timeout_s = job_timeout_s
+        self.job_timeout_per_audio_s = job_timeout_per_audio_s
         self.tick_interval_s = tick_interval_s
         self.silence_fill_s = silence_fill_s
         self._clock = clock
@@ -435,6 +446,7 @@ class ChannelEngine:
             self.backend,
             max_concurrency=self.max_concurrency,
             job_timeout_s=self.job_timeout_s,
+            job_timeout_per_audio_s=self.job_timeout_per_audio_s,
             clock=self._clock,
         )
         self._ticker = asyncio.ensure_future(self._tick_loop())

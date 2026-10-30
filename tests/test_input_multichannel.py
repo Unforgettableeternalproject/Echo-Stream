@@ -650,3 +650,27 @@ class TestTranscriberPoolTimeout:
 
         with pytest.raises(ValueError):
             TranscriberPool(_GateBackend(set()), job_timeout_s=0)
+
+    async def test_長音訊的上限依音訊長度縮放(self) -> None:
+        backend = _GateBackend(slow={1})
+        pool = TranscriberPool(backend, job_timeout_s=0.1, job_timeout_per_audio_s=0.2)
+        loop = asyncio.get_running_loop()
+        pcm = struct.pack("<h", 1) * (SR * 3)  # 3 秒 → 上限 0.1 + 0.2 × 3 = 0.7s
+        loop.call_later(0.3, backend.gate.set)  # 超過固定部分 0.1s，但未達 0.7s
+        result = await pool.run("A", pcm, SR)
+        assert result.timed_out is False
+        assert result.result.text == "1"
+        assert pool.timeouts == 0
+
+    async def test_縮放上限仍會逾時且_log_記實際上限(self, caplog) -> None:
+        backend = _GateBackend(slow={1})
+        pool = TranscriberPool(backend, job_timeout_s=0.1, job_timeout_per_audio_s=0.1)
+        try:
+            pcm = struct.pack("<h", 1) * (SR * 1)  # 上限 0.2s
+            with caplog.at_level("WARNING", logger="echo_stream.core.multichannel"):
+                result = await pool.run("A", pcm, SR)
+            assert result.timed_out is True
+            assert any("0.20s" in r.getMessage() for r in caplog.records)
+        finally:
+            backend.gate.set()
+            await asyncio.sleep(0.05)
