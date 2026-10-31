@@ -824,41 +824,42 @@ class EchoMemoryAdapter:
     # --- 關於我（撤回／退出／糾正）---
 
     @staticmethod
-    def _about_me_actor(context: dict[str, Any] | None) -> str | None:
-        """說話者本人的 uid（``about_me.actor_uid``，退回 ``member_recall.viewer_uid``）。"""
-        if not isinstance(context, dict):
-            return None
-        cfg = context.get("about_me")
-        legacy = context.get("member_recall")
-        actor = (cfg.get("actor_uid") if isinstance(cfg, dict) else None) or (
-            legacy.get("viewer_uid") if isinstance(legacy, dict) else None)
+    def _about_me_cfg(context: dict[str, Any] | None) -> dict[str, Any] | None:
+        """宿主明確提供的 ``context["about_me"]``；沒有（或型別不對）回 None。
+
+        fail-closed：不退回 ``member_recall`` 的 scope_id／viewer_uid／shared_adapter，
+        宿主沒有明確授權「關於我」就一律不動作。
+        """
+        cfg = context.get("about_me") if isinstance(context, dict) else None
+        return cfg if isinstance(cfg, dict) else None
+
+    @classmethod
+    def _about_me_actor(cls, context: dict[str, Any] | None) -> str | None:
+        """說話者本人的 uid，只取 ``about_me.actor_uid``；沒有 about_me 回 None。"""
+        cfg = cls._about_me_cfg(context)
+        actor = cfg.get("actor_uid") if cfg else None
         return str(actor) if actor else None
 
     def _about_me_scope(
         self, context: dict[str, Any] | None
     ) -> tuple[Any, str, str, str | None] | None:
-        """從 context 取 (target adapter, scope_id, actor_uid, session_id)；缺漏回 None。
+        """從 ``context["about_me"]`` 取 (target adapter, scope_id, actor_uid, session_id)。
 
-        優先讀 ``context["about_me"]``（``scope_id`` / ``actor_uid`` / ``session_id`` /
-        ``adapter``）；沒有時退回 ``member_recall`` 設定（``viewer_uid`` 即說話者本人）。
-        actor 只來自宿主，工具參數不得帶。
+        沒有 ``about_me``、或缺 ``scope_id`` / ``actor_uid`` 一律回 None（fail-closed，
+        不退回 ``member_recall`` 設定）。``adapter`` 缺省用 self。actor 只來自宿主，
+        工具參數不得帶。
 
         ``session_id`` 宜由宿主提供**說話者**的 session_id；沒給就傳 None，不回退
         ``target._session_id``（那是 scope adapter 的 session，不是說話者的）。
         """
-        if not isinstance(context, dict):
+        cfg = self._about_me_cfg(context)
+        if cfg is None:
             return None
-        cfg = context.get("about_me")
-        legacy = context.get("member_recall")
-        if not isinstance(cfg, dict):
-            cfg = {}
-        if not isinstance(legacy, dict):
-            legacy = {}
-        scope_id = cfg.get("scope_id") or legacy.get("scope_id")
-        actor_uid = cfg.get("actor_uid") or legacy.get("viewer_uid")
+        scope_id = cfg.get("scope_id")
+        actor_uid = cfg.get("actor_uid")
         if not (scope_id and actor_uid):
             return None
-        target = cfg.get("adapter") or legacy.get("shared_adapter") or self
+        target = cfg.get("adapter") or self
         return target, str(scope_id), str(actor_uid), cfg.get("session_id")
 
     @staticmethod

@@ -105,6 +105,12 @@ def _adapter(engine, tools=("member_recall",) + ABOUT_ME_TOOLS):
     return adapter
 
 
+def _mctx():
+    """member_recall 脈絡 + 明確的 about_me（actor 判定只看 about_me）。"""
+    return {"member_recall": {"scope_id": "scope-g1", "viewer_uid": "actor1"},
+            "about_me": {"scope_id": "scope-g1", "actor_uid": "actor1"}}
+
+
 def _ctx(refs=None, **about):
     cfg = {"scope_id": "scope-g1", "actor_uid": "actor1", "session_id": "sess1"}
     cfg.update(about)
@@ -264,11 +270,29 @@ async def test_脈絡缺漏_不碰引擎(context):
     assert out == {"success": False, "result": ABOUT_NO_CONTEXT} and eng.calls3 == []
 
 
-async def test_脈絡退回member_recall設定的viewer_uid():
+async def test_沒有about_me_不退回member_recall設定_fail_closed():
     eng = _AboutEngine()
-    ctx = {"member_recall": {"scope_id": "scope-g9", "viewer_uid": "v9"}}
-    await _adapter(eng).execute_tool("opt_out_about_me", {"enabled": True}, context=ctx)
-    assert eng.calls3 == [("opt_out", "scope-g9", "v9", True)]
+    ctx = {"member_recall": {"scope_id": "scope-g9", "viewer_uid": "v9"},
+           "about_refs": {1: "proj-a"}}
+    adapter = _adapter(eng)
+    for tool, args in (("opt_out_about_me", {"enabled": True}),
+                       ("retract_about_me", {"ref": 1}),
+                       ("correct_about_me", {"ref": 1, "correction_text": "x"})):
+        out = await adapter.execute_tool(tool, args, context=ctx)
+        assert out == {"success": False, "result": ABOUT_NO_CONTEXT}
+    assert eng.calls3 == []
+
+
+async def test_member_recall沒有about_me_不登記refs():
+    ctx = {"member_recall": {"scope_id": "scope-g1", "viewer_uid": "actor1"}}
+    await _adapter(_AboutEngine()).execute_tool("member_recall", {"member": "本人"}, context=ctx)
+    assert "about_refs" not in ctx
+
+
+async def test_adapter缺省用self():
+    eng = _AboutEngine()
+    await _adapter(eng).execute_tool("opt_out_about_me", {"enabled": True}, context=_ctx())
+    assert eng.calls3 == [("opt_out", "scope-g1", "actor1", True)]
 
 
 async def test_工具參數塞uid無效_actor仍取自context():
@@ -324,7 +348,7 @@ async def test_舊版SharedContext沒有about_refs_得空dict():
 async def test_member_recall登記about_refs到context_再撤回():
     eng = _AboutEngine()
     adapter = _adapter(eng)
-    ctx = {"member_recall": {"scope_id": "scope-g1", "viewer_uid": "actor1"}}
+    ctx = _mctx()
     out = await adapter.execute_tool("member_recall", {"member": "本人"}, context=ctx)
     assert "〔旁證1〕" in out["result"]
     assert ctx["about_refs"] == {1: "proj-a", 2: "proj-b"}
@@ -336,7 +360,7 @@ async def test_member_recall登記about_refs到context_再撤回():
 async def test_member_recall舊SharedContext_不登記refs_撤回被拒():
     eng = _AboutEngine(_NoRefShared())
     adapter = _adapter(eng)
-    ctx = {"member_recall": {"scope_id": "scope-g1", "viewer_uid": "actor1"}}
+    ctx = _mctx()
     await adapter.execute_tool("member_recall", {"member": "本人"}, context=ctx)
     assert ctx["about_refs"] == {}
     out = await adapter.execute_tool("retract_about_me", {"ref": 1}, context=ctx)
@@ -349,7 +373,7 @@ async def test_截斷時只登記LLM看得到的旁證編號_ids與行數不變(
     eng = _AboutEngine(_RefShared(items, refs))
     adapter = _adapter(eng)
     adapter.tool_max_chars = 120
-    ctx = {"member_recall": {"scope_id": "scope-g1", "viewer_uid": "actor1"}}
+    ctx = _mctx()
     out = await adapter.execute_tool("member_recall", {"member": "本人"}, context=ctx)
     complete = out["result"].split(chr(10))[:-1]
     shown = [n for n in refs if any(f"〔旁證{n}〕" in ln for ln in complete)]
@@ -362,7 +386,7 @@ async def test_截斷時只登記LLM看得到的旁證編號_ids與行數不變(
 async def test_先查本人再查別人_refs保持本人那份():
     eng = _AboutEngine()
     adapter = _adapter(eng)
-    ctx = {"member_recall": {"scope_id": "scope-g1", "viewer_uid": "actor1"}}
+    ctx = _mctx()
     await adapter.execute_tool("member_recall", {"member": "本人"}, context=ctx)
     mine = dict(ctx["about_refs"])
     assert mine == {1: "proj-a", 2: "proj-b"}
@@ -374,7 +398,7 @@ async def test_先查本人再查別人_refs保持本人那份():
 async def test_查本人兩次_後者整份覆蓋前者():
     eng = _AboutEngine()
     adapter = _adapter(eng)
-    ctx = {"member_recall": {"scope_id": "scope-g1", "viewer_uid": "actor1"}}
+    ctx = _mctx()
     await adapter.execute_tool("member_recall", {"member": "本人"}, context=ctx)
     eng.shared = _RefShared([_Item("q1")], {1: "proj-new"})
     await adapter.execute_tool("member_recall", {"member": "本人"}, context=ctx)
@@ -382,7 +406,7 @@ async def test_查本人兩次_後者整份覆蓋前者():
 
 
 async def test_只查別人_不建立about_refs():
-    ctx = {"member_recall": {"scope_id": "scope-g1", "viewer_uid": "actor1"}}
+    ctx = _mctx()
     await _adapter(_AboutEngine()).execute_tool(
         "member_recall", {"member": "別人"}, context=ctx)
     assert "about_refs" not in ctx
