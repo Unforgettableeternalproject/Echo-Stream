@@ -413,3 +413,36 @@ async def test_糾正_沒有evidence_傳None():
         "correct_about_me", {"ref": 1, "correction_text": "x", "evidence": [1]},
         context=_ctx({1: "proj-a"}))
     assert eng.calls3[0][5] is None
+
+
+async def test_糾正_already_hidden且correction_stored為False_仍要求重送():
+    eng = _AboutEngine()
+    eng.correct_result = {"ok": True, "reason": "already_hidden", "projection_id": "proj-a",
+                          "correction_stored": False, "episode_id": None}
+    out = await _adapter(eng).execute_tool(
+        "correct_about_me", {"ref": 1, "correction_text": "x"}, context=_ctx({1: "proj-a"}))
+    assert "未保存" in out["result"] and "重送" in out["result"]
+
+
+@pytest.mark.parametrize("ref,expected", [
+    (1, "proj-a"), (1.0, "proj-a"), ("2", "proj-b"), (" 2 ", "proj-b"),
+    (True, None), (False, None), (1.9, None), ("1.0", None), ("-1", None),
+    ("一", None), ("１", None), ([1], None), ({}, None),
+])
+async def test_ref解析(ref, expected):
+    eng = _AboutEngine()
+    out = await _adapter(eng).execute_tool(
+        "retract_about_me", {"ref": ref}, context=_ctx({1: "proj-a", 2: "proj-b"}))
+    if expected is None:
+        assert out == {"success": False, "result": ABOUT_BAD_REF} and eng.calls3 == []
+    else:
+        assert eng.calls3[0][3] == expected
+
+
+async def test_糾正_宿主沒給session_id_傳None_不回退adapter的session():
+    eng = _AboutEngine()
+    adapter = _adapter(eng)
+    adapter._session_id = "scope-adapter-session"
+    ctx = {"about_me": {"scope_id": "scope-g1", "actor_uid": "actor1"}, "about_refs": {1: "proj-a"}}
+    await adapter.execute_tool("correct_about_me", {"ref": 1, "correction_text": "x"}, context=ctx)
+    assert eng.calls3[0][6] is None

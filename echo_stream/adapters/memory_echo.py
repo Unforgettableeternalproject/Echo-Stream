@@ -184,6 +184,21 @@ def _declares_param(fn: Any, name: str) -> bool:
         inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
 
 
+def _parse_ref(raw: Any) -> int | None:
+    """旁證編號：整數、整數值的 float（1.0）、純整數字串可接受；bool 與其他一律 None。"""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, float):
+        return int(raw) if raw.is_integer() else None
+    if isinstance(raw, str):
+        text = raw.strip()
+        if text.isascii() and text.isdigit():
+            return int(text)
+    return None
+
+
 def _parse_top_n(raw: Any) -> int:
     """解析常玩筆數設定；非數字或負數一律視為停用（0）。"""
     try:
@@ -827,6 +842,9 @@ class EchoMemoryAdapter:
         優先讀 ``context["about_me"]``（``scope_id`` / ``actor_uid`` / ``session_id`` /
         ``adapter``）；沒有時退回 ``member_recall`` 設定（``viewer_uid`` 即說話者本人）。
         actor 只來自宿主，工具參數不得帶。
+
+        ``session_id`` 宜由宿主提供**說話者**的 session_id；沒給就傳 None，不回退
+        ``target._session_id``（那是 scope adapter 的 session，不是說話者的）。
         """
         if not isinstance(context, dict):
             return None
@@ -865,9 +883,8 @@ class EchoMemoryAdapter:
             refs = context.get("about_refs") if isinstance(context, dict) else None
             if not refs:
                 return {"success": False, "result": ABOUT_NO_REF}
-            try:
-                ref = int(args.get("ref"))
-            except (TypeError, ValueError):
+            ref = _parse_ref(args.get("ref"))
+            if ref is None:
                 return {"success": False, "result": ABOUT_BAD_REF}
             projection_id = refs.get(ref) or ""
             if not projection_id:
@@ -886,7 +903,7 @@ class EchoMemoryAdapter:
             res = await target.correct_about_me(
                 scope_id, actor_uid, projection_id, text,
                 evidence=self._about_me_evidence(context),
-                session_id=session_id or getattr(target, "_session_id", None),
+                session_id=session_id,
             )
         return {"success": bool(res and res.get("ok")), "result": self._about_me_text(name, res)}
 
@@ -898,6 +915,10 @@ class EchoMemoryAdapter:
         reason = str(res.get("reason") or "")
         if not res.get("ok"):
             return f"被拒絕或失敗（原因：{reason or '未註明'}），沒有任何變更。"
+        if name == CORRECT_ABOUT_ME and res.get("correction_stored") is False:
+            # 優先於 already_hidden：遮蔽已生效但內容沒存，必須請使用者重送
+            return ("那條旁證已遮蔽，但更正內容未保存，需要請使用者重送一次更正；"
+                    "只影響之後的檢索。")
         if reason in ABOUT_REASON_TEXT:
             return ABOUT_REASON_TEXT[reason]
         if name == OPT_OUT_ABOUT_ME:
@@ -906,9 +927,6 @@ class EchoMemoryAdapter:
                         "都不會再出現；只影響之後的檢索。")
             return "已恢復：之後的檢索可再包含關於使用者的內容。"
         if name == CORRECT_ABOUT_ME:
-            if res.get("correction_stored") is False:
-                return ("那條旁證已遮蔽，但更正內容未保存，需要請使用者重送一次更正；"
-                        "只影響之後的檢索。")
             return "那條旁證已遮蔽，使用者的更正已保存；只影響之後的檢索。"
         return "已撤回那條旁證；只影響之後的檢索。"
 
