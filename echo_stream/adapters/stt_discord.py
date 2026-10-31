@@ -45,9 +45,17 @@ _HALLUCINATION_CONTAINS = [
     "請不吝點贊訂閱", "請不吝點贊", "點贊訂閱轉發", "訂閱我的頻道", "訂閱頻道", "订阅我的频道",
     "字幕由", "字幕提供", "詞曲李宗盛", "詞曲 李宗盛", "可能夾雜英文詞彙", "以下是繁體中文的對話",
     "字幕志愿者", "字幕志願者", "amara.org", "明鏡與點點欄目",
-    "thank you for watching", "please subscribe", "subtitles by", "subscribe to my channel",
+    "thank you for watching", "thanks for listening", "thank you for listening",
+    "please subscribe", "subtitles by", "subscribe to my channel",
     "感謝您的觀看", "感谢您的观看", "謝謝收看", "謝謝你的觀看",
 ]
+# 結尾／短段英文套語（Whisper 對靜音或雜音的典型幻聽）。「See you later」這類使用者也會真的說，
+# 所以不能無條件擋：必須同時「短音訊 + 低 avg_logprob」才算（outro_hallucination）。
+# 10/31 實測樣本（約 2200 段）：真實道別多落在 avg_logprob >= -0.55，幻聽套語落在 -0.6～-1.1
+_HALLUCINATION_OUTRO = {
+    "theend", "haveagoodday", "haveagoodone", "seeyoulater", "seeyoulate", "seeyousoon",
+    "seeyounexttime", "seeyouinthenextvideo", "seeyouinthenextone",
+}
 _NORMALIZE_RE = re.compile(r"[\W_]+", re.UNICODE)
 _TRAD_SIMP_SHARED = set("才回只台吃托后里干")  # 繁簡同形，不能當簡體判斷依據
 _CJK_RE = re.compile(r"[一-鿿]")
@@ -115,6 +123,19 @@ def is_hallucination(text: str) -> str | None:
     for p in _HALLUCINATION_CONTAINS:
         if _normalize_text(p) in norm:
             return f"contains:{p}"
+    return None
+
+
+def outro_hallucination(
+    text: str, avg_logprob: float | None, duration_s: float,
+    max_logprob: float, max_duration_s: float,
+) -> str | None:
+    """短段 + 低信心 + 命中結尾套語才回傳原因。欄位拿不到（None）時保守放行。"""
+    if avg_logprob is None or avg_logprob > max_logprob or duration_s > max_duration_s:
+        return None
+    norm = _normalize_text(text)
+    if norm in _HALLUCINATION_OUTRO:
+        return f"outro:{norm}"
     return None
 
 
@@ -212,6 +233,10 @@ class DiscordSttProfile:
     filter_credits: bool = True
     clean_garbage: bool = True
     filter_hallucination: bool = True
+    # 結尾套語（The end / Have a good day / See you later…）：短音訊 + 低 avg_logprob 才擋
+    filter_outro: bool = True
+    outro_max_logprob: float = -0.6
+    outro_max_duration_s: float = 1.5
     # 模型來源：None = 走 echo_stt 引擎預載模型；有路徑 = faster_whisper 載自訂模型（如 Breeze）
     model_path: str | None = None
     compute_type: str = "int8_float16"
@@ -488,6 +513,11 @@ class DiscordTranscriberBackend:
                 reasons.append("compression_ratio")
             if p.filter_credits and credit_hallucination(text):
                 reasons.append("credit")
+            if p.filter_outro and outro_hallucination(
+                text, seg.avg_logprob, seg.end - seg.start,
+                p.outro_max_logprob, p.outro_max_duration_s,
+            ):
+                reasons.append("outro")
             if prompt and prompt_leak_reason(text, prompt, seg.end - seg.start):
                 reasons.append("prompt_leak")
             if hotword_leak_reason(text, hotwords):
@@ -638,5 +668,6 @@ __all__ = [
     "english_guard_reason",
     "hotword_leak_reason",
     "is_hallucination",
+    "outro_hallucination",
     "prompt_leak_reason",
 ]

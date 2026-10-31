@@ -225,6 +225,52 @@ def test_hallucination_blacklist_dropped(text):
     assert _backend(_model(text)).transcribe(_pcm(), 16000) is None
 
 
+@pytest.mark.parametrize("text", ["Thanks for listening.", "Thank you for listening!"])
+def test_listening_outro_dropped_ungated(text):
+    assert sd.is_hallucination(text)
+
+
+@pytest.mark.parametrize(
+    "text", ["See you later.", "See you late", "Have a good day.", "The end.", "See you next time!"]
+)
+def test_outro_dropped_when_short_and_low_logprob(text):
+    assert _backend(_model(text, lp=-0.8, end=0.8)).transcribe(_pcm(), 16000) is None
+
+
+@pytest.mark.parametrize(
+    "text, lp, end",
+    [
+        ("See you later.", -0.4, 0.8),  # 信心夠高：使用者真的在道別
+        ("See you later.", -0.8, 2.5),  # 太長：不是典型短幻聽
+        ("OK, see you.", -0.9, 0.8),  # 非套語
+        ("Sorry", -0.9, 0.6),  # 短而低信心但不是套語
+        ("好, bye", -0.9, 0.6),  # 中英混合不屬於套語
+    ],
+)
+def test_outro_filter_does_not_kill_real_speech(text, lp, end):
+    assert sd.outro_hallucination(text, lp, end, -0.6, 1.5) is None
+    b = _backend(_model(text, lp=lp, end=end), filter_hallucination=False)
+    assert b.transcribe(_pcm(), 16000) is not None
+
+
+def test_outro_filter_tail_segment_only():
+    # 中文本體保留，只丟掉結尾那段低信心套語
+    m = _FakeModel(
+        _Seg("我先去睡了", lp=-0.3, end=1.0), _Seg("Have a good day.", lp=-0.9, start=1.0, end=1.6)
+    )
+    r = _backend(m).transcribe(_pcm(), 16000)
+    assert r is not None and r.text == "我先去睡了"
+
+
+def test_outro_filter_missing_logprob_is_conservative():
+    assert sd.outro_hallucination("The end.", None, 0.5, -0.6, 1.5) is None
+
+
+def test_outro_filter_can_be_disabled():
+    b = _backend(_model("The end.", lp=-0.9, end=0.8), filter_outro=False)
+    assert b.transcribe(_pcm(), 16000) is not None
+
+
 def test_hallucination_filter_exact_not_substring():
     assert sd.is_hallucination("謝謝你幫我修好電腦") is None
     assert _backend(_model("謝謝你幫我修好電腦")).transcribe(_pcm(), 16000) is not None
