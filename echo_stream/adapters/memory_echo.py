@@ -97,6 +97,74 @@ MEMBER_RECALL_SCHEMA = {
 }
 """member_recall 不在 echo_memory 的 TOOL_DECLARATIONS 裡，由 ES 自帶 schema。
 預設不開（DEFAULT_TOOLS 不含它），由宿主在 ECHO_STREAM_MEMORY_TOOLS 加上。"""
+RETRACT_ABOUT_ME = "retract_about_me"
+OPT_OUT_ABOUT_ME = "opt_out_about_me"
+CORRECT_ABOUT_ME = "correct_about_me"
+ABOUT_ME_TOOLS = (RETRACT_ABOUT_ME, OPT_OUT_ABOUT_ME, CORRECT_ABOUT_ME)
+"""「關於我」自助工具：對象永遠是說話的人本人（actor 由宿主經 context 傳入，參數不得帶 uid）。
+全部預設不開（DEFAULT_TOOLS 不含），要在 ECHO_STREAM_MEMORY_TOOLS 明列才曝光。"""
+ABOUT_ME_REF_DESCRIPTION = (
+    "要處理的旁證編號 N（member_recall 結果中「〔旁證N〕」那行的數字）。"
+)
+RETRACT_ABOUT_ME_SCHEMA = {
+    "name": RETRACT_ABOUT_ME,
+    "description": (
+        "當使用者明確要求撤回「別人說的關於他自己」的某一條旁證時呼叫（例如「那句別人說我的話，"
+        "請不要再提」）。ref 填 member_recall 結果裡該行的旁證編號。只影響之後的檢索，"
+        "不會改寫既有回覆。使用者沒有明確要求就不要呼叫。"
+        "Call only when the user explicitly asks to retract one statement others made about them."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {"ref": {"type": "integer", "description": ABOUT_ME_REF_DESCRIPTION}},
+        "required": ["ref"],
+    },
+}
+OPT_OUT_ABOUT_ME_SCHEMA = {
+    "name": OPT_OUT_ABOUT_ME,
+    "description": (
+        "當使用者明確要求「不要再在伺服器裡被提起／被查詢」，或要求恢復時呼叫。"
+        "enabled=true 為退出（之後其他人查詢時，關於他的旁證與「最近在玩」那行都不再出現），"
+        "false 為恢復。只影響之後的檢索。使用者沒有明確要求就不要呼叫。"
+        "Call only on an explicit request to opt out of (or back into) being surfaced to others."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "enabled": {"type": "boolean", "description": "true 退出；false 恢復。"},
+        },
+        "required": ["enabled"],
+    },
+}
+CORRECT_ABOUT_ME_SCHEMA = {
+    "name": CORRECT_ABOUT_ME,
+    "description": (
+        "當使用者明確指出「別人說我的某條旁證不對」並說出正確說法時呼叫：該條旁證立即被遮蔽，"
+        "並把使用者的更正存下。ref 填旁證編號，correction_text 用使用者自己的話寫出更正內容。"
+        "只影響之後的檢索。使用者沒有明確更正就不要呼叫。"
+        "Call only when the user explicitly says a statement others made about them is wrong."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "ref": {"type": "integer", "description": ABOUT_ME_REF_DESCRIPTION},
+            "correction_text": {"type": "string", "description": "使用者提供的更正內容。"},
+        },
+        "required": ["ref", "correction_text"],
+    },
+}
+ABOUT_ME_SCHEMAS = {
+    RETRACT_ABOUT_ME: RETRACT_ABOUT_ME_SCHEMA,
+    OPT_OUT_ABOUT_ME: OPT_OUT_ABOUT_ME_SCHEMA,
+    CORRECT_ABOUT_ME: CORRECT_ABOUT_ME_SCHEMA,
+}
+ABOUT_UNSUPPORTED = "目前記憶引擎不支援這個操作。"
+ABOUT_NO_CONTEXT = "目前無法確認你的身分或所在場域，無法處理。"
+ABOUT_NO_REF = "目前無法指定對象，請先查詢相關內容再試。"
+ABOUT_BAD_REF = "找不到這個編號對應的內容，請先查詢相關內容再試。"
+ABOUT_REASON_TEXT = {
+    "already_hidden": "這條內容先前已經處理過了。",
+}
 MEMBER_NOT_FOUND = "無法確認是哪位成員。"
 MEMBER_NAME_MAX_CHARS = 40
 ASSESS_MODES = ("llm", "heuristic", "off")
@@ -260,6 +328,21 @@ class SharedRetrieval:
     scope_id: str = ""
     degraded: bool = False
     degraded_reason: str = ""
+    about_refs: dict[int, str] = field(default_factory=dict)
+    """旁證編號 N -> projection_id（引擎 ``SharedContext.about_refs()``；舊引擎為空）。"""
+
+
+def _extract_about_refs(result: Any) -> dict[int, str]:
+    """取 ``result.about_refs()``；不存在或失敗回空 dict（不猜 id）。"""
+    fn = getattr(result, "about_refs", None)
+    if not callable(fn):
+        return {}
+    try:
+        raw = fn()
+        return {int(k): str(v) for k, v in dict(raw).items()}
+    except Exception as exc:  # noqa: BLE001 - 編號只是加分項
+        logger.warning("about_refs 取得失敗，略過：%s: %s", type(exc).__name__, exc)
+        return {}
 
 
 def _rendered_ids(result: Any) -> list[str]:
@@ -570,6 +653,7 @@ class EchoMemoryAdapter:
             TOOL_DECLARATIONS = []
         known = {d["name"]: d for d in TOOL_DECLARATIONS}
         known[MEMBER_RECALL] = MEMBER_RECALL_SCHEMA
+        known.update(ABOUT_ME_SCHEMAS)
         out = []
         for name in self.enabled_tools:
             if name == MEMBER_RECALL and self.member_resolver is None:
@@ -615,6 +699,8 @@ class EchoMemoryAdapter:
             return {"success": False, "result": f"Tool {name!r} is not available."}
         if name == MEMBER_RECALL:
             return await self._member_recall(args, context)
+        if name in ABOUT_ME_TOOLS:
+            return await self._about_me_tool(name, args, context)
 
         def _work() -> dict[str, Any]:
             outcome = self.tool_executor.execute(name, dict(args))
@@ -695,19 +781,156 @@ class EchoMemoryAdapter:
             f"「提到〈…〉」的是其他成員的說法，與本人說法不同時以本人為準：\n{result.text}"
         )
         visible = list(result.ids)
+        complete_text = text  # 旁證編號只認完整的行；被截斷的半行不登記
         if len(text) > self.tool_max_chars:
             cut = text[: self.tool_max_chars]
             # 渲染格式是一項一行（"- " 開頭）；行數對不上 ids 就不登記，寧缺勿濫
             full_items = sum(1 for ln in text.split("\n") if ln.startswith("- "))
             seen = sum(1 for ln in cut.split("\n")[:-1] if ln.startswith("- "))
             visible = visible[:seen] if full_items == len(visible) else []
+            complete_text = "\n".join(cut.split("\n")[:-1])
             text = cut + "…"
+        if isinstance(context, dict) and result.about_refs:
+            # 只登記 LLM 實際看得到的旁證編號（截斷後仍在文字中的）
+            refs = context.setdefault("about_refs", {})
+            for n, pid in result.about_refs.items():
+                if f"〔旁證{n}〕" in complete_text:
+                    refs[n] = pid
         if isinstance(context, dict):
             bucket = context.setdefault("member_recall_ids", [])
             for pid in visible:
                 if pid not in bucket:
                     bucket.append(pid)
         return {"success": True, "result": text}
+
+    # --- 關於我（撤回／退出／糾正）---
+
+    def _about_me_scope(
+        self, context: dict[str, Any] | None
+    ) -> tuple[Any, str, str, str | None] | None:
+        """從 context 取 (target adapter, scope_id, actor_uid, session_id)；缺漏回 None。
+
+        優先讀 ``context["about_me"]``（``scope_id`` / ``actor_uid`` / ``session_id`` /
+        ``adapter``）；沒有時退回 ``member_recall`` 設定（``viewer_uid`` 即說話者本人）。
+        actor 只來自宿主，工具參數不得帶。
+        """
+        if not isinstance(context, dict):
+            return None
+        cfg = context.get("about_me")
+        legacy = context.get("member_recall")
+        if not isinstance(cfg, dict):
+            cfg = {}
+        if not isinstance(legacy, dict):
+            legacy = {}
+        scope_id = cfg.get("scope_id") or legacy.get("scope_id")
+        actor_uid = cfg.get("actor_uid") or legacy.get("viewer_uid")
+        if not (scope_id and actor_uid):
+            return None
+        target = cfg.get("adapter") or legacy.get("shared_adapter") or self
+        return target, str(scope_id), str(actor_uid), cfg.get("session_id")
+
+    async def _about_me_tool(
+        self, name: str, args: dict[str, Any], context: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        """三個「關於我」工具的共用入口：驗脈絡、轉 ref、呼叫引擎、翻成 LLM 讀的文字。"""
+        scope = self._about_me_scope(context)
+        if scope is None:
+            return {"success": False, "result": ABOUT_NO_CONTEXT}
+        target, scope_id, actor_uid, session_id = scope
+        projection_id = ""
+        if name != OPT_OUT_ABOUT_ME:
+            refs = context.get("about_refs") if isinstance(context, dict) else None
+            if not refs:
+                return {"success": False, "result": ABOUT_NO_REF}
+            try:
+                ref = int(args.get("ref"))
+            except (TypeError, ValueError):
+                return {"success": False, "result": ABOUT_BAD_REF}
+            projection_id = refs.get(ref) or ""
+            if not projection_id:
+                return {"success": False, "result": ABOUT_BAD_REF}
+        if name == RETRACT_ABOUT_ME:
+            res = await target.retract_about_me(scope_id, actor_uid, projection_id)
+        elif name == OPT_OUT_ABOUT_ME:
+            enabled = args.get("enabled")
+            if not isinstance(enabled, bool):
+                return {"success": False, "result": "enabled 必須是 true 或 false。"}
+            res = await target.opt_out_about_me(scope_id, actor_uid, enabled)
+        else:
+            text = str(args.get("correction_text") or "").strip()
+            if not text:
+                return {"success": False, "result": "更正內容是空的，請使用者說出正確的說法。"}
+            res = await target.correct_about_me(
+                scope_id, actor_uid, projection_id, text,
+                session_id=session_id or getattr(target, "_session_id", None),
+            )
+        return {"success": bool(res and res.get("ok")), "result": self._about_me_text(name, res)}
+
+    @staticmethod
+    def _about_me_text(name: str, res: dict[str, Any] | None) -> str:
+        """引擎結果 -> 給 LLM 的文字：分辨不支援／被拒絕（帶 reason）／成功。"""
+        if res is None:
+            return ABOUT_UNSUPPORTED
+        reason = str(res.get("reason") or "")
+        if not res.get("ok"):
+            return f"被拒絕或失敗（原因：{reason or '未註明'}），沒有任何變更。"
+        if reason in ABOUT_REASON_TEXT:
+            return ABOUT_REASON_TEXT[reason]
+        if name == OPT_OUT_ABOUT_ME:
+            if res.get("enabled"):
+                return ("已設定退出：之後其他人查詢時，關於使用者的內容（含「最近在玩」）"
+                        "都不會再出現；只影響之後的檢索。")
+            return "已恢復：之後的檢索可再包含關於使用者的內容。"
+        if name == CORRECT_ABOUT_ME:
+            if res.get("correction_stored") is False:
+                return ("那條旁證已遮蔽，但更正內容未保存，需要請使用者重送一次更正；"
+                        "只影響之後的檢索。")
+            return "那條旁證已遮蔽，使用者的更正已保存；只影響之後的檢索。"
+        return "已撤回那條旁證；只影響之後的檢索。"
+
+    async def _about_call(self, method: str, *args: Any, **kwargs: Any) -> dict[str, Any] | None:
+        """呼叫 scope engine 的同步方法（寫入路徑，丟 thread）。
+
+        引擎沒這個方法回 None（= 不支援）；引擎丟例外回 ``ok=False`` 的 dict，
+        reason 為 ``engine_error``，與「不支援」區分。引擎回的 dict 原樣保留。
+        """
+        fn = getattr(self.engine, method, None)
+        if fn is None:
+            return None
+        try:
+            res = await self._run(lambda: fn(*args, **kwargs), "write")
+        except Exception as exc:  # noqa: BLE001 - 失敗要讓 LLM 知道沒成功
+            logger.warning("%s 失敗：%s: %s", method, type(exc).__name__, exc)
+            return {"ok": False, "reason": "engine_error"}
+        return res if isinstance(res, dict) else {"ok": False, "reason": "bad_result"}
+
+    async def retract_about_me(
+        self, scope_id: str, actor_uid: str, projection_id: str
+    ) -> dict[str, Any] | None:
+        """撤回一條關於 actor 的旁證投影。回引擎 dict；引擎不支援回 None。"""
+        return await self._about_call("retract_about_me", scope_id, actor_uid, projection_id)
+
+    async def opt_out_about_me(
+        self, scope_id: str, actor_uid: str, enabled: bool
+    ) -> dict[str, Any] | None:
+        """設定／解除 actor 的退出旗標。回引擎 dict；引擎不支援回 None。"""
+        return await self._about_call("opt_out_about_me", scope_id, actor_uid, enabled)
+
+    async def correct_about_me(
+        self,
+        scope_id: str,
+        actor_uid: str,
+        projection_id: str,
+        correction_text: str,
+        *,
+        evidence: Any = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """遮蔽一條旁證並存下 actor 的更正。回引擎 dict；引擎不支援回 None。"""
+        return await self._about_call(
+            "correct_about_me", scope_id, actor_uid, projection_id, correction_text,
+            evidence=evidence, session_id=session_id,
+        )
 
     # --- 管線介面 ---
 
@@ -1147,6 +1370,7 @@ class EchoMemoryAdapter:
                 scope_id=getattr(result, "scope_id", scope_id),
                 degraded=bool(getattr(result, "degraded", False)),
                 degraded_reason=str(getattr(result, "degraded_reason", "") or ""),
+                about_refs=_extract_about_refs(result),
             )
         except Exception as exc:  # noqa: BLE001 - 共享脈絡是加分項
             logger.warning("retrieve_shared 失敗，略過：%s: %s", type(exc).__name__, exc)

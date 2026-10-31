@@ -125,16 +125,30 @@ MEMBER_RECALL_RULE = (
 （保護 prompt cache）。文案只教選哪個工具，不含任何記憶斷言。"""
 
 
+ABOUT_ME_RULE = (
+    "- 使用者**明確要求**撤回／更正別人說他的某條旁證（`member_recall` 結果中「〔旁證N〕」那行）"
+    "→ `retract_about_me` / `correct_about_me`（ref 填 N）；明確要求不再被提起（含「最近在玩」）"
+    "或恢復 → `opt_out_about_me`。沒有明確要求不要呼叫；效果只對之後的檢索生效。"
+)
+"""任一「關於我」工具曝光時才加進 TOOLS_PROMPT；未曝光時 prompt 不變（保護 prompt cache）。"""
+
+
 def build_tools_prompt(tool_names: Any = ()) -> str:
     """依實際曝光的工具組裝 TOOLS_PROMPT；同一組工具產出完全相同的字串（與順序無關）。
 
     ``member_recall`` 不在曝光清單時回傳原 ``TOOLS_PROMPT``；在時把
     :data:`MEMBER_RECALL_RULE` 接在規則清單最後、結尾提醒之前。
     """
-    if "member_recall" not in set(tool_names):
+    names = set(tool_names)
+    rules = []
+    if "member_recall" in names:
+        rules.append(MEMBER_RECALL_RULE)
+    if names & {"retract_about_me", "opt_out_about_me", "correct_about_me"}:
+        rules.append(ABOUT_ME_RULE)
+    if not rules:
         return TOOLS_PROMPT
     head, tail = TOOLS_PROMPT.rsplit("\n\n", 1)
-    return f"{head}\n{MEMBER_RECALL_RULE}\n\n{tail}"
+    return f"{head}\n" + "\n".join(rules) + f"\n\n{tail}"
 
 
 TOOL_LEAD_IN_PROMPT = """## 查詢前的開場
@@ -1291,6 +1305,7 @@ __all__ = [
     "DEFAULT_TOOL_FILLER",
     "TOOLS_PROMPT",
     "MEMBER_RECALL_RULE",
+    "ABOUT_ME_RULE",
     "build_tools_prompt",
     "TOOL_LEAD_IN_PROMPT",
     "TOOL_LEAD_IN_MODES",
