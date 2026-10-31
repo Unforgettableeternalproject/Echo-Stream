@@ -105,6 +105,7 @@ ABOUT_ME_TOOLS = (RETRACT_ABOUT_ME, OPT_OUT_ABOUT_ME, CORRECT_ABOUT_ME)
 全部預設不開（DEFAULT_TOOLS 不含），要在 ECHO_STREAM_MEMORY_TOOLS 明列才曝光。"""
 ABOUT_ME_REF_DESCRIPTION = (
     "要處理的旁證編號 N（member_recall 結果中「〔旁證N〕」那行的數字）。"
+    "只能指定你本人那次查詢（查詢對象是目前說話的人）結果裡的旁證；查別人的結果沒有可用編號。"
 )
 RETRACT_ABOUT_ME_SCHEMA = {
     "name": RETRACT_ABOUT_ME,
@@ -790,12 +791,14 @@ class EchoMemoryAdapter:
             visible = visible[:seen] if full_items == len(visible) else []
             complete_text = "\n".join(cut.split("\n")[:-1])
             text = cut + "…"
-        if isinstance(context, dict) and result.about_refs:
-            # 只登記 LLM 實際看得到的旁證編號（截斷後仍在文字中的）
-            refs = context.setdefault("about_refs", {})
-            for n, pid in result.about_refs.items():
-                if f"〔旁證{n}〕" in complete_text:
-                    refs[n] = pid
+        if isinstance(context, dict) and owner_uid == self._about_me_actor(context):
+            # 旁證編號每個 SharedContext 都從 1 開始，且只有指名查詢本人時才渲染旁證：
+            # 只在查本人時整份覆蓋（不合併、不留舊份），查別人完全不動。
+            # 只登記 LLM 實際看得到的旁證編號（截斷後仍在完整行中的）。
+            context["about_refs"] = {
+                n: pid for n, pid in result.about_refs.items()
+                if f"〔旁證{n}〕" in complete_text
+            }
         if isinstance(context, dict):
             bucket = context.setdefault("member_recall_ids", [])
             for pid in visible:
@@ -804,6 +807,17 @@ class EchoMemoryAdapter:
         return {"success": True, "result": text}
 
     # --- 關於我（撤回／退出／糾正）---
+
+    @staticmethod
+    def _about_me_actor(context: dict[str, Any] | None) -> str | None:
+        """說話者本人的 uid（``about_me.actor_uid``，退回 ``member_recall.viewer_uid``）。"""
+        if not isinstance(context, dict):
+            return None
+        cfg = context.get("about_me")
+        legacy = context.get("member_recall")
+        actor = (cfg.get("actor_uid") if isinstance(cfg, dict) else None) or (
+            legacy.get("viewer_uid") if isinstance(legacy, dict) else None)
+        return str(actor) if actor else None
 
     def _about_me_scope(
         self, context: dict[str, Any] | None
@@ -828,6 +842,15 @@ class EchoMemoryAdapter:
             return None
         target = cfg.get("adapter") or legacy.get("shared_adapter") or self
         return target, str(scope_id), str(actor_uid), cfg.get("session_id")
+
+    @staticmethod
+    def _about_me_evidence(context: dict[str, Any] | None) -> Any:
+        """宿主放在 ``context["about_me"]["evidence"]`` 的本輪 evidence（與 store 同一份）。
+
+        只讀宿主 context，LLM 參數無法提供。
+        """
+        cfg = context.get("about_me") if isinstance(context, dict) else None
+        return cfg.get("evidence") if isinstance(cfg, dict) else None
 
     async def _about_me_tool(
         self, name: str, args: dict[str, Any], context: dict[str, Any] | None
@@ -862,6 +885,7 @@ class EchoMemoryAdapter:
                 return {"success": False, "result": "更正內容是空的，請使用者說出正確的說法。"}
             res = await target.correct_about_me(
                 scope_id, actor_uid, projection_id, text,
+                evidence=self._about_me_evidence(context),
                 session_id=session_id or getattr(target, "_session_id", None),
             )
         return {"success": bool(res and res.get("ok")), "result": self._about_me_text(name, res)}
@@ -926,10 +950,22 @@ class EchoMemoryAdapter:
         evidence: Any = None,
         session_id: str | None = None,
     ) -> dict[str, Any] | None:
-        """遮蔽一條旁證並存下 actor 的更正。回引擎 dict；引擎不支援回 None。"""
+        """遮蔽一條旁證並存下 actor 的更正。回引擎 dict；引擎不支援回 None。
+
+        ``evidence``：宿主本輪 store 用的同一份來源宣告（``EvidenceInput`` 或同欄位 dict 的
+        清單，含 channel_kind／audience_size／scope）。為 None（或無法解析）時引擎把更正內容
+        當**私有**使用者陳述寫入，不進共享投影——遮蔽仍生效，但更正不會出現在別人的查詢裡。
+        """
+        prepared = None
+        if evidence:
+            try:
+                prepared = [_coerce_evidence(item) for item in evidence]
+            except Exception as exc:  # noqa: BLE001 - 退回私有陳述，不擋遮蔽
+                logger.warning("correct_about_me evidence 無法解析，退回 None：%s: %s",
+                               type(exc).__name__, exc)
         return await self._about_call(
             "correct_about_me", scope_id, actor_uid, projection_id, correction_text,
-            evidence=evidence, session_id=session_id,
+            evidence=prepared, session_id=session_id,
         )
 
     # --- 管線介面 ---

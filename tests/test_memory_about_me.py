@@ -101,7 +101,7 @@ def _clean_env(monkeypatch):
 def _adapter(engine, tools=("member_recall",) + ABOUT_ME_TOOLS):
     adapter = EchoMemoryAdapter(engine=engine)
     adapter.enabled_tools = list(tools)
-    adapter.set_member_resolver(lambda name: "u_other")
+    adapter.set_member_resolver(lambda name: "actor1" if name == "本人" else "u_other")
     return adapter
 
 
@@ -325,7 +325,7 @@ async def test_member_recall登記about_refs到context_再撤回():
     eng = _AboutEngine()
     adapter = _adapter(eng)
     ctx = {"member_recall": {"scope_id": "scope-g1", "viewer_uid": "actor1"}}
-    out = await adapter.execute_tool("member_recall", {"member": "某人"}, context=ctx)
+    out = await adapter.execute_tool("member_recall", {"member": "本人"}, context=ctx)
     assert "〔旁證1〕" in out["result"]
     assert ctx["about_refs"] == {1: "proj-a", 2: "proj-b"}
     out = await adapter.execute_tool("retract_about_me", {"ref": 1}, context=ctx)
@@ -337,8 +337,8 @@ async def test_member_recall舊SharedContext_不登記refs_撤回被拒():
     eng = _AboutEngine(_NoRefShared())
     adapter = _adapter(eng)
     ctx = {"member_recall": {"scope_id": "scope-g1", "viewer_uid": "actor1"}}
-    await adapter.execute_tool("member_recall", {"member": "某人"}, context=ctx)
-    assert "about_refs" not in ctx
+    await adapter.execute_tool("member_recall", {"member": "本人"}, context=ctx)
+    assert ctx["about_refs"] == {}
     out = await adapter.execute_tool("retract_about_me", {"ref": 1}, context=ctx)
     assert out == {"success": False, "result": ABOUT_NO_REF}
 
@@ -350,10 +350,66 @@ async def test_截斷時只登記LLM看得到的旁證編號_ids與行數不變(
     adapter = _adapter(eng)
     adapter.tool_max_chars = 120
     ctx = {"member_recall": {"scope_id": "scope-g1", "viewer_uid": "actor1"}}
-    out = await adapter.execute_tool("member_recall", {"member": "某人"}, context=ctx)
+    out = await adapter.execute_tool("member_recall", {"member": "本人"}, context=ctx)
     complete = out["result"].split(chr(10))[:-1]
     shown = [n for n in refs if any(f"〔旁證{n}〕" in ln for ln in complete)]
     assert 0 < len(shown) < 6
     assert set(ctx["about_refs"]) == set(shown)
     # 「- 」開頭的完整行數 = 登記的 ids 數：新格式不破壞既有截斷對位
     assert ctx["member_recall_ids"] == [f"p{n}" for n in shown]
+
+
+async def test_先查本人再查別人_refs保持本人那份():
+    eng = _AboutEngine()
+    adapter = _adapter(eng)
+    ctx = {"member_recall": {"scope_id": "scope-g1", "viewer_uid": "actor1"}}
+    await adapter.execute_tool("member_recall", {"member": "本人"}, context=ctx)
+    mine = dict(ctx["about_refs"])
+    assert mine == {1: "proj-a", 2: "proj-b"}
+    eng.shared = _RefShared([_Item("q1")], {1: "other-x"})
+    await adapter.execute_tool("member_recall", {"member": "別人"}, context=ctx)
+    assert ctx["about_refs"] == mine
+
+
+async def test_查本人兩次_後者整份覆蓋前者():
+    eng = _AboutEngine()
+    adapter = _adapter(eng)
+    ctx = {"member_recall": {"scope_id": "scope-g1", "viewer_uid": "actor1"}}
+    await adapter.execute_tool("member_recall", {"member": "本人"}, context=ctx)
+    eng.shared = _RefShared([_Item("q1")], {1: "proj-new"})
+    await adapter.execute_tool("member_recall", {"member": "本人"}, context=ctx)
+    assert ctx["about_refs"] == {1: "proj-new"}
+
+
+async def test_只查別人_不建立about_refs():
+    ctx = {"member_recall": {"scope_id": "scope-g1", "viewer_uid": "actor1"}}
+    await _adapter(_AboutEngine()).execute_tool(
+        "member_recall", {"member": "別人"}, context=ctx)
+    assert "about_refs" not in ctx
+
+
+async def test_糾正_evidence取自host_context_不來自LLM參數():
+    eng = _AboutEngine()
+    ev = [{"source_type": "user_statement", "channel_kind": "guild", "audience_size": 5}]
+    import echo_stream.adapters.memory_echo as m
+
+    seen = []
+    orig = m._coerce_evidence
+    m._coerce_evidence = lambda item: (seen.append(item), item)[1]
+    try:
+        await _adapter(eng).execute_tool(
+            "correct_about_me",
+            {"ref": 1, "correction_text": "x", "evidence": [{"evil": 1}]},
+            context=_ctx({1: "proj-a"}, evidence=ev))
+    finally:
+        m._coerce_evidence = orig
+    assert seen == ev
+    assert eng.calls3[0][5] == ev
+
+
+async def test_糾正_沒有evidence_傳None():
+    eng = _AboutEngine()
+    await _adapter(eng).execute_tool(
+        "correct_about_me", {"ref": 1, "correction_text": "x", "evidence": [1]},
+        context=_ctx({1: "proj-a"}))
+    assert eng.calls3[0][5] is None
