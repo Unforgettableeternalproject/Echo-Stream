@@ -363,3 +363,36 @@ def test_recommended_split_policy_數值():
     assert (policy.first_min_weight, policy.first_max_weight) == (10.0, 24.0)
     assert (policy.min_weight, policy.max_weight) == (30.0, 80.0)
     assert policy.hard_cap_weight is None  # 沿用 2 x max
+
+
+async def test_句尾停頓依切點性質():
+    """句末切長停、逗號切短停、最後一句與 flush 用 segment_silence_ms。"""
+    from echo_stream.contracts.types import Sentence
+
+    async def stream():
+        specs = [("一。", "terminal"), ("二，", "secondary"), ("三", "flush"), ("四。", "terminal")]
+        for i, (text, reason) in enumerate(specs):
+            yield Sentence(
+                text=text, turn_id="t", index=i, is_first=i == 0,
+                is_last=i == len(specs) - 1, split_reason=reason,
+            )
+
+    stage = VoxSpeakStage(
+        backend=FakeVoxBackend(chunks_per_call=1), sample_rate=48000,
+        terminal_pause_ms=250.0, secondary_pause_ms=80.0,
+    )
+    chunks = [c async for c in stage.stream(stream(), CancellationToken())]
+    dur = {i: sum(c.duration_s for c in chunks if c.sentence_index == i) for i in range(4)}
+    base = 0.16  # 一個 chunk 的語音長度
+    assert dur[0] == pytest.approx(base + 0.250, abs=0.002)
+    assert dur[1] == pytest.approx(base + 0.080, abs=0.002)
+    assert dur[2] == pytest.approx(base + 0.015, abs=0.002)  # flush：沿用 segment_silence_ms
+    assert dur[3] == pytest.approx(base + 0.015, abs=0.002)  # 最後一句：不拖長 turn
+
+
+async def test_停頓未設定時行為不變():
+    stage = VoxSpeakStage(backend=FakeVoxBackend(chunks_per_call=1), sample_rate=48000)
+    chunks = await _collect(stage, ["一。", "二。"])
+    assert sum(c.duration_s for c in chunks if c.sentence_index == 0) == pytest.approx(
+        0.16 + 0.015, abs=0.002
+    )

@@ -86,6 +86,8 @@ class VoxSpeakStage:
         queue_size: int | None = None,
         edge_fade_ms: float = 4.0,
         segment_silence_ms: float = 15.0,
+        terminal_pause_ms: float | None = None,
+        secondary_pause_ms: float | None = None,
     ) -> None:
         self._backend = backend
         self._tts_repo = Path(tts_repo) if tts_repo else None
@@ -103,6 +105,13 @@ class VoxSpeakStage:
         generator 每個 chunk 都檢查 token，已排隊的音訊直接丟棄，不會多燒 GPU。"""
         self.edge_fade_ms = edge_fade_ms
         self.segment_silence_ms = segment_silence_ms
+        self.terminal_pause_ms = terminal_pause_ms
+        """句末標點（。！？）切開的句子，句尾停頓毫秒。None = 沿用 segment_silence_ms。"""
+        self.secondary_pause_ms = secondary_pause_ms
+        """逗號等次級標點切開的句子，句尾停頓毫秒。None = 沿用 segment_silence_ms。
+
+        兩者都是「換氣感」的旋鈕（11/01 聽感：太快、沒有呼吸感）：句間的停頓
+        依切點性質給，硬切／flush 與整個 turn 的最後一句一律只用 segment_silence_ms。"""
         self._backend_lock = threading.Lock()
         """backend 同時只能處理一個請求；跨 turn 也要串行。"""
         self._executor = concurrent.futures.ThreadPoolExecutor(
@@ -237,6 +246,16 @@ class VoxSpeakStage:
             return
         audio_ch.close()
 
+    def _tail_silence_ms(self, sentence: Sentence) -> float:
+        """依切點性質決定句尾停頓；最後一句與硬切／flush 用 segment_silence_ms。"""
+        pause: float | None = None
+        if not sentence.is_last:
+            if sentence.split_reason == "terminal":
+                pause = self.terminal_pause_ms
+            elif sentence.split_reason == "secondary":
+                pause = self.secondary_pause_ms
+        return self.segment_silence_ms if pause is None else pause
+
     def _resolve_speed(self, style: SpeechStyle | None) -> float | None:
         """只取 speed。style 非 1.0 優先，否則用 stage 預設，都沒有回 None。"""
         if style is not None and style.speed != 1.0:
@@ -259,6 +278,7 @@ class VoxSpeakStage:
             return  # 整句都是符號——沒東西可唸
 
         speed = self._resolve_speed(sentence.style)
+        tail_silence_ms = self._tail_silence_ms(sentence)
         # smooth_segment_edges 的淡化長度上限是段長的一半，尾端留兩倍才淡得滿 edge_fade_ms
         n_hold = 2 * int(self.sample_rate * self.edge_fade_ms / 1000)
         resampler = self._make_resampler()
@@ -273,12 +293,12 @@ class VoxSpeakStage:
         def emit(samples: Any, *, first: bool, final: bool) -> None:
             nonlocal chunk_index
             pcm = tensor_to_pcm16(samples) if len(samples) else b""
-            if self.edge_fade_ms > 0 or self.segment_silence_ms > 0:
+            if self.edge_fade_ms > 0 or tail_silence_ms > 0:
                 pcm = smooth_segment_edges(
                     pcm,
                     self.sample_rate,
                     fade_ms=self.edge_fade_ms,
-                    tail_silence_ms=self.segment_silence_ms if final else 0.0,
+                    tail_silence_ms=tail_silence_ms if final else 0.0,
                     fade_in=first,
                     fade_out=final,
                 )
