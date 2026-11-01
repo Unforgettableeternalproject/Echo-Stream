@@ -353,6 +353,9 @@ def smooth_segment_edges(
     sample_rate: int,
     fade_ms: float = 4.0,
     tail_silence_ms: float = 15.0,
+    *,
+    fade_in: bool = True,
+    fade_out: bool = True,
 ) -> bytes:
     """段緣平滑：半 Hann 淡入淡出 + 段尾短靜音墊。
 
@@ -362,6 +365,9 @@ def smooth_segment_edges(
 
     淡化只動段緣幾毫秒（預設 4ms ≈ 88 樣本 @22050Hz），聽不出音量變化；
     靜音墊直接附在段尾，前端排程不需要知道這件事。
+
+    ``fade_in`` / ``fade_out`` 可單獨關閉一側：串流式 backend 把一句切成
+    多個 chunk 時，只有句首要淡入、句尾要淡出，中間的 chunk 邊界是連續的。
     """
     import numpy as np
 
@@ -370,8 +376,10 @@ def smooth_segment_edges(
     if n_fade > 0:
         # 半 Hann：0→1 的升沿。比線性淡化少一點高頻假影。
         ramp = 0.5 * (1.0 - np.cos(np.pi * np.arange(n_fade) / n_fade))
-        arr[:n_fade] *= ramp
-        arr[-n_fade:] *= ramp[::-1]
+        if fade_in:
+            arr[:n_fade] *= ramp
+        if fade_out:
+            arr[-n_fade:] *= ramp[::-1]
     out = arr.astype("<i2").tobytes()
     n_pad = int(sample_rate * tail_silence_ms / 1000)
     if n_pad > 0:
