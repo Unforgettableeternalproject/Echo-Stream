@@ -160,6 +160,43 @@ def subsystem_path(kind: str) -> Path:
     )
 
 
+def ensure_subsystem(kind: str, package: str, repo: str | Path | None = None) -> Path | None:
+    """讓子系統套件可 import，回傳採用的 repo 根目錄（無法判定時為 None）。
+
+    優先序：
+
+    1. **明確指定**（``repo`` 參數或 ``ECHO_STREAM_{KIND}_REPO``）→ 放進 ``sys.path`` 最前面。
+    2. **環境已裝**（共用環境以 editable 安裝、或之後遷入 Core 的 ``subsystems/``）
+       → 不動 ``sys.path``。若照舊猜同層 repo 並插到最前面，會蓋過環境裡的版本，
+       遷移後就默默載到凍結的舊 repo（11/01 bot 的 PYTHONPATH 踩過同一個坑）。
+    3. 都沒有 → 猜同層 repo（:func:`subsystem_path`）。
+    """
+    import importlib.util
+
+    explicit = repo or get(f"ECHO_STREAM_{kind.upper()}_REPO")
+    if explicit:
+        path = Path(explicit).expanduser().resolve()
+        ensure_importable(path)
+        return path
+
+    try:
+        spec = importlib.util.find_spec(package)
+    except ValueError:  # 已在 sys.modules 但沒有 __spec__（測試替身）：視為已可 import
+        return None
+    if spec is not None:
+        origin = spec.origin or next(iter(spec.submodule_search_locations or []), None)
+        if origin is None:
+            return None
+        pkg_dir = Path(origin)
+        if pkg_dir.name == "__init__.py":
+            pkg_dir = pkg_dir.parent
+        return pkg_dir.parent
+
+    path = subsystem_path(kind)
+    ensure_importable(path)
+    return path
+
+
 def ensure_importable(path: Path) -> None:
     """把 repo 根目錄放進 ``sys.path``，讓 ``import echo_tts`` 之類能成功。
 

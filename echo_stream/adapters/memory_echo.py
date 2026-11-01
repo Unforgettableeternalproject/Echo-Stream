@@ -285,10 +285,7 @@ def build_engine(
     不符時 echo_memory 會判定索引需重建，而非靜默混用；因此不要讓兩邊
     共用同一個資料目錄，除非 ``EMBEDDING_*`` 設定一致。
     """
-    repo = memory_repo or config.get("ECHO_STREAM_MEMORY_REPO")
-    config.ensure_importable(
-        Path(repo).expanduser().resolve() if repo else config.subsystem_path("MEMORY")
-    )
+    config.ensure_subsystem("MEMORY", "echo_memory", memory_repo)
 
     # echo_memory 自帶的 APScheduler 是 lazy + 無差別的（見 core/dream_scheduler.py），
     # 觸發時機改由 Echo Stream 的 DreamScheduler 決定。其 Config 在 import 時讀 env，

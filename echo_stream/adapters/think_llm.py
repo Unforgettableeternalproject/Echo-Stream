@@ -238,10 +238,7 @@ def build_backend(
     **這是唯一 import echo_thought_core 的地方**，其餘程式碼只認
     :class:`StreamingBackend` 這個形狀。
     """
-    repo = session_repo or config.get("ECHO_STREAM_SESSION_REPO")
-    config.ensure_importable(
-        __import__("pathlib").Path(repo) if repo else config.subsystem_path("SESSION")
-    )
+    config.ensure_subsystem("SESSION", "echo_thought_core", session_repo)
 
     from echo_thought_core.backends.registry import BackendRegistry
 

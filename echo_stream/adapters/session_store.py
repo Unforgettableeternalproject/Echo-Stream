@@ -33,10 +33,7 @@ def build_store(data_dir: str | Path | None = None) -> Any:
     store 自己會加上 ``sessions/`` 子目錄，與 SessionControl 的
     目錄慣例一致。
     """
-    repo = config.get("ECHO_STREAM_SESSION_REPO")
-    config.ensure_importable(
-        Path(repo) if repo else config.subsystem_path("SESSION")
-    )
+    config.ensure_subsystem("SESSION", "echo_thought_core")
 
     from echo_thought_core.session_store import SessionStore
 

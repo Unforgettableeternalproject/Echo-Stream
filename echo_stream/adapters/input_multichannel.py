@@ -116,8 +116,7 @@ class MultiChannelSttInputStage:
 
     def _build_backend(self) -> TranscriberBackend:
         """建立真的 echo_stt backend。**只有這裡 import echo_stt**（經 input_stt）。"""
-        repo = self._stt_repo or config.subsystem_path("STT")
-        config.ensure_importable(repo)
+        config.ensure_subsystem("STT", "echo_stt", self._stt_repo)
         return _EchoSttBackend(language=self.language)
 
     async def aclose(self) -> None:

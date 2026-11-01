@@ -811,11 +811,24 @@ def test_emotion_presets_在_runner_prepare_之前也能從_echo_tts_載入(
 
 
 def test_emotion_presets_找不到_TTS_repo_退回內建表(tmp_path, monkeypatch):
+    import sys
+
     from echo_stream import config
 
     def _missing(kind):
         raise FileNotFoundError(f"找不到 {kind} 子系統")
 
+    # 環境裡若裝了 echo_tts（共用環境 editable），先藏起來：這裡要驗的是「哪裡都找不到」
+    monkeypatch.setattr(sys, "path", [p for p in sys.path if "SeparateTTS" not in p])
+    monkeypatch.setattr(
+        sys,
+        "meta_path",
+        [f for f in sys.meta_path if "__editable___echo_tts" not in getattr(f, "__module__", "")],
+    )
+    for name in [m for m in sys.modules if m == "echo_tts" or m.startswith("echo_tts.")]:
+        monkeypatch.delitem(sys.modules, name)
+    monkeypatch.delenv("ECHO_STREAM_TTS_REPO", raising=False)
+    monkeypatch.setattr(config, "_dotenv_values", lambda: {})
     monkeypatch.setattr(config, "subsystem_path", _missing)
     service = StreamService(use_real_tts=False, use_real_llm=False, log_dir=tmp_path)
     service._load_emotion_presets()

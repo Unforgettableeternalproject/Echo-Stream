@@ -147,8 +147,7 @@ class VoxSpeakStage:
         """建立真的 VoxBackend。**只有這裡 import TTS repo。**"""
         import importlib
 
-        repo = self._tts_repo or config.subsystem_path("TTS")
-        config.ensure_importable(repo)
+        config.ensure_subsystem("TTS", "echo_tts", self._tts_repo)
         module = importlib.import_module(VOX_BACKEND_MODULE)
         return module.VoxBackend(self.backend_config or {})
 

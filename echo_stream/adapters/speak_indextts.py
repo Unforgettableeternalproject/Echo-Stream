@@ -567,8 +567,7 @@ class IndexTTS2SpeakStage:
 
     def _build_backend(self) -> Any:
         """建立真的 IndexTTS2Backend。**只有這裡 import echo_tts。**"""
-        repo = self._tts_repo or config.subsystem_path("TTS")
-        config.ensure_importable(repo)
+        repo = config.ensure_subsystem("TTS", "echo_tts", self._tts_repo)
 
         from echo_tts.runtime.indextts_backend import IndexTTS2Backend
         from echo_tts.runtime.indextts_generate import default_generation_paths

@@ -47,3 +47,54 @@ def test_空值不炸(env_file):
     env_file("EMPTY=\nA=1\n")
     assert config.get("EMPTY") is None  # 空字串視同未設定
     assert config.get("A") == "1"
+
+
+# --- ensure_subsystem：環境已裝的版本優先於同層猜測 ---
+
+
+def _fake_package(root, name):
+    pkg = root / name
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    return root
+
+
+def test_ensure_subsystem_環境已裝就不插同層_repo(tmp_path, monkeypatch):
+    import sys
+
+    installed = _fake_package(tmp_path / "installed", "fake_sub_pkg")
+    sibling = _fake_package(tmp_path / "sibling", "fake_sub_pkg")
+    monkeypatch.setattr(sys, "path", [str(installed), *sys.path])
+    monkeypatch.delenv("ECHO_STREAM_FAKE_REPO", raising=False)
+    monkeypatch.setattr(config, "_dotenv_values", lambda: {})
+    monkeypatch.setattr(config, "subsystem_path", lambda kind: sibling)
+
+    repo = config.ensure_subsystem("FAKE", "fake_sub_pkg")
+    assert repo == installed
+    assert str(sibling) not in sys.path
+
+
+def test_ensure_subsystem_明確指定的_repo_優先(tmp_path, monkeypatch):
+    import sys
+
+    installed = _fake_package(tmp_path / "installed", "fake_sub_pkg2")
+    explicit = _fake_package(tmp_path / "explicit", "fake_sub_pkg2")
+    monkeypatch.setattr(sys, "path", [str(installed), *sys.path])
+    monkeypatch.setattr(config, "_dotenv_values", lambda: {})
+
+    repo = config.ensure_subsystem("FAKE", "fake_sub_pkg2", explicit)
+    assert repo == explicit.resolve()
+    assert sys.path[0] == str(explicit.resolve())
+
+
+def test_ensure_subsystem_沒裝才猜同層(tmp_path, monkeypatch):
+    import sys
+
+    sibling = _fake_package(tmp_path / "sibling", "fake_sub_pkg3")
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.delenv("ECHO_STREAM_FAKE_REPO", raising=False)
+    monkeypatch.setattr(config, "_dotenv_values", lambda: {})
+    monkeypatch.setattr(config, "subsystem_path", lambda kind: sibling)
+
+    assert config.ensure_subsystem("FAKE", "fake_sub_pkg3") == sibling
+    assert sys.path[0] == str(sibling)
