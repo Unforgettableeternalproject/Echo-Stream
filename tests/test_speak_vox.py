@@ -101,6 +101,22 @@ async def test_句首淡入句尾淡出且中段連續():
     assert pcm[-1] == 0  # 靜音墊
 
 
+async def test_句尾淡出長度等於_edge_fade_ms():
+    """尾端保留不足時淡化會被砍成一半（11/01 TTS 量到實際只有 2ms）。"""
+    stage = VoxSpeakStage(
+        backend=FakeVoxBackend(chunks_per_call=3), sample_rate=48000, segment_silence_ms=0.0
+    )
+    chunks = await _collect(stage, ["只有一句。"])
+    pcm = np.frombuffer(b"".join(c.pcm for c in chunks), dtype="<i2")
+    n_fade = int(48000 * 4.0 / 1000)  # 預設 edge_fade_ms=4
+    # 淡出區間從滿振幅單調降到接近 0；區間外仍是滿振幅
+    assert np.all(pcm[-n_fade - 10 : -n_fade - 1] > 16000)
+    tail = pcm[-n_fade:]
+    assert tail[0] > 15000 and tail[-1] < 200
+    assert 5000 < tail[n_fade // 2] < 12000  # 半 Hann 中點約半振幅；只淡一半時這裡仍是滿振幅
+    assert np.all(np.diff(tail.astype(int)) <= 0)
+
+
 async def test_取樣率_48k_不重採樣():
     stage = VoxSpeakStage(backend=FakeVoxBackend(chunks_per_call=2), sample_rate=48000)
     chunks = await _collect(stage, ["一句。"])

@@ -256,7 +256,8 @@ class VoxSpeakStage:
             return  # 整句都是符號——沒東西可唸
 
         speed = self._resolve_speed(sentence.style)
-        n_hold = int(self.sample_rate * self.edge_fade_ms / 1000)
+        # smooth_segment_edges 的淡化長度上限是段長的一半，尾端留兩倍才淡得滿 edge_fade_ms
+        n_hold = 2 * int(self.sample_rate * self.edge_fade_ms / 1000)
         resampler = self._make_resampler()
         carry = np.zeros(0, dtype="float32")
         chunk_index = 0
