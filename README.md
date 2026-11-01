@@ -45,7 +45,7 @@ C:\Users\Bernie\source\repos\Unforgettableeternalproject\U.E.P-s-Core\env\Script
 Phase 0 是純 asyncio + 標準庫，**零第三方依賴、不需要 GPU**。
 
 ```bash
-PY="C:/Users/Bernie/source/repos/Unforgettableeternalproject/U.E.P-s-Core/env/Scripts/python.exe"
+PY="C:/Users/Bernie/.uep/venv-inference-312/Scripts/python.exe"
 
 # 跑一輪 fake 管線並輸出延遲報告
 PYTHONIOENCODING=utf-8 "$PY" -m echo_stream demo --fake

@@ -56,10 +56,10 @@ if ($Stop) {
 Stop-EchoProcesses | Out-Null
 Start-Sleep -Seconds 1
 
-# Python：優先環境變數，否則猜同層的 U.E.P Core env（與 config.py 的同層猜測一致）
+# Python：優先環境變數，否則用 U.E.P 共用環境（~/.uep/venv-inference-312，由 Core lock 管理）
 $Py = $env:ECHO_STREAM_PYTHON
 if (-not $Py) {
-    $Py = Join-Path (Split-Path -Parent $Root) "U.E.P-s-Core\env\Scripts\python.exe"
+    $Py = Join-Path $env:USERPROFILE ".uep\venv-inference-312\Scripts\python.exe"
 }
 if (-not (Test-Path $Py)) {
     Write-Host "找不到 Python：$Py（可設環境變數 ECHO_STREAM_PYTHON 覆寫）"
