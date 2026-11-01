@@ -96,7 +96,11 @@ class VoxSpeakStage:
         """stage 預設語速；句子的 ``SpeechStyle.speed`` 非 1.0 時優先。
         都沒有就傳 None，由 backend 決定。"""
         self.sentence_buffer = sentence_buffer
-        self.queue_size = queue_size or int(config.get("ECHO_STREAM_TTS_QUEUE", "2"))
+        self.queue_size = queue_size or int(config.get("ECHO_STREAM_VOX_QUEUE", "12"))
+        """音訊通道上限（chunk 數）。VOX 一個 chunk 約 160ms，這個值就是合成能領先
+        播放多少：IndexTTS 那組的 2（約 320ms）在句間換新一次 backend 呼叫、又和
+        Whisper 搶 GPU 時會欠流（11/01 實測接縫雜音）。12 ≈ 1.9s 的餘裕；取消時
+        generator 每個 chunk 都檢查 token，已排隊的音訊直接丟棄，不會多燒 GPU。"""
         self.edge_fade_ms = edge_fade_ms
         self.segment_silence_ms = segment_silence_ms
         self._backend_lock = threading.Lock()
