@@ -141,7 +141,9 @@ def test_零或負倍率不爆炸():
 # --- adapter 套用 ---
 
 
-async def test_句子帶_style_會套到_backend():
+async def test_句子帶_style_會套到_backend(monkeypatch):
+    import sys
+
     from echo_stream.adapters.speak_indextts import IndexTTS2SpeakStage
     from echo_stream.contracts.cancellation import CancellationToken
     from echo_stream.contracts.types import Sentence
@@ -149,6 +151,8 @@ async def test_句子帶_style_會套到_backend():
     pytest.importorskip("numpy")
     from tests.conftest import FakeTTSBackend as FakeBackend
 
+    # 擋掉 echo_tts，驗的是退回路徑（向量 × 強度）；真換算見 test_speak_indextts
+    monkeypatch.setitem(sys.modules, "echo_tts.config.emotion_presets", None)
     backend = FakeBackend(segments_per_sentence=1)
     stage = IndexTTS2SpeakStage(backend=backend)
 

@@ -780,6 +780,12 @@ def test_emotion_presets_在_runner_prepare_之前也能從_echo_tts_載入(
     )
     # 隔離：真 echo_tts 若已被其他測試 import 或放進 sys.path，要先拿掉
     monkeypatch.setattr(sys, "path", [p for p in sys.path if "SeparateTTS" not in p])
+    # 共用環境以 editable 安裝 echo_tts 時是走 meta_path finder，不在 sys.path 上
+    monkeypatch.setattr(
+        sys,
+        "meta_path",
+        [f for f in sys.meta_path if "__editable___echo_tts" not in getattr(f, "__module__", "")],
+    )
     for name in [m for m in sys.modules if m == "echo_tts" or m.startswith("echo_tts.")]:
         monkeypatch.delitem(sys.modules, name)
     monkeypatch.setattr(

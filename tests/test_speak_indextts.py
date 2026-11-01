@@ -480,9 +480,16 @@ def test_過短的段不會因淡化壞掉():
 # --- 逐句 style 套用 ---
 
 
-async def test_style_的情緒向量乘上強度():
+async def test_style_的情緒向量乘上強度(monkeypatch):
+    """echo_tts 不可 import 時的退回路徑：向量 × 強度。
+
+    明確擋掉 echo_tts——共用環境把它 editable 裝進來後，沒擋的話會走真換算，
+    這個測試的結果就變成依賴環境。"""
+    import sys
+
     from echo_stream.contracts.style import SpeechStyle
 
+    monkeypatch.setitem(sys.modules, "echo_tts.config.emotion_presets", None)
     backend = FakeBackend(segments_per_sentence=1)
     stage = IndexTTS2SpeakStage(backend=backend)
     await stage.prepare()
@@ -490,6 +497,20 @@ async def test_style_的情緒向量乘上強度():
     style = SpeechStyle(emotion={"happy": 0.8}, intensity=0.5)
     stage._apply_style(style)
     assert backend.emotion_vector[0] == pytest.approx(0.4)  # happy 是第 0 維
+
+
+async def test_style_的情緒強度走_echo_tts_區間():
+    """echo_tts 可 import 時：總和落在 TTS 定案區間（0.5 → 甜蜜點 0.65）。"""
+    pytest.importorskip("echo_tts.config.emotion_presets")
+    from echo_stream.contracts.style import SpeechStyle
+
+    backend = FakeBackend(segments_per_sentence=1)
+    stage = IndexTTS2SpeakStage(backend=backend)
+    await stage.prepare()
+
+    stage._apply_style(SpeechStyle(emotion={"happy": 0.8}, intensity=0.5))
+    assert sum(backend.emotion_vector) == pytest.approx(0.65, abs=0.01)
+    assert backend.emotion_vector[0] == max(backend.emotion_vector)
 
 
 async def test_中性句還原角色檔預設情緒():
