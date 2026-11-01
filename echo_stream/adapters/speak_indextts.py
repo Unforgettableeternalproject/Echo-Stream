@@ -781,7 +781,7 @@ class IndexTTS2SpeakStage:
         不是每個欄位都保證被實作。
 
         ``intensity`` 的翻譯走 echo_tts 的強度區間（2026-08-23 改）：
-        0~1 刻度 → ``user_to_strength`` → 總和 0.57~0.73（0.5 = 0.65 甜蜜點），
+        0~1 刻度 → ``user_to_strength`` → 總和落在 echo_tts 定案區間（0.5 = 中點），
         再 ``scale_to_strength`` 等比縮放——preset 向量只剩比例有意義。
         舊做法「向量 × intensity」送進去的總和多半 < 0.5，落在 TTS 那邊定案的
         「情緒表現不足」區，LLM 標記聽起來跟沒標一樣。

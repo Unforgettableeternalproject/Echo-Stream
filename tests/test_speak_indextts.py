@@ -500,8 +500,8 @@ async def test_style_的情緒向量乘上強度(monkeypatch):
 
 
 async def test_style_的情緒強度走_echo_tts_區間():
-    """echo_tts 可 import 時：總和落在 TTS 定案區間（0.5 → 甜蜜點 0.65）。"""
-    pytest.importorskip("echo_tts.config.emotion_presets")
+    """echo_tts 可 import 時：總和等於 echo_tts 對該刻度的強度（區間由 TTS 定案）。"""
+    presets = pytest.importorskip("echo_tts.config.emotion_presets")
     from echo_stream.contracts.style import SpeechStyle
 
     backend = FakeBackend(segments_per_sentence=1)
@@ -509,7 +509,7 @@ async def test_style_的情緒強度走_echo_tts_區間():
     await stage.prepare()
 
     stage._apply_style(SpeechStyle(emotion={"happy": 0.8}, intensity=0.5))
-    assert sum(backend.emotion_vector) == pytest.approx(0.65, abs=0.01)
+    assert sum(backend.emotion_vector) == pytest.approx(presets.user_to_strength(0.5))
     assert backend.emotion_vector[0] == max(backend.emotion_vector)
 
 

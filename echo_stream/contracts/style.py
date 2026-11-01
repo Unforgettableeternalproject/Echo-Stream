@@ -72,7 +72,7 @@ class SpeechStyle:
 
     intensity: float = 0.5
     """情緒強度，0~1 的**相對**刻度，由 adapter 映射到後端的可用區間——
-    0.5 = 後端的甜蜜點（IndexTTS2 是總和 0.65，區間 0.57~0.73）。
+    0.5 = 後端定案區間的中點（IndexTTS2 的區間由 echo_tts ``user_to_strength`` 決定）。
     不是絕對值：contracts 不知道任何後端的數字。"""
 
     expressiveness: float | None = None
