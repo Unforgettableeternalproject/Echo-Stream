@@ -89,6 +89,14 @@ class VoxSpeakStage:
         self.segment_silence_ms = segment_silence_ms
         self._backend_lock = threading.Lock()
         """backend 同時只能處理一個請求；跨 turn 也要串行。"""
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="vox-tts"
+        )
+        """所有 backend 呼叫（建立、prepare、合成、unload）都走這條**同一個**執行緒。
+
+        torch inductor 的 CUDA graph tree manager 是執行緒區域（TLS）的，只在做
+        compile／暖機的那條執行緒初始化；合成落到別條執行緒會在
+        ``cudagraph_trees.get_obj`` 斷言失敗。預設執行緒池不保證同一條。"""
         self._prepared = False
 
     # --- 生命週期 ---
@@ -99,10 +107,10 @@ class VoxSpeakStage:
             return
         loop = asyncio.get_running_loop()
         if self._backend is None:
-            self._backend = await loop.run_in_executor(None, self._build_backend)
+            self._backend = await loop.run_in_executor(self._executor, self._build_backend)
         prepare = getattr(self._backend, "prepare", None)
         if callable(prepare):
-            await loop.run_in_executor(None, prepare)
+            await loop.run_in_executor(self._executor, prepare)
         self._prepared = True
 
     def _build_backend(self) -> Any:
@@ -120,7 +128,7 @@ class VoxSpeakStage:
         if callable(unload):
             loop = asyncio.get_running_loop()
             # 在 executor 內取得 lock 再 unload，不會踩到正在推理的執行緒
-            await loop.run_in_executor(None, self._unload_locked, unload)
+            await loop.run_in_executor(self._executor, self._unload_locked, unload)
         self._prepared = False
 
     def _unload_locked(self, unload: Any) -> None:
@@ -191,7 +199,7 @@ class VoxSpeakStage:
             async for sentence in sentence_ch:
                 token.raise_if_cancelled()
                 await loop.run_in_executor(
-                    None, self._synthesize_one, sentence, audio_ch, loop, token, stop
+                    self._executor, self._synthesize_one, sentence, audio_ch, loop, token, stop
                 )
         except CancelledError:
             pass

@@ -264,3 +264,41 @@ async def test_淡化與靜音皆為零時仍送出_is_last():
 def test_建構子拒絕未知參數():
     with pytest.raises(TypeError):
         VoxSpeakStage(backend=FakeVoxBackend(), warmup=True)  # type: ignore[call-arg]
+
+
+async def test_所有_backend_呼叫都在同一條執行緒():
+    """torch 的 CUDA graph tree 是執行緒區域的：prepare（compile／暖機）與
+    之後每次合成、unload 必須同一條執行緒，否則真 VOX 會 assert 失敗。"""
+
+    class ThreadRecordingBackend(FakeVoxBackend):
+        def __init__(self) -> None:
+            super().__init__(chunks_per_call=2)
+            self.prepare_threads: list[int] = []
+            self.unload_threads: list[int] = []
+
+        def prepare(self) -> None:
+            super().prepare()
+            self.prepare_threads.append(threading.get_ident())
+
+        def unload(self) -> None:
+            super().unload()
+            self.unload_threads.append(threading.get_ident())
+
+    backend = ThreadRecordingBackend()
+    stage = VoxSpeakStage(backend=backend)
+    await stage.prepare()
+    # 多個 turn、且中間穿插其他 executor 工作，預設執行緒池會換執行緒
+    for i in range(4):
+        await asyncio.gather(
+            _collect(stage, [f"第 {i} 句。", "下一句。"]),
+            *[asyncio.get_running_loop().run_in_executor(None, time.sleep, 0.01)
+              for _ in range(4)],
+        )
+    await stage.aclose()
+
+    threads = set(
+        backend.prepare_threads + backend.call_threads + backend.close_threads
+        + backend.unload_threads
+    )
+    assert len(threads) == 1
+    assert threading.get_ident() not in threads
