@@ -181,9 +181,17 @@ class SplitPolicy:
     """是否允許在逗號等次級標點切分。關掉可用來比較「只在句末切」的音質差異。"""
 
     hard_cut_grace: float = 8.0
-    """超過上限後的寬限量：到達 max_weight **先不硬切**，再多等這麼多權重，
+    """**首句**超過上限後的寬限量：到達 first_max_weight **先不硬切**，再多等這麼多權重，
     期間出現任何標點就在標點切。硬切點落在詞中間（「…遊戲吸/引…」）的
-    銜接假影遠比句子多幾個字難聽（2026-08-21 實測）。寬限也用完才真的硬切。"""
+    銜接假影遠比句子多幾個字難聽（2026-08-21 實測）。寬限也用完才真的硬切。
+    後續句改用 :attr:`hard_cap_weight`。"""
+
+    hard_cap_weight: float | None = None
+    """**後續句**的絕對上限。``None`` 表示 2 × max_weight。
+
+    權重超過 max_weight 之後，遇到任何標點（含括號內的次級標點）就立刻切；
+    到這個上限還沒遇到標點才 ``_force_cut``。首句不套用，維持 hard_cut_grace
+    （首句拖長直接傷 TTFA）。"""
 
     metadata: dict = field(default_factory=dict)
 
@@ -303,7 +311,7 @@ class SentenceSplitter:
                     self.policy.allow_secondary_split
                     and ch in SECONDARY_PUNCT
                     and weight >= min_w
-                    and depth == 0
+                    and (depth == 0 or (not is_first and weight >= max_w))
                 ):
                     head, buffer = buffer, ""
                     depth = 0
@@ -313,9 +321,15 @@ class SentenceSplitter:
                     continue
 
                 # 5. 長度上限。到達 max 不立刻硬切——硬切點多半落在詞中間，
-                #    先給一段寬限等自然切點（上面的規則 2/4 會在標點處收掉），
-                #    寬限也用完才回溯硬切。
-                if weight >= max_w + self.policy.hard_cut_grace:
+                #    先等自然切點（上面的規則 2/4 會在標點處收掉）。首句等 grace，
+                #    後續句等到 hard_cap（預設 2×max），用完才回溯硬切。
+                if is_first:
+                    cut_at = max_w + self.policy.hard_cut_grace
+                else:
+                    cap = self.policy.hard_cap_weight
+                    cut_at = cap if cap is not None else 2.0 * max_w
+                    cut_at = max(cut_at, max_w)
+                if weight >= cut_at:
                     head, buffer = self._force_cut(buffer)
                     depth = bracket_depth(buffer)
                     if head.strip():

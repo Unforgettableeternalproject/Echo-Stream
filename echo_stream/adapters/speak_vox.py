@@ -33,7 +33,9 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
+import logging
 import threading
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -43,10 +45,20 @@ from ..contracts.cancellation import CancellationToken, CancelledError, CancelRe
 from ..contracts.style import SpeechStyle
 from ..contracts.types import TTS_SAMPLE_RATE, AudioChunk, Sentence
 from ..core.channel import ChannelClosed, StreamChannel
+from ..core.splitter import SplitPolicy
 from .speak_indextts import sanitize_for_tts, smooth_segment_edges, tensor_to_pcm16
+
+logger = logging.getLogger(__name__)
 
 VOX_SAMPLE_RATE = 48_000
 """VoxBackend 固定的輸出取樣率。"""
+
+# 建議切句策略。來源：11/01 VOX 實測，首包約 0.1s，所以首句不必壓短；
+# TTS 端要求只在標點切（hard_cap 沿用 SplitPolicy 預設 2 x max，超過 max 後遇標點即切）。
+VOX_SPLIT_FIRST_MIN = 10.0
+VOX_SPLIT_FIRST_MAX = 24.0
+VOX_SPLIT_MIN = 30.0
+VOX_SPLIT_MAX = 80.0
 
 VOX_BACKEND_MODULE = "echo_tts.runtime.vox_backend"
 """VoxBackend 所在模組（TTS repo 內）。路徑是假設，TTS 端落地後以實際為準。"""
@@ -98,6 +110,20 @@ class VoxSpeakStage:
         compile／暖機的那條執行緒初始化；合成落到別條執行緒會在
         ``cudagraph_trees.get_obj`` 斷言失敗。預設執行緒池不保證同一條。"""
         self._prepared = False
+        self._last_synth_end: tuple[str, float] | None = None
+        """(turn_id, perf_counter)：上一句合成結束時間，只用於逐句 log 的句間間隔。"""
+        self._play_clock: tuple[str, float, int] | None = None
+        """(turn_id, 第一個 chunk 送出的 perf_counter, 已送出樣本數)：只用於 log 的 lead_ms。"""
+
+    @classmethod
+    def recommended_split_policy(cls) -> SplitPolicy:
+        """VOX 建議的切句策略；Core 與 bot 共用這一份，其餘欄位用 SplitPolicy 預設。"""
+        return SplitPolicy(
+            first_min_weight=VOX_SPLIT_FIRST_MIN,
+            first_max_weight=VOX_SPLIT_FIRST_MAX,
+            min_weight=VOX_SPLIT_MIN,
+            max_weight=VOX_SPLIT_MAX,
+        )
 
     # --- 生命週期 ---
 
@@ -234,6 +260,11 @@ class VoxSpeakStage:
         resampler = self._make_resampler()
         carry = np.zeros(0, dtype="float32")
         chunk_index = 0
+        lead_ms: float | None = None
+
+        def set_lead(value: float) -> None:
+            nonlocal lead_ms
+            lead_ms = value
 
         def emit(samples: Any, *, first: bool, final: bool) -> None:
             nonlocal chunk_index
@@ -258,17 +289,43 @@ class VoxSpeakStage:
                 chunk_index=chunk_index,
                 is_last=is_last,
             )
+            is_sentence_first = chunk_index == 0
             chunk_index += 1
             # 通道滿會阻塞此執行緒 = 背壓；token 取消或 stop 設起時脫身
             self._put(audio_ch, chunk, loop, stop)
+            self._note_sent(sentence.turn_id, len(pcm) // 2, is_sentence_first, set_lead)
 
         if not self._acquire_backend(token, stop):
             return
         try:
             gen = None
+            t_start = time.perf_counter()
+            wall_start = time.time()
+            prev = self._last_synth_end
+            prev_end = prev[1] if prev is not None and prev[0] == sentence.turn_id else None
+            first_chunk_s = 0.0
+            max_gap_s = 0.0
+            synth_s = 0.0
+            raw_samples = 0
+            n_raw = 0
             try:
                 gen = self._backend.stream(speak_text, lang=self.language, speed=speed)
-                for raw in gen:
+                while True:
+                    # 只計 next() 的耗時：emit 的背壓等待不是合成時間
+                    t_req = time.perf_counter()
+                    try:
+                        raw = next(gen)
+                    except StopIteration:
+                        break
+                    t_got = time.perf_counter()
+                    gen_s = t_got - t_req
+                    if n_raw == 0:
+                        first_chunk_s = t_got - t_start
+                    else:
+                        max_gap_s = max(max_gap_s, gen_s)
+                    n_raw += 1
+                    synth_s += gen_s
+                    raw_samples += len(raw)
                     if token.is_cancelled or stop.is_set():
                         return
                     buf = np.concatenate([carry, self._resample(resampler, raw, last=False)])
@@ -285,6 +342,10 @@ class VoxSpeakStage:
                     return
                 tail = np.concatenate([carry, self._resample(resampler, None, last=True)])
                 emit(tail, first=chunk_index == 0, final=True)
+                self._log_sentence(
+                    sentence, speak_text, wall_start, t_start, prev_end, first_chunk_s,
+                    synth_s, raw_samples, n_raw, max_gap_s, lead_ms,
+                )
             except (CancelledError, ChannelClosed, concurrent.futures.CancelledError):
                 return
             finally:
@@ -294,6 +355,60 @@ class VoxSpeakStage:
                         gen.close()
         finally:
             self._backend_lock.release()
+
+    def _note_sent(self, turn_id: str, n_samples: int, sentence_first: bool, set_lead: Any) -> None:
+        """記錄已送出的音訊量；句子第一個 chunk 送出時算 lead_ms。
+
+        lead_ms = 本 turn 到此為止已送出的音訊長度 - 自本 turn 第一個 chunk 送出
+        起經過的實際時間（假設即時播放；不含本 chunk）。負值 = 這個接縫一定欠流。
+        n_samples 是 pcm16 位元組數的一半，即實際送出的輸出取樣率樣本數
+        （重採樣、尾端保留、淡化與靜音墊都已包含）。
+        """
+        now = time.perf_counter()
+        clock = self._play_clock
+        if clock is None or clock[0] != turn_id:
+            clock = (turn_id, now, 0)  # turn 的第一個 chunk：lead 為 0
+        if sentence_first:
+            elapsed = now - clock[1]
+            set_lead((clock[2] / self.sample_rate - elapsed) * 1000)
+        self._play_clock = (clock[0], clock[1], clock[2] + n_samples)
+
+    def _log_sentence(
+        self,
+        sentence: Sentence,
+        speak_text: str,
+        wall_start: float,
+        t_start: float,
+        prev_end: float | None,
+        first_chunk_s: float,
+        synth_s: float,
+        raw_samples: int,
+        n_chunks: int,
+        max_gap_s: float,
+        lead_ms: float | None,
+    ) -> None:
+        """逐句一行 INFO，用來分辨斷感出在句間還是句內。只讀計時，不影響音訊。
+
+        ``synth_ms`` 是 backend 產生音訊的累計耗時（不含通道背壓等待）；
+        ``max_chunk_gap_ms`` 是首 chunk 之後、相鄰 chunk 之間最長的生成間隔
+        （一個 chunk 約 160ms 音訊，超過就代表該段生成慢於即時）。
+        """
+        t_end = time.perf_counter()
+        self._last_synth_end = (sentence.turn_id, t_end)
+        audio_s = raw_samples / VOX_SAMPLE_RATE
+        rtf = synth_s / audio_s if audio_s > 0 else 0.0
+        gap = f"{(t_start - prev_end) * 1000:.0f}" if prev_end is not None else "-"
+        start_txt = time.strftime("%H:%M:%S", time.localtime(wall_start))
+        start_txt += f".{int((wall_start % 1) * 1000):03d}"
+        logger.info(
+            "vox sentence turn=%s idx=%d chars=%d reason=%s start=%s first_chunk_ms=%.0f "
+            "synth_ms=%.0f audio_s=%.2f rtf=%.2f gap_prev_ms=%s chunks=%d "
+            "max_chunk_gap_ms=%.0f lead_ms=%s",
+            sentence.turn_id, sentence.index, len(speak_text),
+            sentence.split_reason or "-", start_txt, first_chunk_s * 1000,
+            synth_s * 1000, audio_s, rtf, gap, n_chunks, max_gap_s * 1000,
+            f"{lead_ms:.0f}" if lead_ms is not None else "-",
+        )
 
     def _acquire_backend(self, token: CancellationToken, stop: threading.Event) -> bool:
         """取得 backend lock。等待期間 token 取消或 stop 設起就放棄，不啟動推理。"""

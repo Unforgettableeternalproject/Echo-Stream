@@ -302,3 +302,48 @@ async def test_所有_backend_呼叫都在同一條執行緒():
     )
     assert len(threads) == 1
     assert threading.get_ident() not in threads
+
+
+async def test_逐句_log_每句一行且欄位齊全(caplog):
+    backend = FakeVoxBackend(chunks_per_call=3, delay=0.01)
+    stage = VoxSpeakStage(backend=backend)
+    with caplog.at_level("INFO", logger="echo_stream.adapters.speak_vox"):
+        await _collect(stage, ["第一句。", "第二句。"])
+
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("vox sentence")]
+    assert len(lines) == 2
+    for key in (
+        "turn=t1", "idx=", "chars=", "reason=", "start=", "first_chunk_ms=", "synth_ms=",
+        "audio_s=", "rtf=", "gap_prev_ms=", "chunks=3", "max_chunk_gap_ms=",
+    ):
+        assert all(key in line for line in lines), key
+    assert "gap_prev_ms=-" in lines[0]  # 首句沒有上一句
+    assert "gap_prev_ms=-" not in lines[1]  # 同 turn 第二句有間隔
+    assert "audio_s=0.48" in lines[0]  # 3 chunk x 160ms
+    assert "lead_ms=0" in lines[0]  # turn 第一個 chunk
+    lead = int(lines[1].split("lead_ms=")[1].split()[0])
+    assert lead > 0  # 合成快於即時，接縫有餘裕
+
+
+async def test_lead_ms_第二句延遲時為負值(caplog):
+    class SlowSecond(FakeVoxBackend):
+        def stream(self, text, lang=None, speed=None):
+            self.calls.append({"text": text})
+            return self._slow() if len(self.calls) == 2 else self._gen()
+
+        def _slow(self):
+            time.sleep(0.8)  # 第一句只有 480ms 音訊，第二句晚到 -> 欠流
+            yield from self._gen()
+
+    stage = VoxSpeakStage(backend=SlowSecond(chunks_per_call=3))
+    with caplog.at_level("INFO", logger="echo_stream.adapters.speak_vox"):
+        await _collect(stage, ["第一句。", "第二句。"])
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("vox sentence")]
+    assert int(lines[1].split("lead_ms=")[1].split()[0]) < 0
+
+
+def test_recommended_split_policy_數值():
+    policy = VoxSpeakStage.recommended_split_policy()
+    assert (policy.first_min_weight, policy.first_max_weight) == (10.0, 24.0)
+    assert (policy.min_weight, policy.max_weight) == (30.0, 80.0)
+    assert policy.hard_cap_weight is None  # 沿用 2 x max

@@ -313,3 +313,62 @@ async def test_FLUSH_空buffer不產生空句():
 
     out = [s async for s in SentenceSplitter(SplitPolicy()).split(toks(), "t")]
     assert [s.text for s in out if s.text] == ["好。"]
+
+
+# --- 後續句絕對上限 hard_cap（2026-11-01） ---
+
+
+def _cap_policy(**kw) -> SplitPolicy:
+    base = dict(
+        first_min_weight=2.0, first_max_weight=4.0, hard_cut_grace=0.0,
+        min_weight=10.0, max_weight=20.0,
+    )
+    base.update(kw)
+    return SplitPolicy(**base)
+
+
+async def _skip_first(text: str, policy: SplitPolicy):
+    result = await collect_full(text, policy)
+    return result[1:]
+
+
+async def test_hardcap_純中文在_max_之後遇到逗號就切在逗號():
+    # 首句「好的。」；後續句 25 字無標點、再接逗號：越過 max 20、未到 cap 40
+    text = "好的。" + "這" * 25 + "，" + "後" * 5 + "。"
+    rest = await _skip_first(text, _cap_policy(allow_secondary_split=True))
+    assert rest[0].text == "這" * 25 + "，"
+    assert rest[0].split_reason == "secondary"
+
+
+async def test_hardcap_到上限仍無標點才_max_length_硬切():
+    text = "好的。" + "這" * 100 + "。"
+    rest = await _skip_first(text, _cap_policy())
+    assert rest[0].split_reason == "max_length"
+    assert text_weight(rest[0].text) == 40.0  # 預設 2 x max
+
+
+async def test_hardcap_可由欄位覆寫():
+    text = "好的。" + "這" * 100 + "。"
+    rest = await _skip_first(text, _cap_policy(hard_cap_weight=30.0))
+    assert rest[0].split_reason == "max_length"
+    assert text_weight(rest[0].text) == 30.0
+
+
+async def test_hardcap_括號內的逗號在_max_之後可以切():
+    text = "好的。" + "（" + "這" * 25 + "，" + "後" * 5 + "）。"
+    rest = await _skip_first(text, _cap_policy())
+    assert rest[0].text.endswith("，")
+    assert rest[0].split_reason == "secondary"
+
+
+async def test_hardcap_括號內的逗號在_max_之前仍不切():
+    text = "好的。" + "（" + "這" * 12 + "，" + "後" * 5 + "）。"
+    rest = await _skip_first(text, _cap_policy())
+    assert rest[0].text.count("，") == 1 and rest[0].text.endswith("）。")
+
+
+async def test_hardcap_首句行為不變_仍用_grace():
+    policy = _cap_policy(hard_cut_grace=4.0)
+    result = await collect_full("這" * 30 + "。", policy)
+    assert result[0].split_reason == "max_length"
+    assert text_weight(result[0].text) <= 8.0 + 1

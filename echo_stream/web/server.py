@@ -177,6 +177,7 @@ def _split_policy_from_defaults() -> SplitPolicy:
         "first_max": "first_max_weight",
         "min": "min_weight",
         "max": "max_weight",
+        "hard_cap": "hard_cap_weight",
     }
     kwargs = {attr: float(sec[key]) for key, attr in mapping.items() if key in sec}
     return SplitPolicy(**kwargs)
@@ -597,6 +598,7 @@ class StreamService:
                 "first_max": self.split_policy.first_max_weight,
                 "min": self.split_policy.min_weight,
                 "max": self.split_policy.max_weight,
+                "hard_cap": self.split_policy.hard_cap_weight,
             },
             "turn": {
                 "silence_threshold_s": (
@@ -679,6 +681,7 @@ class StreamService:
                 "first_max": "first_max_weight",
                 "min": "min_weight",
                 "max": "max_weight",
+                "hard_cap": "hard_cap_weight",
             }
             changed = {}
             for key, attr in mapping.items():
